@@ -1,0 +1,10 @@
+node_modules
+node_modules/
+**/node_modules
+**/node_modules/
+**/_generated/
+.env.local
+.env
+dist/
+.DS_Store
+*.tsbuildinfo

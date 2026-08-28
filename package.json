@@ -1,0 +1,33 @@
+{
+  "name": "@convex-dev/ai-budget",
+  "description": "Metered, budget-governed AI Gateway usage for Convex: cost & usage tracking, per-user and per-action spend/rate limits, request logging, and re-run.",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "type": "module",
+  "keywords": [
+    "convex",
+    "convex-component",
+    "ai-gateway",
+    "llm",
+    "usage",
+    "cost",
+    "budget",
+    "rate-limit"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/get-convex/ai-budget.git"
+  },
+  "exports": {
+    ".": "./src/client/index.ts",
+    "./convex.config": "./src/component/convex.config.ts"
+  },
+  "peerDependencies": {
+    "@convex-dev/ai-sdk-provider": "*",
+    "ai": "^5.0.0 || ^6.0.0 || ^7.0.0",
+    "convex": "^1.45.0"
+  },
+  "files": [
+    "src"
+  ]
+}
