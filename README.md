@@ -6,12 +6,16 @@ your LLM calls through it and every request is tracked, priced, attributed, and
 held to a budget — with spend caps that actually hold under concurrent load.
 
 ```ts
-const { text, costCents } = await ai.chat(ctx, { userId, prompt });
+// userId defaults to the signed-in user — this is the whole integration:
+const { text, costCents } = await ai.chat(ctx, { prompt });
 ```
 
 That one call is authenticated to the gateway with a short-lived deployment
-token (no API keys to manage), checked against the user's limits, billed to the
-right user and feature, and written to a full audit log you can replay later.
+token (no API keys to manage), attributed to the authenticated user, checked
+against their limits, billed to the right user and feature, and written to a
+full audit log you can replay later.
+
+![Chat with a live request log — every call tracked, priced, and attributed](docs/hero.png)
 
 ---
 
@@ -25,6 +29,8 @@ right user and feature, and written to a full audit log you can replay later.
 | **Concurrency-safe caps** | A reserve-then-settle design makes admission a true atomic check — concurrent in-flight requests can't blow past the cap (a naive implementation overshoots ~40×). |
 | **Hard or soft** | Each limit either **blocks** (`hard`) or **allows-with-a-warning** (`soft`). |
 | **Per-feature budgets** | Cap or disable a whole action (e.g. `summarize`) independently of any user. |
+| **Global killswitch** | A deployment-wide spend cap across all users and actions (sharded for throughput; enforced approximately). |
+| **One-time bumps** | "Approve another $X" at any level (user / action / global) without changing the standing cap — daily bumps are today-only, lifetime bumps permanent. |
 | **Model policy** | Allow/deny lists for models; an unknown/unpriced model **fails closed** (charged a conservative max, never $0). |
 | **Replay** | Re-run any stored request with edited messages or a different model; re-runs are linked to their original (lineage). |
 | **Agent-ready** | `ai.languageModel(ctx, { userId })` is a standard AI SDK model — drop it into [`@convex-dev/agent`](https://www.npmjs.com/package/@convex-dev/agent) and every agent generation is budgeted. |
@@ -74,14 +80,18 @@ import { v } from "convex/values";
 import { action } from "./_generated/server";
 
 export const sendMessage = action({
-  args: { userId: v.string(), prompt: v.string() },
-  handler: async (ctx, { userId, prompt }) => {
-    // Limit-checked, tracked, priced. Throws a ConvexError if over a hard cap.
-    const { text, costCents, warnings } = await ai.chat(ctx, { userId, prompt });
+  args: { prompt: v.string() },
+  handler: async (ctx, { prompt }) => {
+    // userId defaults to the authenticated caller (ctx.auth). Limit-checked,
+    // tracked, priced. Throws a ConvexError if over a hard cap.
+    const { text, costCents, warnings } = await ai.chat(ctx, { prompt });
     return { text, costCents, warnings };
   },
 });
 ```
+
+Pass an explicit `{ userId }` only for service/admin flows or when you manage
+identity yourself.
 
 Give someone a budget:
 
@@ -109,7 +119,7 @@ for the read-only ones, a query. `ctx` is the Convex context.
 
 ```ts
 ai.chat(ctx, {
-  userId,
+  userId?,           // defaults to the authenticated caller (ctx.auth)
   prompt?,           // or:
   messages?,         // [{ role, content }]
   model?,            // defaults to defaultModel
@@ -117,7 +127,9 @@ ai.chat(ctx, {
 }): Promise<{ text, requestId, costCents, promptTokens, completionTokens, warnings }>
 ```
 
-`warnings` is non-empty only when a **soft** limit was exceeded.
+`warnings` is non-empty only when a **soft** limit was exceeded. If no `userId`
+is passed and there is no authenticated user, `chat` throws — budgets are never
+silently un-attributed.
 
 ### As an AI SDK model (Agent, generateText, streamText)
 
@@ -188,6 +200,28 @@ ai.setActionLimits(ctx, {
 })
 ```
 
+### Global (deployment-wide) budget
+
+```ts
+ai.setGlobalLimits(ctx, { dailySpendLimitCents?, lifetimeSpendLimitCents?, enforcement? })
+ai.getGlobalStatus(ctx)   // { limits, spentTodayCents, spentTotalCents }
+```
+
+A killswitch across all users and actions. Backed by a sharded counter for
+throughput, so it's enforced **approximately** (bounded overshoot under burst) —
+per-user and per-action caps remain exact.
+
+### One-time bumps ("approve another $X")
+
+```ts
+ai.bumpUser(ctx, { userId, dailyCents?, lifetimeCents? })
+ai.bumpAction(ctx, { name, dailyCents?, lifetimeCents? })
+ai.bumpGlobal(ctx, { dailyCents?, lifetimeCents? })
+```
+
+Adds headroom on top of the standing cap without changing it. Daily bumps apply
+to today only (reset with the day); lifetime bumps are permanent.
+
 ### Model policy
 
 ```ts
@@ -255,14 +289,11 @@ hands it. **Your app owns auth.** The `example/` app skips auth on purpose to
 keep the demo frictionless (a persona dropdown, public admin functions); do not
 copy its endpoints verbatim. In production:
 
-1. **Derive `userId` on the server**, never from a client argument — otherwise a
-   caller can spend under someone else's budget or dodge their own limits by
-   rotating ids.
-   ```ts
-   const who = await ctx.auth.getUserIdentity();
-   if (!who) throw new Error("Unauthenticated");
-   await ai.chat(ctx, { userId: who.subject, prompt });
-   ```
+1. **Let `userId` default to the authenticated caller** (that's the built-in
+   behavior — `ai.chat(ctx, { prompt })` uses `ctx.auth.getUserIdentity()`).
+   Only pass an explicit `userId` from a trusted server context; never forward a
+   client-supplied id, or a caller can spend under someone else's budget or
+   dodge their own limits by rotating ids.
 2. **Gate every admin call** — `setLimits`, `setActionLimits`, `setModelPolicy`,
    `setPrice`, `deleteUser` — behind an admin check. A limit-management surface
    must not be operable by the party being limited.
@@ -278,8 +309,17 @@ copy its endpoints verbatim. In production:
 
 `example/` is a full working demo: chat as different personas on the left; a live
 admin panel on the right with the request audit log (inspect → edit → re-run,
-with lineage), a users table (rate / spend / token limits, soft toggle, block),
-and per-action budgets.
+with lineage), a users table (rate / spend / token limits, soft toggle, block,
+one-time bump), and per-action budgets.
+
+Per-user limits — rate, daily spend, daily tokens, hard/soft, block, one-time bump:
+
+![Users & Limits admin table](docs/users.png)
+
+Per-action budgets, auto-attributed to the calling Convex function (including
+agent generations via `agentChat`):
+
+![Actions & Budgets admin table](docs/actions.png)
 
 ```sh
 cd example
