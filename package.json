@@ -1,6 +1,6 @@
 {
   "name": "@convex-dev/ai-budget",
-  "description": "Metered, budget-governed AI Gateway usage for Convex: cost & usage tracking, per-user and per-action spend/rate limits, request logging, and re-run.",
+  "description": "Metered, budget-governed AI Gateway usage for Convex: cost & usage tracking, per-user and per-action spend/token/rate limits, request logging, re-run, and an Agent-component adapter.",
   "version": "0.0.1",
   "license": "Apache-2.0",
   "type": "module",
@@ -18,16 +18,35 @@
     "type": "git",
     "url": "git+https://github.com/get-convex/ai-budget.git"
   },
-  "exports": {
-    ".": "./src/client/index.ts",
-    "./convex.config": "./src/component/convex.config.ts"
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "npm run build"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client/index.js"
+    },
+    "./convex.config": {
+      "types": "./dist/component/convex.config.d.ts",
+      "default": "./dist/component/convex.config.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
   "peerDependencies": {
     "@convex-dev/ai-sdk-provider": "*",
     "ai": "^5.0.0 || ^6.0.0 || ^7.0.0",
     "convex": "^1.45.0"
   },
-  "files": [
-    "src"
-  ]
+  "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
+    "convex-test": "^0.0.38",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.0"
+  }
 }
