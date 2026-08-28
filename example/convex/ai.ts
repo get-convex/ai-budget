@@ -48,42 +48,42 @@ export const rerun = action({
     model: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    return await ai.rerun(ctx, args);
+    return await ai.requests.rerun(ctx, args);
   },
 });
 
 export const listRequests = query({
   args: { userId: v.optional(v.string()) },
   handler: async (ctx, args) => {
-    return await ai.listRequests(ctx, { ...args, limit: 100 });
+    return await ai.requests.list(ctx, { ...args, limit: 100 });
   },
 });
 
 export const lineage = query({
   args: { requestId: v.string() },
   handler: async (ctx, args) => {
-    return await ai.lineage(ctx, args);
+    return await ai.requests.lineage(ctx, args);
   },
 });
 
 export const listUsers = query({
   args: {},
   handler: async (ctx) => {
-    return await ai.listUsers(ctx);
+    return await ai.users.list(ctx);
   },
 });
 
 export const listPrices = query({
   args: {},
   handler: async (ctx) => {
-    return await ai.listPrices(ctx);
+    return await ai.prices.list(ctx);
   },
 });
 
 export const listActions = query({
   args: {},
   handler: async (ctx) => {
-    return await ai.listActions(ctx);
+    return await ai.actions.list(ctx);
   },
 });
 
@@ -94,21 +94,21 @@ export const setPrice = mutation({
     outputCentsPerMTok: v.number(),
   },
   handler: async (ctx, args) => {
-    await ai.setPrice(ctx, args);
+    await ai.prices.set(ctx, args);
   },
 });
 
 export const getModelPolicy = query({
   args: {},
   handler: async (ctx) => {
-    return await ai.getModelPolicy(ctx);
+    return await ai.models.getPolicy(ctx);
   },
 });
 
 export const getGlobalStatus = query({
   args: {},
   handler: async (ctx) => {
-    return await ai.getGlobalStatus(ctx);
+    return await ai.global.status(ctx);
   },
 });
 
@@ -119,7 +119,7 @@ export const setGlobalLimits = mutation({
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
   },
   handler: async (ctx, args) => {
-    await ai.setGlobalLimits(ctx, args);
+    await ai.global.setLimits(ctx, args);
   },
 });
 
@@ -133,7 +133,7 @@ export const setModelPolicy = mutation({
     models: v.array(v.string()),
   },
   handler: async (ctx, args) => {
-    await ai.setModelPolicy(ctx, args);
+    await ai.models.setPolicy(ctx, args);
   },
 });
 
@@ -148,14 +148,14 @@ export const setActionLimits = mutation({
     disabled: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    await ai.setActionLimits(ctx, args);
+    await ai.actions.setLimits(ctx, args);
   },
 });
 
 export const deleteUser = mutation({
   args: { userId: v.string() },
   handler: async (ctx, args) => {
-    return await ai.deleteUser(ctx, args);
+    return await ai.users.delete(ctx, args);
   },
 });
 
@@ -166,7 +166,7 @@ export const bumpUser = mutation({
     lifetimeCents: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    await ai.bumpUser(ctx, args);
+    await ai.users.bump(ctx, args);
   },
 });
 
@@ -177,7 +177,7 @@ export const bumpAction = mutation({
     lifetimeCents: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    await ai.bumpAction(ctx, args);
+    await ai.actions.bump(ctx, args);
   },
 });
 
@@ -187,7 +187,7 @@ export const bumpGlobal = mutation({
     lifetimeCents: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    await ai.bumpGlobal(ctx, args);
+    await ai.global.bump(ctx, args);
   },
 });
 
@@ -203,6 +203,6 @@ export const setLimits = mutation({
     blocked: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    await ai.setLimits(ctx, args);
+    await ai.users.setLimits(ctx, args);
   },
 });

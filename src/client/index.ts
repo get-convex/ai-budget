@@ -376,8 +376,7 @@ export class AIBudget {
     }) as LanguageModel;
   }
 
-  /** Re-run a stored request, optionally with modified messages or model. */
-  async rerun(
+  private async rerunImpl(
     ctx: RunMutationCtx,
     args: { requestId: string; messages?: Message[]; model?: string }
   ): Promise<ChatResult> {
@@ -394,138 +393,130 @@ export class AIBudget {
     });
   }
 
-  // ---------- admin passthroughs ----------
+  // ---------- namespaced admin API ----------
 
-  async listRequests(
-    ctx: RunQueryCtx,
-    args: { userId?: string; limit?: number } = {}
-  ) {
-    return ctx.runQuery(this.component.lib.listRequests, args);
+  /** The request audit log, replay, and re-run lineage. */
+  get requests() {
+    const c = this.component;
+    return {
+      list: (ctx: RunQueryCtx, args: { userId?: string; limit?: number } = {}) =>
+        ctx.runQuery(c.lib.listRequests, args),
+      /** Ancestors up to the original, plus direct re-runs. */
+      lineage: (ctx: RunQueryCtx, args: { requestId: string }) =>
+        ctx.runQuery(c.lib.lineage, { requestId: args.requestId as any }),
+      /** Replay a stored request, optionally with edited messages/model. */
+      rerun: (
+        ctx: RunMutationCtx,
+        args: { requestId: string; messages?: Message[]; model?: string }
+      ) => this.rerunImpl(ctx, args),
+    };
   }
 
-  /** The re-run chain for a request: ancestors up to the original, plus direct re-runs. */
-  async lineage(ctx: RunQueryCtx, args: { requestId: string }) {
-    return ctx.runQuery(this.component.lib.lineage, {
-      requestId: args.requestId as any,
-    });
+  /** Per-user budgets and controls. */
+  get users() {
+    const c = this.component;
+    return {
+      list: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.listUsers, {}),
+      setLimits: (
+        ctx: RunMutationCtx,
+        args: {
+          userId: string;
+          requestsPerMinute?: number;
+          dailySpendLimitCents?: number;
+          lifetimeSpendLimitCents?: number;
+          dailyTokenLimit?: number;
+          lifetimeTokenLimit?: number;
+          enforcement?: "hard" | "soft";
+          blocked?: boolean;
+        }
+      ) => ctx.runMutation(c.lib.setLimits, args),
+      /** One-time "approve another $X" bump (daily is today-only). */
+      bump: (
+        ctx: RunMutationCtx,
+        args: { userId: string; dailyCents?: number; lifetimeCents?: number }
+      ) => ctx.runMutation(c.lib.bumpUser, args),
+      /** Delete a user and all their request rows. */
+      delete: (ctx: RunMutationCtx, args: { userId: string }) =>
+        ctx.runMutation(c.lib.deleteUser, args),
+    };
   }
 
-  async listUsers(ctx: RunQueryCtx) {
-    return ctx.runQuery(this.component.lib.listUsers, {});
+  /** Per-action (per-feature) budgets. */
+  get actions() {
+    const c = this.component;
+    return {
+      list: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.listActions, {}),
+      setLimits: (
+        ctx: RunMutationCtx,
+        args: {
+          name: string;
+          dailySpendLimitCents?: number;
+          lifetimeSpendLimitCents?: number;
+          dailyTokenLimit?: number;
+          lifetimeTokenLimit?: number;
+          enforcement?: "hard" | "soft";
+          disabled?: boolean;
+        }
+      ) => ctx.runMutation(c.lib.setActionLimits, args),
+      bump: (
+        ctx: RunMutationCtx,
+        args: { name: string; dailyCents?: number; lifetimeCents?: number }
+      ) => ctx.runMutation(c.lib.bumpAction, args),
+    };
   }
 
-  async listPrices(ctx: RunQueryCtx) {
-    return ctx.runQuery(this.component.lib.listPrices, {});
+  /** The deployment-wide budget and retention config. */
+  get global() {
+    const c = this.component;
+    return {
+      /** Limits + spend today/total. */
+      status: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.getGlobalStatus, {}),
+      /** A killswitch spend cap across all users/actions (enforced approximately). */
+      setLimits: (
+        ctx: RunMutationCtx,
+        args: {
+          dailySpendLimitCents?: number;
+          lifetimeSpendLimitCents?: number;
+          enforcement?: "hard" | "soft";
+        }
+      ) => ctx.runMutation(c.lib.setGlobalLimits, args),
+      bump: (
+        ctx: RunMutationCtx,
+        args: { dailyCents?: number; lifetimeCents?: number }
+      ) => ctx.runMutation(c.lib.bumpGlobal, args),
+      /** Request-row retention window in ms (default 1h; 0 disables). */
+      setRetention: (ctx: RunMutationCtx, args: { retentionMs: number }) =>
+        ctx.runMutation(c.lib.setRetention, args),
+    };
   }
 
-  async setLimits(
-    ctx: RunMutationCtx,
-    args: {
-      userId: string;
-      requestsPerMinute?: number;
-      dailySpendLimitCents?: number;
-      lifetimeSpendLimitCents?: number;
-      dailyTokenLimit?: number;
-      lifetimeTokenLimit?: number;
-      enforcement?: "hard" | "soft";
-      blocked?: boolean;
-    }
-  ) {
-    return ctx.runMutation(this.component.lib.setLimits, args);
+  /** Model allow/deny policy. */
+  get models() {
+    const c = this.component;
+    return {
+      getPolicy: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.getModelPolicy, {}),
+      /** mode: "open" | "allowlist" (only these) | "denylist" (all but these). */
+      setPolicy: (
+        ctx: RunMutationCtx,
+        args: { mode: "open" | "allowlist" | "denylist"; models: string[] }
+      ) => ctx.runMutation(c.lib.setModelPolicy, args),
+    };
   }
 
-  async listActions(ctx: RunQueryCtx) {
-    return ctx.runQuery(this.component.lib.listActions, {});
-  }
-
-  /** One-time "approve another $X" bump for a user (daily is today-only). */
-  async bumpUser(
-    ctx: RunMutationCtx,
-    args: { userId: string; dailyCents?: number; lifetimeCents?: number }
-  ) {
-    return ctx.runMutation(this.component.lib.bumpUser, args);
-  }
-
-  /** One-time bump for an action's budget. */
-  async bumpAction(
-    ctx: RunMutationCtx,
-    args: { name: string; dailyCents?: number; lifetimeCents?: number }
-  ) {
-    return ctx.runMutation(this.component.lib.bumpAction, args);
-  }
-
-  /** One-time bump for the deployment-wide budget. */
-  async bumpGlobal(
-    ctx: RunMutationCtx,
-    args: { dailyCents?: number; lifetimeCents?: number }
-  ) {
-    return ctx.runMutation(this.component.lib.bumpGlobal, args);
-  }
-
-  /** Delete a user and all their request rows. Returns rows removed. */
-  async deleteUser(ctx: RunMutationCtx, args: { userId: string }) {
-    return ctx.runMutation(this.component.lib.deleteUser, args);
-  }
-
-  /** Current model allow/deny policy. */
-  async getModelPolicy(ctx: RunQueryCtx) {
-    return ctx.runQuery(this.component.lib.getModelPolicy, {});
-  }
-
-  /** Deployment-wide spend cap status: limits + spend today/total. */
-  async getGlobalStatus(ctx: RunQueryCtx) {
-    return ctx.runQuery(this.component.lib.getGlobalStatus, {});
-  }
-
-  /**
-   * Set a deployment-wide ("global") spend cap across all users and actions.
-   * Enforced approximately (see the component docs) — a killswitch budget, not
-   * an exact per-request reservation. Pass a field as `undefined` to clear it.
-   */
-  async setGlobalLimits(
-    ctx: RunMutationCtx,
-    args: {
-      dailySpendLimitCents?: number;
-      lifetimeSpendLimitCents?: number;
-      enforcement?: "hard" | "soft";
-    }
-  ) {
-    return ctx.runMutation(this.component.lib.setGlobalLimits, args);
-  }
-
-  /**
-   * Restrict which models may be used component-wide.
-   * - `open`: any model (default)
-   * - `allowlist`: only `models` are allowed
-   * - `denylist`: any model except `models`
-   */
-  async setModelPolicy(
-    ctx: RunMutationCtx,
-    args: { mode: "open" | "allowlist" | "denylist"; models: string[] }
-  ) {
-    return ctx.runMutation(this.component.lib.setModelPolicy, args);
-  }
-
-  async setActionLimits(
-    ctx: RunMutationCtx,
-    args: {
-      name: string;
-      dailySpendLimitCents?: number;
-      lifetimeSpendLimitCents?: number;
-      dailyTokenLimit?: number;
-      lifetimeTokenLimit?: number;
-      enforcement?: "hard" | "soft";
-      disabled?: boolean;
-    }
-  ) {
-    return ctx.runMutation(this.component.lib.setActionLimits, args);
-  }
-
-  async setPrice(
-    ctx: RunMutationCtx,
-    args: { model: string; inputCentsPerMTok: number; outputCentsPerMTok: number }
-  ) {
-    return ctx.runMutation(this.component.lib.setPrice, args);
+  /** Per-model prices (cents per million tokens). */
+  get prices() {
+    const c = this.component;
+    return {
+      list: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.listPrices, {}),
+      set: (
+        ctx: RunMutationCtx,
+        args: {
+          model: string;
+          inputCentsPerMTok: number;
+          outputCentsPerMTok: number;
+        }
+      ) => ctx.runMutation(c.lib.setPrice, args),
+    };
   }
 }
 

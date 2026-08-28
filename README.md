@@ -62,13 +62,19 @@ Create a client:
 
 ```ts
 // convex/ai.ts
-import { WorryFreeAI } from "@convex-dev/ai-budget";
+import { AIBudget } from "@convex-dev/ai-budget";
 import { components } from "./_generated/api";
 
-export const ai = new WorryFreeAI(components.aiBudget, {
+export const ai = new AIBudget(components.aiBudget, {
   defaultModel: "openai/gpt-4o-mini",
+  // Optional: surface soft-limit warnings even on the Agent/languageModel path.
+  onSoftLimit: ({ userId, warnings }) => console.warn(userId, warnings),
 });
 ```
+
+The admin API is namespaced: `ai.users.*`, `ai.actions.*`, `ai.global.*`,
+`ai.models.*`, `ai.prices.*`, and `ai.requests.*`; `ai.chat` and
+`ai.languageModel` are top-level.
 
 ---
 
@@ -96,7 +102,7 @@ identity yourself.
 Give someone a budget:
 
 ```ts
-await ai.setLimits(ctx, {
+await ai.users.setLimits(ctx, {
   userId: "alice",
   dailySpendLimitCents: 100,     // $1.00 / day
   dailyTokenLimit: 500_000,
@@ -105,7 +111,7 @@ await ai.setLimits(ctx, {
 ```
 
 When a request would exceed a **hard** cap, `chat` throws a `ConvexError`
-carrying `{ kind: "AIGatewayLimit", code, reason }`; the attempt is still
+carrying `{ kind: "AIBudgetLimit", code, reason }`; the attempt is still
 recorded (`status: "blocked"`) so you can see who's hitting limits.
 
 ---
@@ -159,8 +165,8 @@ Every generation the agent makes is now tracked and budgeted, attributed to
 ### Replay
 
 ```ts
-ai.rerun(ctx, { requestId, messages?, model? }): Promise<ChatResult>
-ai.lineage(ctx, { requestId }): Promise<{ ancestors, reruns }>
+ai.requests.rerun(ctx, { requestId, messages?, model? }): Promise<ChatResult>
+ai.requests.lineage(ctx, { requestId }): Promise<{ ancestors, reruns }>
 ```
 
 `rerun` re-runs a stored request (optionally with edited messages/model), linked
@@ -169,7 +175,7 @@ to the original. `lineage` walks the re-run chain in both directions.
 ### User limits
 
 ```ts
-ai.setLimits(ctx, {
+ai.users.setLimits(ctx, {
   userId,
   requestsPerMinute?,
   dailySpendLimitCents?,
@@ -179,7 +185,7 @@ ai.setLimits(ctx, {
   enforcement?,       // "hard" (block, default) | "soft" (warn but allow)
   blocked?,           // hard block on/off
 })
-ai.deleteUser(ctx, { userId })   // remove a user and all their request rows
+ai.users.delete(ctx, { userId })   // remove a user and all their request rows
 ```
 
 Pass a field as `undefined` to clear that limit (unlimited).
@@ -189,7 +195,7 @@ Pass a field as `undefined` to clear that limit (unlimited).
 Spend is attributed to the calling action automatically. Cap a feature:
 
 ```ts
-ai.setActionLimits(ctx, {
+ai.actions.setLimits(ctx, {
   name,                          // e.g. "ai:summarize"
   dailySpendLimitCents?,
   lifetimeSpendLimitCents?,
@@ -203,8 +209,8 @@ ai.setActionLimits(ctx, {
 ### Global (deployment-wide) budget
 
 ```ts
-ai.setGlobalLimits(ctx, { dailySpendLimitCents?, lifetimeSpendLimitCents?, enforcement? })
-ai.getGlobalStatus(ctx)   // { limits, spentTodayCents, spentTotalCents }
+ai.global.setLimits(ctx, { dailySpendLimitCents?, lifetimeSpendLimitCents?, enforcement? })
+ai.global.status(ctx)   // { limits, spentTodayCents, spentTotalCents }
 ```
 
 A killswitch across all users and actions. Backed by a sharded counter for
@@ -214,9 +220,9 @@ per-user and per-action caps remain exact.
 ### One-time bumps ("approve another $X")
 
 ```ts
-ai.bumpUser(ctx, { userId, dailyCents?, lifetimeCents? })
-ai.bumpAction(ctx, { name, dailyCents?, lifetimeCents? })
-ai.bumpGlobal(ctx, { dailyCents?, lifetimeCents? })
+ai.users.bump(ctx, { userId, dailyCents?, lifetimeCents? })
+ai.actions.bump(ctx, { name, dailyCents?, lifetimeCents? })
+ai.global.bump(ctx, { dailyCents?, lifetimeCents? })
 ```
 
 Adds headroom on top of the standing cap without changing it. Daily bumps apply
@@ -225,9 +231,9 @@ to today only (reset with the day); lifetime bumps are permanent.
 ### Model policy
 
 ```ts
-ai.setModelPolicy(ctx, { mode, models })
+ai.models.setPolicy(ctx, { mode, models })
 // mode: "open" (default) | "allowlist" (only these) | "denylist" (all but these)
-ai.getModelPolicy(ctx)
+ai.models.getPolicy(ctx)
 ```
 
 ### Pricing
@@ -236,8 +242,8 @@ Prices are in **cents per million tokens**. Sensible defaults ship for common
 models; override or add any model:
 
 ```ts
-ai.setPrice(ctx, { model, inputCentsPerMTok, outputCentsPerMTok })  // must be ≥ 0
-ai.listPrices(ctx)
+ai.prices.set(ctx, { model, inputCentsPerMTok, outputCentsPerMTok })  // must be ≥ 0
+ai.prices.list(ctx)
 ```
 
 An unpriced model is charged the conservative maximum of the known table (so a
@@ -247,9 +253,9 @@ flagged `unpricedModel: true` so you know to add a real price.
 ### Observability
 
 ```ts
-ai.listUsers(ctx)                      // per-user spend today / total / tokens / limits
-ai.listActions(ctx)                    // per-action spend & totals
-ai.listRequests(ctx, { userId?, limit? })  // the audit log (blocked attempts included)
+ai.users.list(ctx)                      // per-user spend today / total / tokens / limits
+ai.actions.list(ctx)                    // per-action spend & totals
+ai.requests.list(ctx, { userId?, limit? })  // the audit log (blocked attempts included)
 ```
 
 ---
@@ -343,7 +349,7 @@ npm run build       # emit dist/ (client + component) for publishing
 - `src/component/` — the component: tables (`users`, `actions`, `requests`,
   `prices`, `settings`), the reserve/settle mutations (`startRequest` /
   `finishRequest`), the idempotent `foldTotals`, and the `reconcile` cron.
-- `src/client/` — the `WorryFreeAI` class: `chat`, `languageModel` (AI SDK
+- `src/client/` — the `AIBudget` class: `chat`, `languageModel` (AI SDK
   middleware around `convexGateway`), `rerun`, and the admin methods above.
 - `example/` — the demo app.
 
