@@ -10,15 +10,18 @@ const MODELS = [
   "anthropic/claude-sonnet-4.5",
 ];
 
-const cents = (c: number | undefined) =>
-  c === undefined ? "—" : `${c < 1 ? c.toFixed(4) : c.toFixed(2)}¢`;
-const dollars = (c: number) =>
-  c >= 100 ? `$${(c / 100).toFixed(2)}` : cents(c);
+// All money is integer nanodollars (1 USD = 1e9).
+const NANOS = 1e9;
+const usd = (nanos: number | undefined) =>
+  nanos === undefined ? "—" : `$${(nanos / NANOS).toFixed(nanos < NANOS / 100 ? 6 : 2)}`;
+// aliases kept so existing call sites render nanodollars as USD
+const cents = usd;
+const dollars = usd;
 
 type ChatEntry = {
   who: "user" | "ai" | "error";
   text: string;
-  costCents?: number;
+  costNanos?: number;
   warnings?: string[];
 };
 
@@ -123,7 +126,7 @@ function Chat({ userId, model }: { userId: string; model: string }) {
     setBusy(true);
     try {
       const res = await send({ userId, prompt, model });
-      push({ who: "ai", text: res.text, costCents: res.costCents, warnings: res.warnings });
+      push({ who: "ai", text: res.text, costNanos: res.costNanos, warnings: res.warnings });
     } catch (e: any) {
       const data = e?.data;
       push({
@@ -169,9 +172,9 @@ function Chat({ userId, model }: { userId: string; model: string }) {
                 ))}
               </div>
             )}
-            {m.costCents !== undefined && (
+            {m.costNanos !== undefined && (
               <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
-                cost: {cents(m.costCents)}
+                cost: {cents(m.costNanos)}
               </div>
             )}
           </div>
@@ -198,7 +201,7 @@ function Chat({ userId, model }: { userId: string; model: string }) {
             try {
               const text = entries.map((e) => `${e.who}: ${e.text}`).join("\n");
               const res = await summarize({ userId, text });
-              push({ who: "ai", text: `📝 ${res.text}`, costCents: res.costCents });
+              push({ who: "ai", text: `📝 ${res.text}`, costNanos: res.costNanos });
             } catch (e: any) {
               const data = e?.data;
               push({
@@ -219,7 +222,7 @@ function Chat({ userId, model }: { userId: string; model: string }) {
 
 function Totals() {
   const users = useQuery(api.ai.listUsers) ?? [];
-  const total = users.reduce((s: number, u: any) => s + u.totalSpendCents, 0);
+  const total = users.reduce((s: number, u: any) => s + u.totalSpendNanos, 0);
   const requests = users.reduce((s: number, u: any) => s + u.totalRequests, 0);
   return (
     <div style={{ marginLeft: "auto", color: "var(--muted)", fontSize: 13 }}>
@@ -271,7 +274,7 @@ function Requests() {
               <td className="mono">
                 {r.promptTokens !== undefined ? `${r.promptTokens}→${r.completionTokens}` : "—"}
               </td>
-              <td className="mono">{cents(r.costCents)}</td>
+              <td className="mono">{cents(r.costNanos)}</td>
               <td className="mono">{r.latencyMs ? `${r.latencyMs}ms` : "—"}</td>
               <td>
                 <button className="ghost" onClick={() => setSelected(r)}>
@@ -364,7 +367,7 @@ function Inspector({
             {lineage.ancestors.map((a: any) => (
               <span key={a._id}>
                 <button className="ghost" onClick={() => onOpen(a)}>
-                  {new Date(a._creationTime).toLocaleTimeString()} · {a.model.split("/")[1]} · {cents(a.costCents)}
+                  {new Date(a._creationTime).toLocaleTimeString()} · {a.model.split("/")[1]} · {cents(a.costNanos)}
                 </button>{" "}
                 →
               </span>
@@ -383,7 +386,7 @@ function Inspector({
               <span key={r._id}>
                 →{" "}
                 <button className="ghost" onClick={() => onOpen(r)}>
-                  {new Date(r._creationTime).toLocaleTimeString()} · {r.model.split("/")[1]} · {cents(r.costCents)}
+                  {new Date(r._creationTime).toLocaleTimeString()} · {r.model.split("/")[1]} · {cents(r.costNanos)}
                 </button>
               </span>
             ))}
@@ -408,7 +411,7 @@ function Inspector({
         {request.responseText && (
           <div style={{ background: "var(--panel2)", borderRadius: 8, padding: 10, marginBottom: 10 }}>
             <div style={{ fontSize: 12, color: "var(--muted)" }}>
-              original response · {cents(request.costCents)}
+              original response · {cents(request.costNanos)}
             </div>
             <div style={{ whiteSpace: "pre-wrap" }}>{request.responseText}</div>
           </div>
@@ -426,7 +429,7 @@ function Inspector({
             ) : (
               <>
                 <div style={{ fontSize: 12, color: "var(--accent2)" }}>
-                  new response · {cents(result.costCents)}
+                  new response · {cents(result.costNanos)}
                 </div>
                 <div style={{ whiteSpace: "pre-wrap" }}>{result.text}</div>
               </>
@@ -452,7 +455,7 @@ function Users() {
           <th>spend today</th>
           <th>total spend</th>
           <th>req/min</th>
-          <th>daily ¢</th>
+          <th>daily $</th>
           <th>daily tokens</th>
           <th>soft</th>
           <th>blocked</th>
@@ -465,8 +468,8 @@ function Users() {
             <td><b>{u.userId}</b></td>
             <td className="mono">{u.totalRequests}</td>
             <td className="mono">{u.totalTokens.toLocaleString()}</td>
-            <td className="mono">{dollars(u.spendTodayCents)}</td>
-            <td className="mono">{dollars(u.totalSpendCents)}</td>
+            <td className="mono">{dollars(u.spendTodayNanos)}</td>
+            <td className="mono">{dollars(u.totalSpendNanos)}</td>
             <td>
               <LimitInput
                 value={u.requestsPerMinute}
@@ -474,9 +477,9 @@ function Users() {
               />
             </td>
             <td>
-              <LimitInput
-                value={u.dailySpendLimitCents}
-                onSave={(n) => setLimits({ userId: u.userId, dailySpendLimitCents: n })}
+              <MoneyInput
+                value={u.dailySpendLimitNanos}
+                onSave={(n) => setLimits({ userId: u.userId, dailySpendLimitNanos: n })}
               />
             </td>
             <td>
@@ -501,12 +504,12 @@ function Users() {
                 onChange={(e) => setLimits({ userId: u.userId, blocked: e.target.checked })}
               />
             </td>
-            <td title="One-time bump: approve another $0.01 of daily budget">
+            <td title="One-time bump: approve another $1 of daily budget">
               <button
                 className="ghost"
-                onClick={() => bumpUser({ userId: u.userId, dailyCents: 1 })}
+                onClick={() => bumpUser({ userId: u.userId, dailyNanos: NANOS })}
               >
-                +1¢ today
+                +$1 today
               </button>
             </td>
           </tr>
@@ -533,7 +536,7 @@ function Actions() {
             <th>tokens</th>
             <th>spend today</th>
             <th>total spend</th>
-            <th>daily limit (¢)</th>
+            <th>daily limit ($)</th>
             <th>disabled</th>
           </tr>
         </thead>
@@ -543,12 +546,12 @@ function Actions() {
               <td className="mono"><b>{a.name}</b></td>
               <td className="mono">{a.totalRequests}</td>
               <td className="mono">{a.totalTokens.toLocaleString()}</td>
-              <td className="mono">{dollars(a.spendTodayCents)}</td>
-              <td className="mono">{dollars(a.totalSpendCents)}</td>
+              <td className="mono">{dollars(a.spendTodayNanos)}</td>
+              <td className="mono">{dollars(a.totalSpendNanos)}</td>
               <td>
-                <LimitInput
-                  value={a.dailySpendLimitCents}
-                  onSave={(n) => setLimits({ name: a.name, dailySpendLimitCents: n })}
+                <MoneyInput
+                  value={a.dailySpendLimitNanos}
+                  onSave={(n) => setLimits({ name: a.name, dailySpendLimitNanos: n })}
                 />
               </td>
               <td>
@@ -584,6 +587,29 @@ function LimitInput({
       onKeyDown={(e) =>
         e.key === "Enter" && onSave(text === "" ? undefined : Number(text))
       }
+    />
+  );
+}
+
+// A limit stored in nanodollars but edited in dollars.
+function MoneyInput({
+  value,
+  onSave,
+}: {
+  value: number | undefined;
+  onSave: (nanos: number | undefined) => void;
+}) {
+  const [text, setText] = useState(value === undefined ? "" : (value / NANOS).toString());
+  const save = () =>
+    onSave(text === "" ? undefined : Math.round(Number(text) * NANOS));
+  return (
+    <input
+      style={{ width: 80 }}
+      placeholder="∞ $"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={save}
+      onKeyDown={(e) => e.key === "Enter" && save()}
     />
   );
 }

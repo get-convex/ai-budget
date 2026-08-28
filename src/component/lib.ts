@@ -10,20 +10,30 @@ import { vMessage } from "./schema";
 import type { Doc } from "./_generated/dataModel";
 import { ShardedCounter } from "@convex-dev/sharded-counter";
 
-// Deployment-wide spend totals (cents), sharded for high write throughput.
+// All money is integer **nanodollars** (1 USD = 1e9 nano). Integers avoid the
+// rounding drift that floating-point cents accumulate over millions of
+// requests, and keep cap comparisons exact. Nanodollars up to ~$9M are exact in
+// a JS number (2^53); beyond that you'd move to int64. This is the single fixed
+// currency (USD) for now — a future multi-currency version would carry a
+// currency code alongside these amounts and convert here, at the one boundary.
+const NANOS_PER_DOLLAR = 1e9;
+const fmtUsd = (nanos: number) => `$${(nanos / NANOS_PER_DOLLAR).toFixed(4)}`;
+
+// Deployment-wide spend totals (nanodollars), sharded for high write throughput.
 // Keyed "total" (lifetime) and "day:<UTC date>" (natural daily reset).
 const globalSpend = new ShardedCounter(components.shardedCounter);
 const GLOBAL_TOTAL = "total";
 const globalDayKey = (stamp: string) => `day:${stamp}`;
 
-// Fallback prices in cents per million tokens, used when no override is stored.
+// Fallback prices in NANODOLLARS per million tokens, used when no override is
+// stored (e.g. gpt-4o-mini = $0.15 in / $0.60 out per Mtok).
 const DEFAULT_PRICES: Record<string, { input: number; output: number }> = {
-  "anthropic/claude-sonnet-4.5": { input: 300, output: 1500 },
-  "anthropic/claude-haiku-4.5": { input: 100, output: 500 },
-  "openai/gpt-4o": { input: 250, output: 1000 },
-  "openai/gpt-4o-mini": { input: 15, output: 60 },
-  "openai/gpt-5": { input: 125, output: 1000 },
-  "openai/gpt-5-mini": { input: 25, output: 200 },
+  "anthropic/claude-sonnet-4.5": { input: 3_000_000_000, output: 15_000_000_000 },
+  "anthropic/claude-haiku-4.5": { input: 1_000_000_000, output: 5_000_000_000 },
+  "openai/gpt-4o": { input: 2_500_000_000, output: 10_000_000_000 },
+  "openai/gpt-4o-mini": { input: 150_000_000, output: 600_000_000 },
+  "openai/gpt-5": { input: 1_250_000_000, output: 10_000_000_000 },
+  "openai/gpt-5-mini": { input: 250_000_000, output: 2_000_000_000 },
 };
 
 // Pessimistic assumed output length when reserving budget up front. Reservations
@@ -66,8 +76,8 @@ async function getPrice(ctx: MutationCtx, model: string) {
     .unique();
   if (override) {
     return {
-      input: override.inputCentsPerMTok,
-      output: override.outputCentsPerMTok,
+      input: override.inputNanosPerMTok,
+      output: override.outputNanosPerMTok,
       known: true,
     };
   }
@@ -76,11 +86,16 @@ async function getPrice(ctx: MutationCtx, model: string) {
   return { ...CONSERVATIVE_PRICE, known: false };
 }
 
+// Integer nanodollars. Divide-before-multiply keeps the intermediate product
+// within 2^53 even for large token counts × large per-Mtok prices.
 const costOf = (
   inputTokens: number,
   outputTokens: number,
   price: { input: number; output: number }
-) => (inputTokens / 1e6) * price.input + (outputTokens / 1e6) * price.output;
+) =>
+  Math.round(
+    (inputTokens / 1e6) * price.input + (outputTokens / 1e6) * price.output
+  );
 
 // Up-front estimate of a request's cost and token count, reserved before the
 // call so concurrent in-flight requests are visible to each other's caps.
@@ -113,8 +128,8 @@ function evaluateCaps(o: {
   reservedTokensToday: number;
   totalTokens: number;
   reservedTokensTotal: number;
-  dailySpendLimitCents?: number;
-  lifetimeSpendLimitCents?: number;
+  dailySpendLimitNanos?: number;
+  lifetimeSpendLimitNanos?: number;
   dailyTokenLimit?: number;
   lifetimeTokenLimit?: number;
 }): { hard?: { code: string; reason: string }; warnings: string[] } {
@@ -123,13 +138,13 @@ function evaluateCaps(o: {
     violations.push({ code: `${o.label}_${code}`, reason });
 
   if (
-    o.dailySpendLimitCents !== undefined &&
-    o.spendToday + o.reservedSpendToday + o.estCost > o.dailySpendLimitCents
+    o.dailySpendLimitNanos !== undefined &&
+    o.spendToday + o.reservedSpendToday + o.estCost > o.dailySpendLimitNanos
   )
-    push("daily_spend_limit", `Daily spend limit reached for ${o.label} "${o.name}" (${o.dailySpendLimitCents}¢/day)`);
+    push("daily_spend_limit", `Daily spend limit reached for ${o.label} "${o.name}" (${fmtUsd(o.dailySpendLimitNanos)}/day)`);
   if (
-    o.lifetimeSpendLimitCents !== undefined &&
-    o.totalSpend + o.reservedSpendTotal + o.estCost > o.lifetimeSpendLimitCents
+    o.lifetimeSpendLimitNanos !== undefined &&
+    o.totalSpend + o.reservedSpendTotal + o.estCost > o.lifetimeSpendLimitNanos
   )
     push("lifetime_spend_limit", `Lifetime spend limit reached for ${o.label} "${o.name}"`);
   if (
@@ -154,13 +169,13 @@ const withBump = (base: number | undefined, bump: number | undefined) =>
   base === undefined ? undefined : base + (bump ?? 0);
 
 const hasAnyCap = (e: {
-  dailySpendLimitCents?: number;
-  lifetimeSpendLimitCents?: number;
+  dailySpendLimitNanos?: number;
+  lifetimeSpendLimitNanos?: number;
   dailyTokenLimit?: number;
   lifetimeTokenLimit?: number;
 }) =>
-  e.dailySpendLimitCents !== undefined ||
-  e.lifetimeSpendLimitCents !== undefined ||
+  e.dailySpendLimitNanos !== undefined ||
+  e.lifetimeSpendLimitNanos !== undefined ||
   e.dailyTokenLimit !== undefined ||
   e.lifetimeTokenLimit !== undefined;
 
@@ -172,11 +187,11 @@ async function getOrCreateUser(ctx: MutationCtx, userId: string) {
   if (existing) return existing;
   const id = await ctx.db.insert("users", {
     userId,
-    totalSpendCents: 0,
+    totalSpendNanos: 0,
     totalRequests: 0,
     totalTokens: 0,
     dayStamp: dayStamp(),
-    spendTodayCents: 0,
+    spendTodayNanos: 0,
   });
   return (await ctx.db.get(id))!;
 }
@@ -189,11 +204,11 @@ async function getOrCreateAction(ctx: MutationCtx, name: string) {
   if (existing) return existing;
   const id = await ctx.db.insert("actions", {
     name,
-    totalSpendCents: 0,
+    totalSpendNanos: 0,
     totalRequests: 0,
     totalTokens: 0,
     dayStamp: dayStamp(),
-    spendTodayCents: 0,
+    spendTodayNanos: 0,
   });
   return (await ctx.db.get(id))!;
 }
@@ -302,21 +317,21 @@ export const startRequest = mutation({
       enforcement: user.enforcement ?? "hard",
       estCost: est.cost,
       estTokens: est.tokens,
-      spendToday: userSameDay ? user.spendTodayCents : 0,
-      reservedSpendToday: userSameDay ? user.reservedTodayCents ?? 0 : 0,
-      totalSpend: user.totalSpendCents,
-      reservedSpendTotal: user.reservedTotalCents ?? 0,
+      spendToday: userSameDay ? user.spendTodayNanos : 0,
+      reservedSpendToday: userSameDay ? user.reservedTodayNanos ?? 0 : 0,
+      totalSpend: user.totalSpendNanos,
+      reservedSpendTotal: user.reservedTotalNanos ?? 0,
       tokensToday: userSameDay ? user.tokensToday ?? 0 : 0,
       reservedTokensToday: userSameDay ? user.reservedTodayTokens ?? 0 : 0,
       totalTokens: user.totalTokens,
       reservedTokensTotal: user.reservedTotalTokens ?? 0,
-      dailySpendLimitCents: withBump(
-        user.dailySpendLimitCents,
-        user.bumpDayStamp === today ? user.dailyBumpCents : 0
+      dailySpendLimitNanos: withBump(
+        user.dailySpendLimitNanos,
+        user.bumpDayStamp === today ? user.dailyBumpNanos : 0
       ),
-      lifetimeSpendLimitCents: withBump(
-        user.lifetimeSpendLimitCents,
-        user.lifetimeBumpCents
+      lifetimeSpendLimitNanos: withBump(
+        user.lifetimeSpendLimitNanos,
+        user.lifetimeBumpNanos
       ),
       dailyTokenLimit: user.dailyTokenLimit,
       lifetimeTokenLimit: user.lifetimeTokenLimit,
@@ -337,21 +352,21 @@ export const startRequest = mutation({
         enforcement: action.enforcement ?? "hard",
         estCost: est.cost,
         estTokens: est.tokens,
-        spendToday: aSameDay ? action.spendTodayCents : 0,
-        reservedSpendToday: aSameDay ? action.reservedTodayCents ?? 0 : 0,
-        totalSpend: action.totalSpendCents,
-        reservedSpendTotal: action.reservedTotalCents ?? 0,
+        spendToday: aSameDay ? action.spendTodayNanos : 0,
+        reservedSpendToday: aSameDay ? action.reservedTodayNanos ?? 0 : 0,
+        totalSpend: action.totalSpendNanos,
+        reservedSpendTotal: action.reservedTotalNanos ?? 0,
         tokensToday: aSameDay ? action.tokensToday ?? 0 : 0,
         reservedTokensToday: aSameDay ? action.reservedTodayTokens ?? 0 : 0,
         totalTokens: action.totalTokens,
         reservedTokensTotal: action.reservedTotalTokens ?? 0,
-        dailySpendLimitCents: withBump(
-          action.dailySpendLimitCents,
-          action.bumpDayStamp === today ? action.dailyBumpCents : 0
+        dailySpendLimitNanos: withBump(
+          action.dailySpendLimitNanos,
+          action.bumpDayStamp === today ? action.dailyBumpNanos : 0
         ),
-        lifetimeSpendLimitCents: withBump(
-          action.lifetimeSpendLimitCents,
-          action.lifetimeBumpCents
+        lifetimeSpendLimitNanos: withBump(
+          action.lifetimeSpendLimitNanos,
+          action.lifetimeBumpNanos
         ),
         dailyTokenLimit: action.dailyTokenLimit,
         lifetimeTokenLimit: action.lifetimeTokenLimit,
@@ -366,22 +381,22 @@ export const startRequest = mutation({
     // traffic through one row. `policy` is the settings singleton fetched above.
     if (
       policy &&
-      (policy.globalDailySpendLimitCents !== undefined ||
-        policy.globalLifetimeSpendLimitCents !== undefined)
+      (policy.globalDailySpendLimitNanos !== undefined ||
+        policy.globalLifetimeSpendLimitNanos !== undefined)
     ) {
       const globalEnforcement = policy.globalEnforcement ?? "hard";
       const globalDailyCap = withBump(
-        policy.globalDailySpendLimitCents,
-        policy.globalBumpDayStamp === today ? policy.globalDailyBumpCents : 0
+        policy.globalDailySpendLimitNanos,
+        policy.globalBumpDayStamp === today ? policy.globalDailyBumpNanos : 0
       );
       const globalLifetimeCap = withBump(
-        policy.globalLifetimeSpendLimitCents,
-        policy.globalLifetimeBumpCents
+        policy.globalLifetimeSpendLimitNanos,
+        policy.globalLifetimeBumpNanos
       );
       if (globalDailyCap !== undefined) {
         const spentToday = await globalSpend.count(ctx, globalDayKey(today));
         if (spentToday + est.cost > globalDailyCap) {
-          const reason = `Global daily spend limit reached (${globalDailyCap}¢/day)`;
+          const reason = `Global daily spend limit reached (${fmtUsd(globalDailyCap)}/day)`;
           if (globalEnforcement === "hard")
             return reject("global_daily_spend_limit", reason);
           warnings.push(reason);
@@ -390,7 +405,7 @@ export const startRequest = mutation({
       if (globalLifetimeCap !== undefined) {
         const spentTotal = await globalSpend.count(ctx, GLOBAL_TOTAL);
         if (spentTotal + est.cost > globalLifetimeCap) {
-          const reason = `Global lifetime spend limit reached (${globalLifetimeCap}¢)`;
+          const reason = `Global lifetime spend limit reached (${fmtUsd(globalLifetimeCap)})`;
           if (globalEnforcement === "hard")
             return reject("global_lifetime_spend_limit", reason);
           warnings.push(reason);
@@ -405,10 +420,10 @@ export const startRequest = mutation({
     if (hasAnyCap(user)) {
       await ctx.db.patch(user._id, {
         dayStamp: today,
-        spendTodayCents: userSameDay ? user.spendTodayCents : 0,
+        spendTodayNanos: userSameDay ? user.spendTodayNanos : 0,
         tokensToday: userSameDay ? user.tokensToday ?? 0 : 0,
-        reservedTodayCents: (userSameDay ? user.reservedTodayCents ?? 0 : 0) + est.cost,
-        reservedTotalCents: (user.reservedTotalCents ?? 0) + est.cost,
+        reservedTodayNanos: (userSameDay ? user.reservedTodayNanos ?? 0 : 0) + est.cost,
+        reservedTotalNanos: (user.reservedTotalNanos ?? 0) + est.cost,
         reservedTodayTokens: (userSameDay ? user.reservedTodayTokens ?? 0 : 0) + est.tokens,
         reservedTotalTokens: (user.reservedTotalTokens ?? 0) + est.tokens,
         pendingCount: (user.pendingCount ?? 0) + 1,
@@ -418,10 +433,10 @@ export const startRequest = mutation({
       const aSameDay = action.dayStamp === today;
       await ctx.db.patch(action._id, {
         dayStamp: today,
-        spendTodayCents: aSameDay ? action.spendTodayCents : 0,
+        spendTodayNanos: aSameDay ? action.spendTodayNanos : 0,
         tokensToday: aSameDay ? action.tokensToday ?? 0 : 0,
-        reservedTodayCents: (aSameDay ? action.reservedTodayCents ?? 0 : 0) + est.cost,
-        reservedTotalCents: (action.reservedTotalCents ?? 0) + est.cost,
+        reservedTodayNanos: (aSameDay ? action.reservedTodayNanos ?? 0 : 0) + est.cost,
+        reservedTotalNanos: (action.reservedTotalNanos ?? 0) + est.cost,
         reservedTodayTokens: (aSameDay ? action.reservedTodayTokens ?? 0 : 0) + est.tokens,
         reservedTotalTokens: (action.reservedTotalTokens ?? 0) + est.tokens,
         pendingCount: (action.pendingCount ?? 0) + 1,
@@ -430,7 +445,7 @@ export const startRequest = mutation({
     const requestId = await ctx.db.insert("requests", {
       ...args,
       status: "pending",
-      estimatedCents: est.cost,
+      estimatedNanos: est.cost,
       estimatedTokens: est.tokens,
       ...(priceInfo.known ? {} : { unpricedModel: true }),
       ...(warnings.length > 0 ? { overBudget: true } : {}),
@@ -448,7 +463,7 @@ export const finishRequest = mutation({
     completionTokens: v.optional(v.number()),
     latencyMs: v.optional(v.number()),
   },
-  returns: v.object({ costCents: v.number() }),
+  returns: v.object({ costNanos: v.number() }),
   handler: async (ctx, args) => {
     const request = await ctx.db.get(args.requestId);
     if (!request) throw new Error("Unknown request");
@@ -461,14 +476,14 @@ export const finishRequest = mutation({
     // twice, dropping the reserved pool below reality and letting the atomic
     // check-and-reserve admit requests it should block.
     if (request.status !== "pending") {
-      return { costCents: request.costCents ?? 0 };
+      return { costNanos: request.costNanos ?? 0 };
     }
 
     // Clamp caller-supplied token counts: negatives would produce negative cost
     // and could refund a user below their cap.
     const promptTokens = Math.max(0, args.promptTokens ?? 0);
     const completionTokens = Math.max(0, args.completionTokens ?? 0);
-    const costCents = Math.max(
+    const costNanos = Math.max(
       0,
       costOf(promptTokens, completionTokens, await getPrice(ctx, request.model))
     );
@@ -482,7 +497,7 @@ export const finishRequest = mutation({
       error: args.error,
       promptTokens,
       completionTokens,
-      costCents,
+      costNanos,
       latencyMs: args.latencyMs,
       settled: false,
     });
@@ -492,7 +507,7 @@ export const finishRequest = mutation({
     await ctx.scheduler.runAfter(0, internal.lib.foldTotals, {
       requestId: args.requestId,
     });
-    return { costCents };
+    return { costNanos };
   },
 });
 
@@ -501,8 +516,8 @@ export const finishRequest = mutation({
 // reconciler can never double-count.
 async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   if (!req || req.settled !== false) return;
-  const actual = req.costCents ?? 0;
-  const estCost = req.estimatedCents ?? 0;
+  const actual = req.costNanos ?? 0;
+  const estCost = req.estimatedNanos ?? 0;
   const tokens = (req.promptTokens ?? 0) + (req.completionTokens ?? 0);
   const estTokens = req.estimatedTokens ?? 0;
   const today = dayStamp();
@@ -510,14 +525,14 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   const user = await getOrCreateUser(ctx, req.userId);
   const uSameDay = user.dayStamp === today;
   await ctx.db.patch(user._id, {
-    totalSpendCents: user.totalSpendCents + actual,
+    totalSpendNanos: user.totalSpendNanos + actual,
     totalRequests: user.totalRequests + 1,
     totalTokens: user.totalTokens + tokens,
     dayStamp: today,
-    spendTodayCents: (uSameDay ? user.spendTodayCents : 0) + actual,
+    spendTodayNanos: (uSameDay ? user.spendTodayNanos : 0) + actual,
     tokensToday: (uSameDay ? user.tokensToday ?? 0 : 0) + tokens,
-    reservedTodayCents: Math.max(0, (uSameDay ? user.reservedTodayCents ?? 0 : 0) - estCost),
-    reservedTotalCents: Math.max(0, (user.reservedTotalCents ?? 0) - estCost),
+    reservedTodayNanos: Math.max(0, (uSameDay ? user.reservedTodayNanos ?? 0 : 0) - estCost),
+    reservedTotalNanos: Math.max(0, (user.reservedTotalNanos ?? 0) - estCost),
     reservedTodayTokens: Math.max(0, (uSameDay ? user.reservedTodayTokens ?? 0 : 0) - estTokens),
     reservedTotalTokens: Math.max(0, (user.reservedTotalTokens ?? 0) - estTokens),
     pendingCount: Math.max(0, (user.pendingCount ?? 0) - 1),
@@ -527,14 +542,14 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
     const action = await getOrCreateAction(ctx, req.actionName);
     const aSameDay = action.dayStamp === today;
     await ctx.db.patch(action._id, {
-      totalSpendCents: action.totalSpendCents + actual,
+      totalSpendNanos: action.totalSpendNanos + actual,
       totalRequests: action.totalRequests + 1,
       totalTokens: action.totalTokens + tokens,
       dayStamp: today,
-      spendTodayCents: (aSameDay ? action.spendTodayCents : 0) + actual,
+      spendTodayNanos: (aSameDay ? action.spendTodayNanos : 0) + actual,
       tokensToday: (aSameDay ? action.tokensToday ?? 0 : 0) + tokens,
-      reservedTodayCents: Math.max(0, (aSameDay ? action.reservedTodayCents ?? 0 : 0) - estCost),
-      reservedTotalCents: Math.max(0, (action.reservedTotalCents ?? 0) - estCost),
+      reservedTodayNanos: Math.max(0, (aSameDay ? action.reservedTodayNanos ?? 0 : 0) - estCost),
+      reservedTotalNanos: Math.max(0, (action.reservedTotalNanos ?? 0) - estCost),
       reservedTodayTokens: Math.max(0, (aSameDay ? action.reservedTodayTokens ?? 0 : 0) - estTokens),
       reservedTotalTokens: Math.max(0, (action.reservedTotalTokens ?? 0) - estTokens),
       pendingCount: Math.max(0, (action.pendingCount ?? 0) - 1),
@@ -550,8 +565,8 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
       .unique();
     if (
       settings &&
-      (settings.globalDailySpendLimitCents !== undefined ||
-        settings.globalLifetimeSpendLimitCents !== undefined)
+      (settings.globalDailySpendLimitNanos !== undefined ||
+        settings.globalLifetimeSpendLimitNanos !== undefined)
     ) {
       await globalSpend.add(ctx, GLOBAL_TOTAL, actual);
       await globalSpend.add(ctx, globalDayKey(today), actual);
@@ -597,7 +612,7 @@ export const reconcile = internalMutation({
       await ctx.db.patch(req._id, {
         status: "error",
         error: "Timed out before settling; reservation released",
-        costCents: 0,
+        costNanos: 0,
         settled: false,
       });
       await foldOne(ctx, await ctx.db.get(req._id));
@@ -690,7 +705,7 @@ export const listUsers = query({
     const today = dayStamp();
     return users.map((u) => ({
       ...u,
-      spendTodayCents: u.dayStamp === today ? u.spendTodayCents : 0,
+      spendTodayNanos: u.dayStamp === today ? u.spendTodayNanos : 0,
     }));
   },
 });
@@ -699,8 +714,8 @@ export const setLimits = mutation({
   args: {
     userId: v.string(),
     requestsPerMinute: v.optional(v.number()),
-    dailySpendLimitCents: v.optional(v.number()),
-    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailySpendLimitNanos: v.optional(v.number()),
+    lifetimeSpendLimitNanos: v.optional(v.number()),
     dailyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
@@ -750,14 +765,14 @@ export const listActions = query({
     const today = dayStamp();
     return actions.map((a) => ({
       ...a,
-      spendTodayCents: a.dayStamp === today ? a.spendTodayCents : 0,
+      spendTodayNanos: a.dayStamp === today ? a.spendTodayNanos : 0,
     }));
   },
 });
 
 const vBumpArgs = {
-  dailyCents: v.optional(v.number()),
-  lifetimeCents: v.optional(v.number()),
+  dailyNanos: v.optional(v.number()),
+  lifetimeNanos: v.optional(v.number()),
 };
 
 // One-time "approve another $X" bumps, added on top of the standing cap without
@@ -765,14 +780,14 @@ const vBumpArgs = {
 export const bumpUser = mutation({
   args: { userId: v.string(), ...vBumpArgs },
   returns: v.null(),
-  handler: async (ctx, { userId, dailyCents, lifetimeCents }) => {
+  handler: async (ctx, { userId, dailyNanos, lifetimeNanos }) => {
     const user = await getOrCreateUser(ctx, userId);
     const today = dayStamp();
-    const curDaily = user.bumpDayStamp === today ? user.dailyBumpCents ?? 0 : 0;
+    const curDaily = user.bumpDayStamp === today ? user.dailyBumpNanos ?? 0 : 0;
     await ctx.db.patch(user._id, {
       bumpDayStamp: today,
-      dailyBumpCents: curDaily + (dailyCents ?? 0),
-      lifetimeBumpCents: (user.lifetimeBumpCents ?? 0) + (lifetimeCents ?? 0),
+      dailyBumpNanos: curDaily + (dailyNanos ?? 0),
+      lifetimeBumpNanos: (user.lifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
     });
     return null;
   },
@@ -781,14 +796,14 @@ export const bumpUser = mutation({
 export const bumpAction = mutation({
   args: { name: v.string(), ...vBumpArgs },
   returns: v.null(),
-  handler: async (ctx, { name, dailyCents, lifetimeCents }) => {
+  handler: async (ctx, { name, dailyNanos, lifetimeNanos }) => {
     const action = await getOrCreateAction(ctx, name);
     const today = dayStamp();
-    const curDaily = action.bumpDayStamp === today ? action.dailyBumpCents ?? 0 : 0;
+    const curDaily = action.bumpDayStamp === today ? action.dailyBumpNanos ?? 0 : 0;
     await ctx.db.patch(action._id, {
       bumpDayStamp: today,
-      dailyBumpCents: curDaily + (dailyCents ?? 0),
-      lifetimeBumpCents: (action.lifetimeBumpCents ?? 0) + (lifetimeCents ?? 0),
+      dailyBumpNanos: curDaily + (dailyNanos ?? 0),
+      lifetimeBumpNanos: (action.lifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
     });
     return null;
   },
@@ -797,14 +812,14 @@ export const bumpAction = mutation({
 export const bumpGlobal = mutation({
   args: vBumpArgs,
   returns: v.null(),
-  handler: async (ctx, { dailyCents, lifetimeCents }) => {
+  handler: async (ctx, { dailyNanos, lifetimeNanos }) => {
     const today = dayStamp();
     const s = await getSettings(ctx);
-    const curDaily = s?.globalBumpDayStamp === today ? s?.globalDailyBumpCents ?? 0 : 0;
+    const curDaily = s?.globalBumpDayStamp === today ? s?.globalDailyBumpNanos ?? 0 : 0;
     const patch = {
       globalBumpDayStamp: today,
-      globalDailyBumpCents: curDaily + (dailyCents ?? 0),
-      globalLifetimeBumpCents: (s?.globalLifetimeBumpCents ?? 0) + (lifetimeCents ?? 0),
+      globalDailyBumpNanos: curDaily + (dailyNanos ?? 0),
+      globalLifetimeBumpNanos: (s?.globalLifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
     };
     if (s) await ctx.db.patch(s._id, patch);
     else await ctx.db.insert("settings", { key: "singleton", ...patch });
@@ -815,8 +830,8 @@ export const bumpGlobal = mutation({
 export const setActionLimits = mutation({
   args: {
     name: v.string(),
-    dailySpendLimitCents: v.optional(v.number()),
-    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailySpendLimitNanos: v.optional(v.number()),
+    lifetimeSpendLimitNanos: v.optional(v.number()),
     dailyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
@@ -853,11 +868,11 @@ export const getModelPolicy = query({
 export const getGlobalStatus = query({
   args: {},
   returns: v.object({
-    dailySpendLimitCents: v.union(v.number(), v.null()),
-    lifetimeSpendLimitCents: v.union(v.number(), v.null()),
+    dailySpendLimitNanos: v.union(v.number(), v.null()),
+    lifetimeSpendLimitNanos: v.union(v.number(), v.null()),
     enforcement: v.union(v.literal("hard"), v.literal("soft")),
-    spentTodayCents: v.number(),
-    spentTotalCents: v.number(),
+    spentTodayNanos: v.number(),
+    spentTotalNanos: v.number(),
   }),
   handler: async (ctx) => {
     const s = await ctx.db
@@ -865,27 +880,27 @@ export const getGlobalStatus = query({
       .withIndex("key", (q) => q.eq("key", "singleton"))
       .unique();
     return {
-      dailySpendLimitCents: s?.globalDailySpendLimitCents ?? null,
-      lifetimeSpendLimitCents: s?.globalLifetimeSpendLimitCents ?? null,
+      dailySpendLimitNanos: s?.globalDailySpendLimitNanos ?? null,
+      lifetimeSpendLimitNanos: s?.globalLifetimeSpendLimitNanos ?? null,
       enforcement: s?.globalEnforcement ?? "hard",
-      spentTodayCents: await globalSpend.count(ctx, globalDayKey(dayStamp())),
-      spentTotalCents: await globalSpend.count(ctx, GLOBAL_TOTAL),
+      spentTodayNanos: await globalSpend.count(ctx, globalDayKey(dayStamp())),
+      spentTotalNanos: await globalSpend.count(ctx, GLOBAL_TOTAL),
     };
   },
 });
 
 export const setGlobalLimits = mutation({
   args: {
-    dailySpendLimitCents: v.optional(v.number()),
-    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailySpendLimitNanos: v.optional(v.number()),
+    lifetimeSpendLimitNanos: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
     // The settings fields are "global"-prefixed; map the friendly arg names.
     const patch = {
-      globalDailySpendLimitCents: args.dailySpendLimitCents,
-      globalLifetimeSpendLimitCents: args.lifetimeSpendLimitCents,
+      globalDailySpendLimitNanos: args.dailySpendLimitNanos,
+      globalLifetimeSpendLimitNanos: args.lifetimeSpendLimitNanos,
       globalEnforcement: args.enforcement,
     };
     const existing = await getSettings(ctx);
@@ -929,14 +944,14 @@ export const setModelPolicy = mutation({
 export const setPrice = mutation({
   args: {
     model: v.string(),
-    inputCentsPerMTok: v.number(),
-    outputCentsPerMTok: v.number(),
+    inputNanosPerMTok: v.number(),
+    outputNanosPerMTok: v.number(),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
     // Negative prices would make costOf return a negative cost, which folds
     // into totals as a spend *refund* — pushing a user back under their cap.
-    if (args.inputCentsPerMTok < 0 || args.outputCentsPerMTok < 0) {
+    if (args.inputNanosPerMTok < 0 || args.outputNanosPerMTok < 0) {
       throw new Error("Prices must be non-negative");
     }
     const existing = await ctx.db
@@ -962,8 +977,8 @@ export const listPrices = query({
     }
     for (const o of overrides) {
       merged[o.model] = {
-        input: o.inputCentsPerMTok,
-        output: o.outputCentsPerMTok,
+        input: o.inputNanosPerMTok,
+        output: o.outputNanosPerMTok,
         overridden: true,
       };
     }

@@ -38,10 +38,11 @@ const userOf = async (t: any, userId: string) =>
 describe("reserve / settle spend caps", () => {
   test("a daily cap below one request's reservation blocks up front", async () => {
     const t = convexTest(schema, modules);
-    // one gpt-4o-mini request reserves ~0.048¢; a 0.01¢ cap can't fit it.
+    // one gpt-4o-mini request reserves ~480_000 nanodollars ($0.00048); a
+    // 1_000-nano ($0.000001) cap can't fit it.
     await t.mutation(api.lib.setLimits, {
       userId: "u",
-      dailySpendLimitCents: 0.01,
+      dailySpendLimitNanos: 1_000,
     });
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(false);
@@ -52,15 +53,15 @@ describe("reserve / settle spend caps", () => {
     const t = convexTest(schema, modules);
     await t.mutation(api.lib.setLimits, {
       userId: "u",
-      dailySpendLimitCents: 100,
+      dailySpendLimitNanos: 1_000_000_000, // $1/day
     });
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(true);
     await settle(t, r.requestId, 1_000_000, 1_000_000); // 1M in, 1M out
     const u = await userOf(t, "u");
-    // gpt-4o-mini: 15¢/Mtok in + 60¢/Mtok out = 75¢ for 1M+1M.
-    expect(u.totalSpendCents).toBeCloseTo(75, 6);
-    expect(u.reservedTotalCents ?? 0).toBeCloseTo(0, 6);
+    // gpt-4o-mini: $0.15/Mtok in + $0.60/Mtok out = $0.75 = 750_000_000 nano.
+    expect(u.totalSpendNanos).toBe(750_000_000);
+    expect(u.reservedTotalNanos ?? 0).toBe(0);
     expect(u.pendingCount ?? 0).toBe(0);
     expect(u.totalRequests).toBe(1);
   });
@@ -76,8 +77,8 @@ describe("D-00 exactly-once settlement", () => {
     const after = await userOf(t, "u");
     expect(after.totalRequests).toBe(1);
     expect(after.totalRequests).toBe(before.totalRequests);
-    expect(after.totalSpendCents).toBeCloseTo(before.totalSpendCents, 9);
-    expect(after.reservedTotalCents ?? 0).toBeCloseTo(0, 9);
+    expect(after.totalSpendNanos).toBeCloseTo(before.totalSpendNanos, 9);
+    expect(after.reservedTotalNanos ?? 0).toBeCloseTo(0, 9);
   });
 });
 
@@ -96,7 +97,7 @@ describe("soft enforcement", () => {
     const t = convexTest(schema, modules);
     await t.mutation(api.lib.setLimits, {
       userId: "u",
-      dailySpendLimitCents: 0.0001,
+      dailySpendLimitNanos: 1, // 1 nanodollar — one estimate blows past it
       enforcement: "soft",
     });
     const r = await start(t, { userId: "u" });
@@ -128,8 +129,8 @@ describe("D-02 pricing validation", () => {
     await expect(
       t.mutation(api.lib.setPrice, {
         model: "x/y",
-        inputCentsPerMTok: -1,
-        outputCentsPerMTok: 5,
+        inputNanosPerMTok: -1,
+        outputNanosPerMTok: 5,
       })
     ).rejects.toThrow(/non-negative/);
   });
@@ -142,8 +143,8 @@ describe("F-04 fail-closed pricing", () => {
     expect(r.allowed).toBe(true);
     await settle(t, r.requestId, 1_000_000, 1_000_000);
     const u = await userOf(t, "u");
-    // conservative price = max over table = {300 in, 1500 out} => 300 + 1500¢
-    expect(u.totalSpendCents).toBeCloseTo(1800, 6);
+    // conservative = max over table = {$3 in, $15 out}/Mtok => $18 = 18e9 nano.
+    expect(u.totalSpendNanos).toBe(18_000_000_000);
     const req = await t.query(api.lib.getRequest, { requestId: r.requestId });
     expect(req.unpricedModel).toBe(true);
   });

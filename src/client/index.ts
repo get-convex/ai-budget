@@ -108,7 +108,7 @@ export type Message = { role: string; content: string };
 export type ChatResult = {
   text: string;
   requestId: string;
-  costCents: number;
+  costNanos: number;
   promptTokens: number;
   completionTokens: number;
   /** Soft-limit warnings raised at admission (empty unless a soft cap was hit). */
@@ -234,7 +234,7 @@ export class AIBudget {
         messages: messages as any,
       });
       const usage = extractUsage(result.usage);
-      const { costCents } = await ctx.runMutation(
+      const { costNanos } = await ctx.runMutation(
         this.component.lib.finishRequest,
         {
           requestId,
@@ -243,7 +243,7 @@ export class AIBudget {
           latencyMs: Date.now() - start,
         }
       );
-      return { text: result.text, requestId, costCents, warnings, ...usage };
+      return { text: result.text, requestId, costNanos, warnings, ...usage };
     } catch (e) {
       await ctx.runMutation(this.component.lib.finishRequest, {
         requestId,
@@ -422,8 +422,8 @@ export class AIBudget {
         args: {
           userId: string;
           requestsPerMinute?: number;
-          dailySpendLimitCents?: number;
-          lifetimeSpendLimitCents?: number;
+          dailySpendLimitNanos?: number;
+          lifetimeSpendLimitNanos?: number;
           dailyTokenLimit?: number;
           lifetimeTokenLimit?: number;
           enforcement?: "hard" | "soft";
@@ -433,7 +433,7 @@ export class AIBudget {
       /** One-time "approve another $X" bump (daily is today-only). */
       bump: (
         ctx: RunMutationCtx,
-        args: { userId: string; dailyCents?: number; lifetimeCents?: number }
+        args: { userId: string; dailyNanos?: number; lifetimeNanos?: number }
       ) => ctx.runMutation(c.lib.bumpUser, args),
       /** Delete a user and all their request rows. */
       delete: (ctx: RunMutationCtx, args: { userId: string }) =>
@@ -450,8 +450,8 @@ export class AIBudget {
         ctx: RunMutationCtx,
         args: {
           name: string;
-          dailySpendLimitCents?: number;
-          lifetimeSpendLimitCents?: number;
+          dailySpendLimitNanos?: number;
+          lifetimeSpendLimitNanos?: number;
           dailyTokenLimit?: number;
           lifetimeTokenLimit?: number;
           enforcement?: "hard" | "soft";
@@ -460,7 +460,7 @@ export class AIBudget {
       ) => ctx.runMutation(c.lib.setActionLimits, args),
       bump: (
         ctx: RunMutationCtx,
-        args: { name: string; dailyCents?: number; lifetimeCents?: number }
+        args: { name: string; dailyNanos?: number; lifetimeNanos?: number }
       ) => ctx.runMutation(c.lib.bumpAction, args),
     };
   }
@@ -475,14 +475,14 @@ export class AIBudget {
       setLimits: (
         ctx: RunMutationCtx,
         args: {
-          dailySpendLimitCents?: number;
-          lifetimeSpendLimitCents?: number;
+          dailySpendLimitNanos?: number;
+          lifetimeSpendLimitNanos?: number;
           enforcement?: "hard" | "soft";
         }
       ) => ctx.runMutation(c.lib.setGlobalLimits, args),
       bump: (
         ctx: RunMutationCtx,
-        args: { dailyCents?: number; lifetimeCents?: number }
+        args: { dailyNanos?: number; lifetimeNanos?: number }
       ) => ctx.runMutation(c.lib.bumpGlobal, args),
       /** Request-row retention window in ms (default 1h; 0 disables). */
       setRetention: (ctx: RunMutationCtx, args: { retentionMs: number }) =>
@@ -512,8 +512,8 @@ export class AIBudget {
         ctx: RunMutationCtx,
         args: {
           model: string;
-          inputCentsPerMTok: number;
-          outputCentsPerMTok: number;
+          inputNanosPerMTok: number;
+          outputNanosPerMTok: number;
         }
       ) => ctx.runMutation(c.lib.setPrice, args),
     };

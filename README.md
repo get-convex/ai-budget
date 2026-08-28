@@ -7,7 +7,7 @@ held to a budget — with spend caps that actually hold under concurrent load.
 
 ```ts
 // userId defaults to the signed-in user — this is the whole integration:
-const { text, costCents } = await ai.chat(ctx, { prompt });
+const { text, costNanos } = await ai.chat(ctx, { prompt });
 ```
 
 That one call is authenticated to the gateway with a short-lived deployment
@@ -90,8 +90,8 @@ export const sendMessage = action({
   handler: async (ctx, { prompt }) => {
     // userId defaults to the authenticated caller (ctx.auth). Limit-checked,
     // tracked, priced. Throws a ConvexError if over a hard cap.
-    const { text, costCents, warnings } = await ai.chat(ctx, { prompt });
-    return { text, costCents, warnings };
+    const { text, costNanos, warnings } = await ai.chat(ctx, { prompt });
+    return { text, costNanos, warnings };
   },
 });
 ```
@@ -104,7 +104,7 @@ Give someone a budget:
 ```ts
 await ai.users.setLimits(ctx, {
   userId: "alice",
-  dailySpendLimitCents: 100,     // $1.00 / day
+  dailySpendLimitNanos: 1_000_000_000, // $1.00 / day (1e9 nano)
   dailyTokenLimit: 500_000,
   requestsPerMinute: 20,
 });
@@ -121,6 +121,10 @@ recorded (`status: "blocked"`) so you can see who's hitting limits.
 All methods are called from a Convex **action** (they run the gateway call) or,
 for the read-only ones, a query. `ctx` is the Convex context.
 
+**Money is integer nanodollars** (`1 USD = 1e9 nano`) everywhere — costs, limits,
+and prices. Integers avoid the rounding drift floating-point cents accumulate and
+keep cap comparisons exact (exact to ~$9M per value). `$1 = 1_000_000_000`.
+
 ### Generating
 
 ```ts
@@ -130,7 +134,7 @@ ai.chat(ctx, {
   messages?,         // [{ role, content }]
   model?,            // defaults to defaultModel
   action?,           // attribution name; defaults to the calling Convex action
-}): Promise<{ text, requestId, costCents, promptTokens, completionTokens, warnings }>
+}): Promise<{ text, requestId, costNanos, promptTokens, completionTokens, warnings }>
 ```
 
 `warnings` is non-empty only when a **soft** limit was exceeded. If no `userId`
@@ -178,8 +182,8 @@ to the original. `lineage` walks the re-run chain in both directions.
 ai.users.setLimits(ctx, {
   userId,
   requestsPerMinute?,
-  dailySpendLimitCents?,
-  lifetimeSpendLimitCents?,
+  dailySpendLimitNanos?,
+  lifetimeSpendLimitNanos?,
   dailyTokenLimit?,
   lifetimeTokenLimit?,
   enforcement?,       // "hard" (block, default) | "soft" (warn but allow)
@@ -197,8 +201,8 @@ Spend is attributed to the calling action automatically. Cap a feature:
 ```ts
 ai.actions.setLimits(ctx, {
   name,                          // e.g. "ai:summarize"
-  dailySpendLimitCents?,
-  lifetimeSpendLimitCents?,
+  dailySpendLimitNanos?,
+  lifetimeSpendLimitNanos?,
   dailyTokenLimit?,
   lifetimeTokenLimit?,
   enforcement?,                  // "hard" | "soft"
@@ -209,8 +213,8 @@ ai.actions.setLimits(ctx, {
 ### Global (deployment-wide) budget
 
 ```ts
-ai.global.setLimits(ctx, { dailySpendLimitCents?, lifetimeSpendLimitCents?, enforcement? })
-ai.global.status(ctx)   // { limits, spentTodayCents, spentTotalCents }
+ai.global.setLimits(ctx, { dailySpendLimitNanos?, lifetimeSpendLimitNanos?, enforcement? })
+ai.global.status(ctx)   // { limits, spentTodayNanos, spentTotalNanos }
 ```
 
 A killswitch across all users and actions. Backed by a sharded counter for
@@ -220,9 +224,9 @@ per-user and per-action caps remain exact.
 ### One-time bumps ("approve another $X")
 
 ```ts
-ai.users.bump(ctx, { userId, dailyCents?, lifetimeCents? })
-ai.actions.bump(ctx, { name, dailyCents?, lifetimeCents? })
-ai.global.bump(ctx, { dailyCents?, lifetimeCents? })
+ai.users.bump(ctx, { userId, dailyNanos?, lifetimeNanos? })
+ai.actions.bump(ctx, { name, dailyNanos?, lifetimeNanos? })
+ai.global.bump(ctx, { dailyNanos?, lifetimeNanos? })
 ```
 
 Adds headroom on top of the standing cap without changing it. Daily bumps apply
@@ -242,7 +246,7 @@ Prices are in **cents per million tokens**. Sensible defaults ship for common
 models; override or add any model:
 
 ```ts
-ai.prices.set(ctx, { model, inputCentsPerMTok, outputCentsPerMTok })  // must be ≥ 0
+ai.prices.set(ctx, { model, inputNanosPerMTok, outputNanosPerMTok })  // must be ≥ 0
 ai.prices.list(ctx)
 ```
 

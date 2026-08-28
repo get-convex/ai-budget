@@ -90,8 +90,8 @@ export const listActions = query({
 export const setPrice = mutation({
   args: {
     model: v.string(),
-    inputCentsPerMTok: v.number(),
-    outputCentsPerMTok: v.number(),
+    inputNanosPerMTok: v.number(),
+    outputNanosPerMTok: v.number(),
   },
   handler: async (ctx, args) => {
     await ai.prices.set(ctx, args);
@@ -114,8 +114,8 @@ export const getGlobalStatus = query({
 
 export const setGlobalLimits = mutation({
   args: {
-    dailySpendLimitCents: v.optional(v.number()),
-    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailySpendLimitNanos: v.optional(v.number()),
+    lifetimeSpendLimitNanos: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
   },
   handler: async (ctx, args) => {
@@ -140,8 +140,8 @@ export const setModelPolicy = mutation({
 export const setActionLimits = mutation({
   args: {
     name: v.string(),
-    dailySpendLimitCents: v.optional(v.number()),
-    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailySpendLimitNanos: v.optional(v.number()),
+    lifetimeSpendLimitNanos: v.optional(v.number()),
     dailyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
@@ -162,8 +162,8 @@ export const deleteUser = mutation({
 export const bumpUser = mutation({
   args: {
     userId: v.string(),
-    dailyCents: v.optional(v.number()),
-    lifetimeCents: v.optional(v.number()),
+    dailyNanos: v.optional(v.number()),
+    lifetimeNanos: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     await ai.users.bump(ctx, args);
@@ -173,8 +173,8 @@ export const bumpUser = mutation({
 export const bumpAction = mutation({
   args: {
     name: v.string(),
-    dailyCents: v.optional(v.number()),
-    lifetimeCents: v.optional(v.number()),
+    dailyNanos: v.optional(v.number()),
+    lifetimeNanos: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     await ai.actions.bump(ctx, args);
@@ -183,8 +183,8 @@ export const bumpAction = mutation({
 
 export const bumpGlobal = mutation({
   args: {
-    dailyCents: v.optional(v.number()),
-    lifetimeCents: v.optional(v.number()),
+    dailyNanos: v.optional(v.number()),
+    lifetimeNanos: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     await ai.global.bump(ctx, args);
@@ -195,8 +195,8 @@ export const setLimits = mutation({
   args: {
     userId: v.string(),
     requestsPerMinute: v.optional(v.number()),
-    dailySpendLimitCents: v.optional(v.number()),
-    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailySpendLimitNanos: v.optional(v.number()),
+    lifetimeSpendLimitNanos: v.optional(v.number()),
     dailyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
