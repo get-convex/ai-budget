@@ -37,7 +37,26 @@ type UseApi<API> = Expand<{
     : UseApi<API[mod]>;
 }>;
 
-export type AIGatewayApi = UseApi<typeof api>;
+export type AIBudgetApi = UseApi<typeof api>;
+/** @deprecated use AIBudgetApi */
+export type AIGatewayApi = AIBudgetApi;
+
+/** Fired when a request is admitted over a *soft* limit. */
+export type SoftLimitInfo = {
+  userId: string;
+  action?: string;
+  requestId: string;
+  warnings: string[];
+};
+export type AIBudgetOptions = {
+  defaultModel?: string;
+  /**
+   * Called when a soft limit is exceeded (the request is still allowed). Lets
+   * you surface budget warnings even on the languageModel/Agent path, where
+   * they can't be returned. Errors thrown here are swallowed.
+   */
+  onSoftLimit?: (info: SoftLimitInfo) => void | Promise<void>;
+};
 
 type RunQueryCtx = {
   runQuery: <Query extends FunctionReference<"query", "internal">>(
@@ -149,13 +168,24 @@ function extractText(result: any): string {
 
 // ---------- client ----------
 
-export class WorryFreeAI {
+export class AIBudget {
   public defaultModel: string;
+  private onSoftLimit?: AIBudgetOptions["onSoftLimit"];
   constructor(
-    public component: AIGatewayApi,
-    options?: { defaultModel?: string }
+    public component: AIBudgetApi,
+    options?: AIBudgetOptions
   ) {
     this.defaultModel = options?.defaultModel ?? "openai/gpt-4o-mini";
+    this.onSoftLimit = options?.onSoftLimit;
+  }
+
+  private async fireSoftLimit(info: SoftLimitInfo) {
+    if (info.warnings.length === 0 || !this.onSoftLimit) return;
+    try {
+      await this.onSoftLimit(info);
+    } catch {
+      // never let a callback error break a request
+    }
   }
 
   /**
@@ -176,11 +206,13 @@ export class WorryFreeAI {
     } = {}
   ): Promise<ChatResult> {
     const model = args.model ?? this.defaultModel;
+    const userId = await resolveUserId(ctx, args.userId);
+    const actionName = await resolveActionName(ctx, args.action);
     const messages: Message[] =
       args.messages ?? [{ role: "user", content: args.prompt ?? "" }];
     const started = await ctx.runMutation(this.component.lib.startRequest, {
-      userId: await resolveUserId(ctx, args.userId),
-      actionName: await resolveActionName(ctx, args.action),
+      userId,
+      actionName,
       model,
       messages,
       rerunOf: args.rerunOf as any,
@@ -194,6 +226,7 @@ export class WorryFreeAI {
     }
     const requestId = started.requestId;
     const warnings = started.warnings;
+    await this.fireSoftLimit({ userId, action: actionName, requestId, warnings });
     const start = Date.now();
     try {
       const result = await generateText({
@@ -233,11 +266,14 @@ export class WorryFreeAI {
   ): LanguageModel {
     const modelId = opts.model ?? this.defaultModel;
     const component = this.component;
+    const fireSoftLimit = this.fireSoftLimit.bind(this);
 
     const begin = async (params: any) => {
+      const userId = await resolveUserId(ctx, opts.userId);
+      const actionName = await resolveActionName(ctx, opts.action);
       const started = await ctx.runMutation(component.lib.startRequest, {
-        userId: await resolveUserId(ctx, opts.userId),
-        actionName: await resolveActionName(ctx, opts.action),
+        userId,
+        actionName,
         model: modelId,
         messages: simplifyPrompt(params.prompt),
       });
@@ -248,6 +284,12 @@ export class WorryFreeAI {
           reason: started.reason,
         });
       }
+      await fireSoftLimit({
+        userId,
+        action: actionName,
+        requestId: started.requestId,
+        warnings: started.warnings,
+      });
       return started.requestId;
     };
     const finish = async (
@@ -486,3 +528,6 @@ export class WorryFreeAI {
     return ctx.runMutation(this.component.lib.setPrice, args);
   }
 }
+
+/** @deprecated Renamed to `AIBudget`. */
+export const WorryFreeAI = AIBudget;

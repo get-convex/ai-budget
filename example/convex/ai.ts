@@ -6,9 +6,9 @@
 import { v } from "convex/values";
 import { action, mutation, query } from "./_generated/server";
 import { components } from "./_generated/api";
-import { WorryFreeAI } from "../../src/client";
+import { AIBudget } from "../../src/client";
 
-const ai = new WorryFreeAI(components.aiBudget, {
+const ai = new AIBudget(components.aiBudget, {
   defaultModel: "openai/gpt-4o-mini",
 });
 

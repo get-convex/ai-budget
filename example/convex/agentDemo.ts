@@ -2,9 +2,9 @@ import { v } from "convex/values";
 import { Agent } from "@convex-dev/agent";
 import { action } from "./_generated/server";
 import { components } from "./_generated/api";
-import { WorryFreeAI } from "../../src/client";
+import { AIBudget } from "../../src/client";
 
-const ai = new WorryFreeAI(components.aiBudget);
+const ai = new AIBudget(components.aiBudget);
 
 // This is feature #3: the @convex-dev/agent adapter. `ai.languageModel(ctx, …)`
 // returns a standard AI SDK LanguageModel that enforces this user's budgets and

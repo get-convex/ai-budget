@@ -37,6 +37,11 @@ const ESTIMATED_OUTPUT_TOKENS = 800;
 // finishRequest is a no-op once swept (see finishRequest's terminal guard), so
 // the only cost of a generous timeout is a briefly-held reservation.
 const STALE_PENDING_MS = 30 * 60 * 1000;
+// Default retention for request rows (full prompts + responses). Terminal,
+// fully-accounted rows older than this are swept by the reconciler. Keeps the
+// audit table — and the sensitive content in it — from growing without bound.
+// Override per-deployment via setRetention.
+const DEFAULT_RETENTION_MS = 60 * 60 * 1000; // 1 hour
 
 const dayStamp = () => new Date().toISOString().slice(0, 10);
 
@@ -569,7 +574,11 @@ export const foldTotals = internalMutation({
 // settled (their action crashed). Runs on a cron.
 export const reconcile = internalMutation({
   args: {},
-  returns: v.object({ folded: v.number(), expired: v.number() }),
+  returns: v.object({
+    folded: v.number(),
+    expired: v.number(),
+    purged: v.number(),
+  }),
   handler: async (ctx) => {
     const toFold = await ctx.db
       .query("requests")
@@ -593,7 +602,40 @@ export const reconcile = internalMutation({
       });
       await foldOne(ctx, await ctx.db.get(req._id));
     }
-    return { folded: toFold.length, expired: stale.length };
+
+    // Retention: delete terminal, fully-accounted request rows past the window.
+    const settings = await getSettings(ctx);
+    const retentionMs = settings?.retentionMs ?? DEFAULT_RETENTION_MS;
+    let purged = 0;
+    if (retentionMs > 0) {
+      const retentionCutoff = Date.now() - retentionMs;
+      const old = await ctx.db
+        .query("requests")
+        .withIndex("by_creation_time", (q) =>
+          q.lt("_creationTime", retentionCutoff)
+        )
+        .take(500);
+      for (const req of old) {
+        // Only rows that are done and accounted: folded (settled === true) or a
+        // blocked attempt (never needs folding). Never a pending/unfolded row.
+        if (req.settled === true || req.status === "blocked") {
+          await ctx.db.delete(req._id);
+          purged++;
+        }
+      }
+    }
+    return { folded: toFold.length, expired: stale.length, purged };
+  },
+});
+
+export const setRetention = mutation({
+  args: { retentionMs: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { retentionMs }) => {
+    const existing = await getSettings(ctx);
+    if (existing) await ctx.db.patch(existing._id, { retentionMs });
+    else await ctx.db.insert("settings", { key: "singleton", retentionMs });
+    return null;
   },
 });
 

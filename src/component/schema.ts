@@ -134,5 +134,7 @@ export default defineSchema({
     globalDailyBumpCents: v.optional(v.number()),
     globalLifetimeBumpCents: v.optional(v.number()),
     globalBumpDayStamp: v.optional(v.string()),
+    // request-row retention window in ms (default 1h); 0 disables sweeping.
+    retentionMs: v.optional(v.number()),
   }).index("key", ["key"]),
 });
