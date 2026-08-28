@@ -6,7 +6,10 @@ import type { api } from "../component/_generated/api";
 
 // ---------- types ----------
 
-type OpaqueIds<T> = T extends GenericId<infer _T> | string
+// Map branded document Ids to plain strings across the component boundary.
+// Note: only GenericId, not `string` — widening every string (and string-literal
+// union like "hard"|"soft") to `string` breaks structural matching of returns.
+type OpaqueIds<T> = T extends GenericId<infer _T>
   ? string
   : T extends (infer U)[]
     ? OpaqueIds<U>[]
@@ -48,6 +51,7 @@ type RunMutationCtx = RunQueryCtx & {
     args: M["_args"]
   ) => Promise<M["_returnType"]>;
   meta?: { getFunctionMetadata(): Promise<{ name: string }> };
+  auth?: { getUserIdentity(): Promise<{ subject?: string } | null> };
 };
 
 // The calling Convex action's name (e.g. "ai:sendMessage"), unless overridden.
@@ -61,6 +65,23 @@ async function resolveActionName(
   } catch {
     return undefined;
   }
+}
+
+// The user this call is billed to. If not passed explicitly, it's the
+// authenticated caller (ctx.auth.getUserIdentity().subject) — so budgets are
+// server-derived by default and can't be spoofed by a client-supplied id.
+async function resolveUserId(
+  ctx: RunMutationCtx,
+  explicit?: string
+): Promise<string> {
+  if (explicit !== undefined) return explicit;
+  const identity = await ctx.auth?.getUserIdentity?.();
+  if (identity?.subject) return identity.subject;
+  throw new Error(
+    "ai-budget: no `userId` was passed and there is no authenticated user " +
+      "(ctx.auth.getUserIdentity() returned null). Either authenticate the " +
+      "request or pass an explicit `userId`."
+  );
 }
 
 export type Message = { role: string; content: string };
@@ -139,25 +160,26 @@ export class WorryFreeAI {
 
   /**
    * One-shot chat through the AI Gateway with tracking + limits.
-   * Call from an action.
+   * Call from an action. `userId` defaults to the authenticated caller.
    */
   async chat(
     ctx: RunMutationCtx,
     args: {
-      userId: string;
+      /** Whom to bill. Defaults to the authenticated user (ctx.auth). */
+      userId?: string;
       prompt?: string;
       messages?: Message[];
       model?: string;
       rerunOf?: string;
       /** Attribute spend to this action name. Defaults to the calling Convex action. */
       action?: string;
-    }
+    } = {}
   ): Promise<ChatResult> {
     const model = args.model ?? this.defaultModel;
     const messages: Message[] =
       args.messages ?? [{ role: "user", content: args.prompt ?? "" }];
     const started = await ctx.runMutation(this.component.lib.startRequest, {
-      userId: args.userId,
+      userId: await resolveUserId(ctx, args.userId),
       actionName: await resolveActionName(ctx, args.action),
       model,
       messages,
@@ -165,7 +187,7 @@ export class WorryFreeAI {
     });
     if (!started.allowed) {
       throw new ConvexError({
-        kind: "AIGatewayLimit",
+        kind: "AIBudgetLimit",
         code: started.code,
         reason: started.reason,
       });
@@ -203,24 +225,25 @@ export class WorryFreeAI {
    * An AI SDK LanguageModel that enforces limits and records usage/cost for
    * `userId` on every call. Drop it into `generateText`, `streamText`, or the
    * Convex Agent component (`new Agent(components.agent, { languageModel })`).
+   * `userId` defaults to the authenticated caller (ctx.auth).
    */
   languageModel(
     ctx: RunMutationCtx,
-    opts: { userId: string; model?: string; action?: string }
+    opts: { userId?: string; model?: string; action?: string } = {}
   ): LanguageModel {
     const modelId = opts.model ?? this.defaultModel;
     const component = this.component;
 
     const begin = async (params: any) => {
       const started = await ctx.runMutation(component.lib.startRequest, {
-        userId: opts.userId,
+        userId: await resolveUserId(ctx, opts.userId),
         actionName: await resolveActionName(ctx, opts.action),
         model: modelId,
         messages: simplifyPrompt(params.prompt),
       });
       if (!started.allowed) {
         throw new ConvexError({
-          kind: "AIGatewayLimit",
+          kind: "AIBudgetLimit",
           code: started.code,
           reason: started.reason,
         });
@@ -373,6 +396,30 @@ export class WorryFreeAI {
     return ctx.runQuery(this.component.lib.listActions, {});
   }
 
+  /** One-time "approve another $X" bump for a user (daily is today-only). */
+  async bumpUser(
+    ctx: RunMutationCtx,
+    args: { userId: string; dailyCents?: number; lifetimeCents?: number }
+  ) {
+    return ctx.runMutation(this.component.lib.bumpUser, args);
+  }
+
+  /** One-time bump for an action's budget. */
+  async bumpAction(
+    ctx: RunMutationCtx,
+    args: { name: string; dailyCents?: number; lifetimeCents?: number }
+  ) {
+    return ctx.runMutation(this.component.lib.bumpAction, args);
+  }
+
+  /** One-time bump for the deployment-wide budget. */
+  async bumpGlobal(
+    ctx: RunMutationCtx,
+    args: { dailyCents?: number; lifetimeCents?: number }
+  ) {
+    return ctx.runMutation(this.component.lib.bumpGlobal, args);
+  }
+
   /** Delete a user and all their request rows. Returns rows removed. */
   async deleteUser(ctx: RunMutationCtx, args: { userId: string }) {
     return ctx.runMutation(this.component.lib.deleteUser, args);
@@ -381,6 +428,27 @@ export class WorryFreeAI {
   /** Current model allow/deny policy. */
   async getModelPolicy(ctx: RunQueryCtx) {
     return ctx.runQuery(this.component.lib.getModelPolicy, {});
+  }
+
+  /** Deployment-wide spend cap status: limits + spend today/total. */
+  async getGlobalStatus(ctx: RunQueryCtx) {
+    return ctx.runQuery(this.component.lib.getGlobalStatus, {});
+  }
+
+  /**
+   * Set a deployment-wide ("global") spend cap across all users and actions.
+   * Enforced approximately (see the component docs) — a killswitch budget, not
+   * an exact per-request reservation. Pass a field as `undefined` to clear it.
+   */
+  async setGlobalLimits(
+    ctx: RunMutationCtx,
+    args: {
+      dailySpendLimitCents?: number;
+      lifetimeSpendLimitCents?: number;
+      enforcement?: "hard" | "soft";
+    }
+  ) {
+    return ctx.runMutation(this.component.lib.setGlobalLimits, args);
   }
 
   /**

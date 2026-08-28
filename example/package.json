@@ -10,6 +10,7 @@
   "dependencies": {
     "@convex-dev/agent": "^0.7.1",
     "@convex-dev/ai-sdk-provider": "latest",
+    "@convex-dev/sharded-counter": "^0.2.1",
     "ai": "latest",
     "convex": "latest",
     "react": "^19.0.0",

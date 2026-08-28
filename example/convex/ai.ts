@@ -105,6 +105,24 @@ export const getModelPolicy = query({
   },
 });
 
+export const getGlobalStatus = query({
+  args: {},
+  handler: async (ctx) => {
+    return await ai.getGlobalStatus(ctx);
+  },
+});
+
+export const setGlobalLimits = mutation({
+  args: {
+    dailySpendLimitCents: v.optional(v.number()),
+    lifetimeSpendLimitCents: v.optional(v.number()),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
+  },
+  handler: async (ctx, args) => {
+    await ai.setGlobalLimits(ctx, args);
+  },
+});
+
 export const setModelPolicy = mutation({
   args: {
     mode: v.union(
@@ -138,6 +156,38 @@ export const deleteUser = mutation({
   args: { userId: v.string() },
   handler: async (ctx, args) => {
     return await ai.deleteUser(ctx, args);
+  },
+});
+
+export const bumpUser = mutation({
+  args: {
+    userId: v.string(),
+    dailyCents: v.optional(v.number()),
+    lifetimeCents: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    await ai.bumpUser(ctx, args);
+  },
+});
+
+export const bumpAction = mutation({
+  args: {
+    name: v.string(),
+    dailyCents: v.optional(v.number()),
+    lifetimeCents: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    await ai.bumpAction(ctx, args);
+  },
+});
+
+export const bumpGlobal = mutation({
+  args: {
+    dailyCents: v.optional(v.number()),
+    lifetimeCents: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    await ai.bumpGlobal(ctx, args);
   },
 });
 

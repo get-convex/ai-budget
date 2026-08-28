@@ -18,6 +18,11 @@ export default defineSchema({
     blocked: v.optional(v.boolean()),
     // "hard" (default): exceeding a budget blocks. "soft": warn but allow.
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
+    // one-time bumps ("approve another $X") added on top of the cap. Daily bump
+    // is scoped to bumpDayStamp (resets with the day); lifetime bump is permanent.
+    dailyBumpCents: v.optional(v.number()),
+    lifetimeBumpCents: v.optional(v.number()),
+    bumpDayStamp: v.optional(v.string()),
     // settled totals (from finished requests)
     totalSpendCents: v.number(),
     totalRequests: v.number(),
@@ -43,6 +48,9 @@ export default defineSchema({
     lifetimeTokenLimit: v.optional(v.number()),
     disabled: v.optional(v.boolean()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
+    dailyBumpCents: v.optional(v.number()),
+    lifetimeBumpCents: v.optional(v.number()),
+    bumpDayStamp: v.optional(v.string()),
     totalSpendCents: v.number(),
     totalRequests: v.number(),
     totalTokens: v.number(),
@@ -112,5 +120,19 @@ export default defineSchema({
       )
     ),
     models: v.optional(v.array(v.string())),
+    // Deployment-wide ("global") spend cap across ALL users and actions. The
+    // running totals live in a sharded counter (high write throughput); only
+    // the limit config lives here. The cap is enforced approximately — the
+    // sharded total is read without a reservation, so under heavy concurrency
+    // it can overshoot by a bounded amount. Right for a global killswitch;
+    // per-user/per-action caps stay exact via reserve/settle.
+    globalDailySpendLimitCents: v.optional(v.number()),
+    globalLifetimeSpendLimitCents: v.optional(v.number()),
+    globalEnforcement: v.optional(
+      v.union(v.literal("hard"), v.literal("soft"))
+    ),
+    globalDailyBumpCents: v.optional(v.number()),
+    globalLifetimeBumpCents: v.optional(v.number()),
+    globalBumpDayStamp: v.optional(v.string()),
   }).index("key", ["key"]),
 });

@@ -128,7 +128,7 @@ function Chat({ userId, model }: { userId: string; model: string }) {
       const data = e?.data;
       push({
         who: "error",
-        text: data?.kind === "AIGatewayLimit" ? `🚫 ${data.reason}` : String(e?.message ?? e),
+        text: data?.kind === "AIBudgetLimit" ? `🚫 ${data.reason}` : String(e?.message ?? e),
       });
     } finally {
       setBusy(false);
@@ -203,7 +203,7 @@ function Chat({ userId, model }: { userId: string; model: string }) {
               const data = e?.data;
               push({
                 who: "error",
-                text: data?.kind === "AIGatewayLimit" ? `🚫 ${data.reason}` : String(e?.message ?? e),
+                text: data?.kind === "AIBudgetLimit" ? `🚫 ${data.reason}` : String(e?.message ?? e),
               });
             } finally {
               setBusy(false);
@@ -441,6 +441,7 @@ function Inspector({
 function Users() {
   const users = useQuery(api.ai.listUsers) ?? [];
   const setLimits = useMutation(api.ai.setLimits);
+  const bumpUser = useMutation(api.ai.bumpUser);
   return (
     <table>
       <thead>
@@ -455,6 +456,7 @@ function Users() {
           <th>daily tokens</th>
           <th>soft</th>
           <th>blocked</th>
+          <th>bump</th>
         </tr>
       </thead>
       <tbody>
@@ -498,6 +500,14 @@ function Users() {
                 checked={!!u.blocked}
                 onChange={(e) => setLimits({ userId: u.userId, blocked: e.target.checked })}
               />
+            </td>
+            <td title="One-time bump: approve another $0.01 of daily budget">
+              <button
+                className="ghost"
+                onClick={() => bumpUser({ userId: u.userId, dailyCents: 1 })}
+              >
+                +1¢ today
+              </button>
             </td>
           </tr>
         ))}

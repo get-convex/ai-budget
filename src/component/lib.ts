@@ -5,9 +5,16 @@ import {
   query,
   type MutationCtx,
 } from "./_generated/server";
-import { internal } from "./_generated/api";
+import { api, internal, components } from "./_generated/api";
 import { vMessage } from "./schema";
 import type { Doc } from "./_generated/dataModel";
+import { ShardedCounter } from "@convex-dev/sharded-counter";
+
+// Deployment-wide spend totals (cents), sharded for high write throughput.
+// Keyed "total" (lifetime) and "day:<UTC date>" (natural daily reset).
+const globalSpend = new ShardedCounter(components.shardedCounter);
+const GLOBAL_TOTAL = "total";
+const globalDayKey = (stamp: string) => `day:${stamp}`;
 
 // Fallback prices in cents per million tokens, used when no override is stored.
 const DEFAULT_PRICES: Record<string, { input: number; output: number }> = {
@@ -136,6 +143,11 @@ function evaluateCaps(o: {
   return { hard: violations[0], warnings: [] };
 }
 
+// A cap plus any one-time bump. Returns undefined when there's no base cap
+// (a bump alone never creates a cap).
+const withBump = (base: number | undefined, bump: number | undefined) =>
+  base === undefined ? undefined : base + (bump ?? 0);
+
 const hasAnyCap = (e: {
   dailySpendLimitCents?: number;
   lifetimeSpendLimitCents?: number;
@@ -213,13 +225,18 @@ export const startRequest = mutation({
   handler: async (ctx, args) => {
     const user = await getOrCreateUser(ctx, args.userId);
     // Record the blocked attempt and return a rejection (throwing would roll
-    // back the record).
-    const reject = async (code: string, reason: string) => {
-      await ctx.db.insert("requests", {
-        ...args,
-        status: "blocked" as const,
-        error: reason,
-      });
+    // back the record). `persist` is false for the high-frequency-by-design
+    // rejections (rate limit, blocked user) that a client retries in a tight
+    // loop — persisting those would grow the requests table without bound and
+    // bloat the 60s rate-limit window read below.
+    const reject = async (code: string, reason: string, persist = true) => {
+      if (persist) {
+        await ctx.db.insert("requests", {
+          ...args,
+          status: "blocked" as const,
+          error: reason,
+        });
+      }
       return { allowed: false as const, code, reason };
     };
 
@@ -229,7 +246,7 @@ export const startRequest = mutation({
     const warnings: string[] = [];
 
     if (user.blocked) {
-      return reject("blocked", `User "${args.userId}" is blocked`);
+      return reject("blocked", `User "${args.userId}" is blocked`, false);
     }
     // Model allow/deny policy (component-wide).
     const policy = await getSettings(ctx);
@@ -247,16 +264,25 @@ export const startRequest = mutation({
       }
     }
     if (user.requestsPerMinute !== undefined) {
+      // Bounded read: we only need to know whether non-blocked requests in the
+      // window have reached the limit. Reading limit+1 non-blocked rows is
+      // enough, and .take caps the scan even if the window is flooded. Blocked
+      // rows aren't persisted for rate-limit/blocked rejections (see reject),
+      // so the window stays small.
       const recent = await ctx.db
         .query("requests")
         .withIndex("userId", (q) =>
           q.eq("userId", args.userId).gt("_creationTime", Date.now() - 60_000)
         )
-        .collect();
-      if (recent.filter((r) => r.status !== "blocked").length >= user.requestsPerMinute) {
+        .take(user.requestsPerMinute + 50);
+      if (
+        recent.filter((r) => r.status !== "blocked").length >=
+        user.requestsPerMinute
+      ) {
         return reject(
           "rate_limit",
-          `Rate limit exceeded for "${args.userId}" (${user.requestsPerMinute}/min)`
+          `Rate limit exceeded for "${args.userId}" (${user.requestsPerMinute}/min)`,
+          false
         );
       }
     }
@@ -279,8 +305,14 @@ export const startRequest = mutation({
       reservedTokensToday: userSameDay ? user.reservedTodayTokens ?? 0 : 0,
       totalTokens: user.totalTokens,
       reservedTokensTotal: user.reservedTotalTokens ?? 0,
-      dailySpendLimitCents: user.dailySpendLimitCents,
-      lifetimeSpendLimitCents: user.lifetimeSpendLimitCents,
+      dailySpendLimitCents: withBump(
+        user.dailySpendLimitCents,
+        user.bumpDayStamp === today ? user.dailyBumpCents : 0
+      ),
+      lifetimeSpendLimitCents: withBump(
+        user.lifetimeSpendLimitCents,
+        user.lifetimeBumpCents
+      ),
       dailyTokenLimit: user.dailyTokenLimit,
       lifetimeTokenLimit: user.lifetimeTokenLimit,
     });
@@ -308,13 +340,57 @@ export const startRequest = mutation({
         reservedTokensToday: aSameDay ? action.reservedTodayTokens ?? 0 : 0,
         totalTokens: action.totalTokens,
         reservedTokensTotal: action.reservedTotalTokens ?? 0,
-        dailySpendLimitCents: action.dailySpendLimitCents,
-        lifetimeSpendLimitCents: action.lifetimeSpendLimitCents,
+        dailySpendLimitCents: withBump(
+          action.dailySpendLimitCents,
+          action.bumpDayStamp === today ? action.dailyBumpCents : 0
+        ),
+        lifetimeSpendLimitCents: withBump(
+          action.lifetimeSpendLimitCents,
+          action.lifetimeBumpCents
+        ),
         dailyTokenLimit: action.dailyTokenLimit,
         lifetimeTokenLimit: action.lifetimeTokenLimit,
       });
       if (actionEval.hard) return reject(actionEval.hard.code, actionEval.hard.reason);
       warnings.push(...actionEval.warnings);
+    }
+
+    // Deployment-wide ("global") spend cap. Enforced approximately against the
+    // sharded total (no reservation), so it can overshoot by a bounded amount
+    // under burst — appropriate for a killswitch, and it avoids serializing all
+    // traffic through one row. `policy` is the settings singleton fetched above.
+    if (
+      policy &&
+      (policy.globalDailySpendLimitCents !== undefined ||
+        policy.globalLifetimeSpendLimitCents !== undefined)
+    ) {
+      const globalEnforcement = policy.globalEnforcement ?? "hard";
+      const globalDailyCap = withBump(
+        policy.globalDailySpendLimitCents,
+        policy.globalBumpDayStamp === today ? policy.globalDailyBumpCents : 0
+      );
+      const globalLifetimeCap = withBump(
+        policy.globalLifetimeSpendLimitCents,
+        policy.globalLifetimeBumpCents
+      );
+      if (globalDailyCap !== undefined) {
+        const spentToday = await globalSpend.count(ctx, globalDayKey(today));
+        if (spentToday + est.cost > globalDailyCap) {
+          const reason = `Global daily spend limit reached (${globalDailyCap}¢/day)`;
+          if (globalEnforcement === "hard")
+            return reject("global_daily_spend_limit", reason);
+          warnings.push(reason);
+        }
+      }
+      if (globalLifetimeCap !== undefined) {
+        const spentTotal = await globalSpend.count(ctx, GLOBAL_TOTAL);
+        if (spentTotal + est.cost > globalLifetimeCap) {
+          const reason = `Global lifetime spend limit reached (${globalLifetimeCap}¢)`;
+          if (globalEnforcement === "hard")
+            return reject("global_lifetime_spend_limit", reason);
+          warnings.push(reason);
+        }
+      }
     }
 
     // Passed — reserve, but ONLY on entities that actually have a cap. Writing
@@ -459,6 +535,23 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
       pendingCount: Math.max(0, (action.pendingCount ?? 0) - 1),
     });
   }
+  // Deployment-wide totals via the sharded counter (only when a global cap is
+  // configured — otherwise skip the writes entirely). Distributed across shards,
+  // so this does not serialize on a single row.
+  if (actual > 0) {
+    const settings = await ctx.db
+      .query("settings")
+      .withIndex("key", (q) => q.eq("key", "singleton"))
+      .unique();
+    if (
+      settings &&
+      (settings.globalDailySpendLimitCents !== undefined ||
+        settings.globalLifetimeSpendLimitCents !== undefined)
+    ) {
+      await globalSpend.add(ctx, GLOBAL_TOTAL, actual);
+      await globalSpend.add(ctx, globalDayKey(today), actual);
+    }
+  }
   await ctx.db.patch(req._id, { settled: true });
 }
 
@@ -487,8 +580,9 @@ export const reconcile = internalMutation({
     const cutoff = Date.now() - STALE_PENDING_MS;
     const stale = await ctx.db
       .query("requests")
-      .withIndex("status", (q) => q.eq("status", "pending"))
-      .filter((q) => q.lt(q.field("_creationTime"), cutoff))
+      .withIndex("status", (q) =>
+        q.eq("status", "pending").lt("_creationTime", cutoff)
+      )
       .take(200);
     for (const req of stale) {
       await ctx.db.patch(req._id, {
@@ -544,10 +638,13 @@ export const listRequests = query({
   },
 });
 
+const ADMIN_LIST_CAP = 2000;
 export const listUsers = query({
   args: {},
   handler: async (ctx) => {
-    const users = await ctx.db.query("users").collect();
+    // Bounded to avoid an unbounded full-table scan on this reactive query.
+    // Paginate (ctx.db.query("users").paginate(...)) for larger deployments.
+    const users = await ctx.db.query("users").take(ADMIN_LIST_CAP);
     const today = dayStamp();
     return users.map((u) => ({
       ...u,
@@ -577,33 +674,99 @@ export const setLimits = mutation({
 });
 
 // Delete a user and all their request rows (e.g. account deletion / GDPR).
+// Deletes in bounded batches and self-reschedules so it never exceeds the
+// per-transaction document limit — a user with millions of rows still deletes.
+const DELETE_BATCH = 500;
 export const deleteUser = mutation({
   args: { userId: v.string() },
-  returns: v.number(),
+  returns: v.object({ deletedThisBatch: v.number(), done: v.boolean() }),
   handler: async (ctx, { userId }) => {
     const rows = await ctx.db
       .query("requests")
       .withIndex("userId", (q) => q.eq("userId", userId))
-      .collect();
+      .take(DELETE_BATCH);
     for (const r of rows) await ctx.db.delete(r._id);
+    if (rows.length === DELETE_BATCH) {
+      // More to go — continue in a fresh transaction.
+      await ctx.scheduler.runAfter(0, api.lib.deleteUser, { userId });
+      return { deletedThisBatch: rows.length, done: false };
+    }
+    // Last batch: remove the user row itself.
     const user = await ctx.db
       .query("users")
       .withIndex("userId", (q) => q.eq("userId", userId))
       .unique();
     if (user) await ctx.db.delete(user._id);
-    return rows.length + (user ? 1 : 0);
+    return { deletedThisBatch: rows.length + (user ? 1 : 0), done: true };
   },
 });
 
 export const listActions = query({
   args: {},
   handler: async (ctx) => {
-    const actions = await ctx.db.query("actions").collect();
+    const actions = await ctx.db.query("actions").take(ADMIN_LIST_CAP);
     const today = dayStamp();
     return actions.map((a) => ({
       ...a,
       spendTodayCents: a.dayStamp === today ? a.spendTodayCents : 0,
     }));
+  },
+});
+
+const vBumpArgs = {
+  dailyCents: v.optional(v.number()),
+  lifetimeCents: v.optional(v.number()),
+};
+
+// One-time "approve another $X" bumps, added on top of the standing cap without
+// changing it. Daily bumps apply to today only; lifetime bumps are permanent.
+export const bumpUser = mutation({
+  args: { userId: v.string(), ...vBumpArgs },
+  returns: v.null(),
+  handler: async (ctx, { userId, dailyCents, lifetimeCents }) => {
+    const user = await getOrCreateUser(ctx, userId);
+    const today = dayStamp();
+    const curDaily = user.bumpDayStamp === today ? user.dailyBumpCents ?? 0 : 0;
+    await ctx.db.patch(user._id, {
+      bumpDayStamp: today,
+      dailyBumpCents: curDaily + (dailyCents ?? 0),
+      lifetimeBumpCents: (user.lifetimeBumpCents ?? 0) + (lifetimeCents ?? 0),
+    });
+    return null;
+  },
+});
+
+export const bumpAction = mutation({
+  args: { name: v.string(), ...vBumpArgs },
+  returns: v.null(),
+  handler: async (ctx, { name, dailyCents, lifetimeCents }) => {
+    const action = await getOrCreateAction(ctx, name);
+    const today = dayStamp();
+    const curDaily = action.bumpDayStamp === today ? action.dailyBumpCents ?? 0 : 0;
+    await ctx.db.patch(action._id, {
+      bumpDayStamp: today,
+      dailyBumpCents: curDaily + (dailyCents ?? 0),
+      lifetimeBumpCents: (action.lifetimeBumpCents ?? 0) + (lifetimeCents ?? 0),
+    });
+    return null;
+  },
+});
+
+export const bumpGlobal = mutation({
+  args: vBumpArgs,
+  returns: v.null(),
+  handler: async (ctx, { dailyCents, lifetimeCents }) => {
+    const today = dayStamp();
+    const s = await getSettings(ctx);
+    const curDaily = s?.globalBumpDayStamp === today ? s?.globalDailyBumpCents ?? 0 : 0;
+    const patch = {
+      globalBumpDayStamp: today,
+      globalDailyBumpCents: curDaily + (dailyCents ?? 0),
+      globalLifetimeBumpCents: (s?.globalLifetimeBumpCents ?? 0) + (lifetimeCents ?? 0),
+    };
+    if (s) await ctx.db.patch(s._id, patch);
+    else await ctx.db.insert("settings", { key: "singleton", ...patch });
+    return null;
   },
 });
 
@@ -642,6 +805,54 @@ export const getModelPolicy = query({
       .withIndex("key", (q) => q.eq("key", "singleton"))
       .unique();
     return { mode: s?.modelMode ?? "open", models: s?.models ?? [] };
+  },
+});
+
+export const getGlobalStatus = query({
+  args: {},
+  returns: v.object({
+    dailySpendLimitCents: v.union(v.number(), v.null()),
+    lifetimeSpendLimitCents: v.union(v.number(), v.null()),
+    enforcement: v.union(v.literal("hard"), v.literal("soft")),
+    spentTodayCents: v.number(),
+    spentTotalCents: v.number(),
+  }),
+  handler: async (ctx) => {
+    const s = await ctx.db
+      .query("settings")
+      .withIndex("key", (q) => q.eq("key", "singleton"))
+      .unique();
+    return {
+      dailySpendLimitCents: s?.globalDailySpendLimitCents ?? null,
+      lifetimeSpendLimitCents: s?.globalLifetimeSpendLimitCents ?? null,
+      enforcement: s?.globalEnforcement ?? "hard",
+      spentTodayCents: await globalSpend.count(ctx, globalDayKey(dayStamp())),
+      spentTotalCents: await globalSpend.count(ctx, GLOBAL_TOTAL),
+    };
+  },
+});
+
+export const setGlobalLimits = mutation({
+  args: {
+    dailySpendLimitCents: v.optional(v.number()),
+    lifetimeSpendLimitCents: v.optional(v.number()),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    // The settings fields are "global"-prefixed; map the friendly arg names.
+    const patch = {
+      globalDailySpendLimitCents: args.dailySpendLimitCents,
+      globalLifetimeSpendLimitCents: args.lifetimeSpendLimitCents,
+      globalEnforcement: args.enforcement,
+    };
+    const existing = await getSettings(ctx);
+    if (existing) {
+      await ctx.db.patch(existing._id, patch);
+    } else {
+      await ctx.db.insert("settings", { key: "singleton", ...patch });
+    }
+    return null;
   },
 });
 
