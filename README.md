@@ -289,6 +289,17 @@ Reservations are only taken on entities that actually have a cap, so uncapped
 traffic never serializes. The `error.md` file documents the adversarial audits
 this design survived, with live repros.
 
+**One guarantee, all scopes.** Per-user, per-action, and global caps run through
+the *same* admission check — a request is admitted only when
+`committed + reserved + estimate ≤ cap` (bumps included). The only thing that
+differs is the holder: per-user and per-action reserve on a single document, an
+exact atomic check-and-reserve; the **global** killswitch is backed by a sharded
+counter for throughput, so its committed total is read as an eventually-consistent
+sum with no cross-request reservation. That makes the global cap **approximate** —
+it can overshoot by a bounded amount under a burst — the deliberate
+exactness-for-throughput trade for a deployment-wide cap, and the only scope
+that isn't exact.
+
 ---
 
 ## Security: before you ship

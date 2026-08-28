@@ -375,42 +375,46 @@ export const startRequest = mutation({
       warnings.push(...actionEval.warnings);
     }
 
-    // Deployment-wide ("global") spend cap. Enforced approximately against the
-    // sharded total (no reservation), so it can overshoot by a bounded amount
-    // under burst — appropriate for a killswitch, and it avoids serializing all
-    // traffic through one row. `policy` is the settings singleton fetched above.
+    // Deployment-wide ("global") spend cap — same reserve-then-settle model and
+    // the SAME evaluateCaps logic as the per-entity caps above, so the guarantee
+    // statement is uniform: a request is admitted only if
+    // committed + reserved + estimate <= cap. The ONE difference is the holder:
+    // per-user/per-action reserve on a single row (an exact atomic
+    // check-and-reserve), while the global holder is a sharded counter for
+    // throughput — its committed total is read as an eventually-consistent sum
+    // with no cross-request reservation, so a hard global cap can overshoot by a
+    // bounded amount under burst. That's the deliberate exactness/throughput
+    // trade for a deployment-wide killswitch; it's the only approximate scope.
     if (
       policy &&
       (policy.globalDailySpendLimitNanos !== undefined ||
         policy.globalLifetimeSpendLimitNanos !== undefined)
     ) {
-      const globalEnforcement = policy.globalEnforcement ?? "hard";
-      const globalDailyCap = withBump(
-        policy.globalDailySpendLimitNanos,
-        policy.globalBumpDayStamp === today ? policy.globalDailyBumpNanos : 0
-      );
-      const globalLifetimeCap = withBump(
-        policy.globalLifetimeSpendLimitNanos,
-        policy.globalLifetimeBumpNanos
-      );
-      if (globalDailyCap !== undefined) {
-        const spentToday = await globalSpend.count(ctx, globalDayKey(today));
-        if (spentToday + est.cost > globalDailyCap) {
-          const reason = `Global daily spend limit reached (${fmtUsd(globalDailyCap)}/day)`;
-          if (globalEnforcement === "hard")
-            return reject("global_daily_spend_limit", reason);
-          warnings.push(reason);
-        }
-      }
-      if (globalLifetimeCap !== undefined) {
-        const spentTotal = await globalSpend.count(ctx, GLOBAL_TOTAL);
-        if (spentTotal + est.cost > globalLifetimeCap) {
-          const reason = `Global lifetime spend limit reached (${fmtUsd(globalLifetimeCap)})`;
-          if (globalEnforcement === "hard")
-            return reject("global_lifetime_spend_limit", reason);
-          warnings.push(reason);
-        }
-      }
+      const globalEval = evaluateCaps({
+        label: "global",
+        name: "deployment",
+        enforcement: policy.globalEnforcement ?? "hard",
+        estCost: est.cost,
+        estTokens: est.tokens,
+        spendToday: await globalSpend.count(ctx, globalDayKey(today)),
+        reservedSpendToday: 0, // sharded holder: no cross-request reservation
+        totalSpend: await globalSpend.count(ctx, GLOBAL_TOTAL),
+        reservedSpendTotal: 0,
+        tokensToday: 0,
+        reservedTokensToday: 0,
+        totalTokens: 0,
+        reservedTokensTotal: 0,
+        dailySpendLimitNanos: withBump(
+          policy.globalDailySpendLimitNanos,
+          policy.globalBumpDayStamp === today ? policy.globalDailyBumpNanos : 0
+        ),
+        lifetimeSpendLimitNanos: withBump(
+          policy.globalLifetimeSpendLimitNanos,
+          policy.globalLifetimeBumpNanos
+        ),
+      });
+      if (globalEval.hard) return reject(globalEval.hard.code, globalEval.hard.reason);
+      warnings.push(...globalEval.warnings);
     }
 
     // Passed — reserve, but ONLY on entities that actually have a cap. Writing
