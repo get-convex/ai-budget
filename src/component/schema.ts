@@ -13,7 +13,11 @@ export default defineSchema({
     requestsPerMinute: v.optional(v.number()),
     dailySpendLimitCents: v.optional(v.number()),
     lifetimeSpendLimitCents: v.optional(v.number()),
+    dailyTokenLimit: v.optional(v.number()),
+    lifetimeTokenLimit: v.optional(v.number()),
     blocked: v.optional(v.boolean()),
+    // "hard" (default): exceeding a budget blocks. "soft": warn but allow.
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     // settled totals (from finished requests)
     totalSpendCents: v.number(),
     totalRequests: v.number(),
@@ -21,9 +25,12 @@ export default defineSchema({
     // daily window
     dayStamp: v.string(), // e.g. "2026-08-27" (UTC)
     spendTodayCents: v.number(),
+    tokensToday: v.optional(v.number()),
     // in-flight reservations (pessimistic holds; released on settle/expiry)
     reservedTodayCents: v.optional(v.number()),
     reservedTotalCents: v.optional(v.number()),
+    reservedTodayTokens: v.optional(v.number()),
+    reservedTotalTokens: v.optional(v.number()),
     pendingCount: v.optional(v.number()),
   }).index("userId", ["userId"]),
 
@@ -32,14 +39,20 @@ export default defineSchema({
     name: v.string(),
     dailySpendLimitCents: v.optional(v.number()),
     lifetimeSpendLimitCents: v.optional(v.number()),
+    dailyTokenLimit: v.optional(v.number()),
+    lifetimeTokenLimit: v.optional(v.number()),
     disabled: v.optional(v.boolean()),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     totalSpendCents: v.number(),
     totalRequests: v.number(),
     totalTokens: v.number(),
     dayStamp: v.string(),
     spendTodayCents: v.number(),
+    tokensToday: v.optional(v.number()),
     reservedTodayCents: v.optional(v.number()),
     reservedTotalCents: v.optional(v.number()),
+    reservedTodayTokens: v.optional(v.number()),
+    reservedTotalTokens: v.optional(v.number()),
     pendingCount: v.optional(v.number()),
   }).index("name", ["name"]),
 
@@ -47,8 +60,14 @@ export default defineSchema({
     userId: v.string(),
     actionName: v.optional(v.string()),
     model: v.string(),
-    // pessimistic hold placed at start; reconciled to actual on settle
+    // pessimistic holds placed at start; reconciled to actual on settle
     estimatedCents: v.optional(v.number()),
+    estimatedTokens: v.optional(v.number()),
+    // true when the model had no known/override price and was charged the
+    // conservative fallback — a signal to add a real price via setPrice.
+    unpricedModel: v.optional(v.boolean()),
+    // true when a soft budget was exceeded (allowed with a warning).
+    overBudget: v.optional(v.boolean()),
     // false once finished and awaiting fold into totals; true once folded.
     // absent while pending or blocked (so the reconciler ignores those).
     settled: v.optional(v.boolean()),
@@ -79,4 +98,19 @@ export default defineSchema({
     inputCentsPerMTok: v.number(),
     outputCentsPerMTok: v.number(),
   }).index("model", ["model"]),
+
+  // singleton component config (key === "singleton")
+  settings: defineTable({
+    key: v.string(),
+    // "open": any model allowed. "allowlist": only listed models.
+    // "denylist": any model except the listed ones.
+    modelMode: v.optional(
+      v.union(
+        v.literal("open"),
+        v.literal("allowlist"),
+        v.literal("denylist")
+      )
+    ),
+    models: v.optional(v.array(v.string())),
+  }).index("key", ["key"]),
 });

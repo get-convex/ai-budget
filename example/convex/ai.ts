@@ -1,3 +1,8 @@
+// ⚠️ DEMO ONLY — no authentication. `userId` is taken from the client and the
+// admin mutations (setLimits/setActionLimits/setModelPolicy/deleteUser) and the
+// history queries are public. That's fine for a local demo, NOT for production.
+// See the "Security: before you ship this" section of the README for the
+// server-derived-identity + admin-gate + scoped-query pattern.
 import { v } from "convex/values";
 import { action, mutation, query } from "./_generated/server";
 import { components } from "./_generated/api";
@@ -82,10 +87,46 @@ export const listActions = query({
   },
 });
 
+export const setPrice = mutation({
+  args: {
+    model: v.string(),
+    inputCentsPerMTok: v.number(),
+    outputCentsPerMTok: v.number(),
+  },
+  handler: async (ctx, args) => {
+    await ai.setPrice(ctx, args);
+  },
+});
+
+export const getModelPolicy = query({
+  args: {},
+  handler: async (ctx) => {
+    return await ai.getModelPolicy(ctx);
+  },
+});
+
+export const setModelPolicy = mutation({
+  args: {
+    mode: v.union(
+      v.literal("open"),
+      v.literal("allowlist"),
+      v.literal("denylist")
+    ),
+    models: v.array(v.string()),
+  },
+  handler: async (ctx, args) => {
+    await ai.setModelPolicy(ctx, args);
+  },
+});
+
 export const setActionLimits = mutation({
   args: {
     name: v.string(),
     dailySpendLimitCents: v.optional(v.number()),
+    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailyTokenLimit: v.optional(v.number()),
+    lifetimeTokenLimit: v.optional(v.number()),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     disabled: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
@@ -105,6 +146,10 @@ export const setLimits = mutation({
     userId: v.string(),
     requestsPerMinute: v.optional(v.number()),
     dailySpendLimitCents: v.optional(v.number()),
+    lifetimeSpendLimitCents: v.optional(v.number()),
+    dailyTokenLimit: v.optional(v.number()),
+    lifetimeTokenLimit: v.optional(v.number()),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     blocked: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {

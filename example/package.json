@@ -8,6 +8,7 @@
     "dev:backend": "convex dev"
   },
   "dependencies": {
+    "@convex-dev/agent": "^0.7.1",
     "@convex-dev/ai-sdk-provider": "latest",
     "ai": "latest",
     "convex": "latest",
@@ -15,10 +16,13 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "convex-test": "^0.0.56",
     "typescript": "^5.7.0",
-    "vite": "^6.0.0"
+    "vite": "^6.0.0",
+    "vitest": "^4.1.11"
   }
 }

@@ -71,17 +71,27 @@ export type ChatResult = {
   costCents: number;
   promptTokens: number;
   completionTokens: number;
+  /** Soft-limit warnings raised at admission (empty unless a soft cap was hit). */
+  warnings: string[];
 };
 
 // ---------- helpers ----------
+
+// Token counts across AI SDK versions come as plain numbers or, in v7, as a
+// structured breakdown like { reasoning, text, total }. Coerce either to a number.
+function toTokenCount(x: any): number {
+  if (typeof x === "number") return Number.isFinite(x) ? x : 0;
+  if (x && typeof x === "object") return toTokenCount(x.total ?? x.text ?? 0);
+  return 0;
+}
 
 function extractUsage(usage: any): {
   promptTokens: number;
   completionTokens: number;
 } {
   return {
-    promptTokens: usage?.inputTokens ?? usage?.promptTokens ?? 0,
-    completionTokens: usage?.outputTokens ?? usage?.completionTokens ?? 0,
+    promptTokens: toTokenCount(usage?.inputTokens ?? usage?.promptTokens),
+    completionTokens: toTokenCount(usage?.outputTokens ?? usage?.completionTokens),
   };
 }
 
@@ -161,6 +171,7 @@ export class WorryFreeAI {
       });
     }
     const requestId = started.requestId;
+    const warnings = started.warnings;
     const start = Date.now();
     try {
       const result = await generateText({
@@ -177,7 +188,7 @@ export class WorryFreeAI {
           latencyMs: Date.now() - start,
         }
       );
-      return { text: result.text, requestId, costCents, ...usage };
+      return { text: result.text, requestId, costCents, warnings, ...usage };
     } catch (e) {
       await ctx.runMutation(this.component.lib.finishRequest, {
         requestId,
@@ -256,6 +267,22 @@ export class WorryFreeAI {
           let usage: any = undefined;
           try {
             const result = await doStream();
+            // finishRequest is idempotent (terminal-guarded server-side), so
+            // settling from multiple stream outcomes — normal close, an error
+            // chunk, or a cancel — is safe: the first wins, the rest no-op.
+            // Without this an errored or abandoned stream would never settle and
+            // its real usage would be lost (recorded as free by the reconciler).
+            let settled = false;
+            const settle = (error?: string) => {
+              if (settled) return;
+              settled = true;
+              return finish(requestId, {
+                responseText: text,
+                error,
+                ...extractUsage(usage),
+                latencyMs: Date.now() - start,
+              });
+            };
             const tapped = result.stream.pipeThrough(
               new TransformStream({
                 transform(chunk: any, controller) {
@@ -263,14 +290,11 @@ export class WorryFreeAI {
                     text += chunk.delta ?? chunk.textDelta ?? "";
                   }
                   if (chunk?.type === "finish") usage = chunk.usage;
+                  if (chunk?.type === "error") void settle(String(chunk.error));
                   controller.enqueue(chunk);
                 },
                 async flush() {
-                  await finish(requestId, {
-                    responseText: text,
-                    ...extractUsage(usage),
-                    latencyMs: Date.now() - start,
-                  });
+                  await settle();
                 },
               })
             );
@@ -336,6 +360,9 @@ export class WorryFreeAI {
       requestsPerMinute?: number;
       dailySpendLimitCents?: number;
       lifetimeSpendLimitCents?: number;
+      dailyTokenLimit?: number;
+      lifetimeTokenLimit?: number;
+      enforcement?: "hard" | "soft";
       blocked?: boolean;
     }
   ) {
@@ -351,12 +378,33 @@ export class WorryFreeAI {
     return ctx.runMutation(this.component.lib.deleteUser, args);
   }
 
+  /** Current model allow/deny policy. */
+  async getModelPolicy(ctx: RunQueryCtx) {
+    return ctx.runQuery(this.component.lib.getModelPolicy, {});
+  }
+
+  /**
+   * Restrict which models may be used component-wide.
+   * - `open`: any model (default)
+   * - `allowlist`: only `models` are allowed
+   * - `denylist`: any model except `models`
+   */
+  async setModelPolicy(
+    ctx: RunMutationCtx,
+    args: { mode: "open" | "allowlist" | "denylist"; models: string[] }
+  ) {
+    return ctx.runMutation(this.component.lib.setModelPolicy, args);
+  }
+
   async setActionLimits(
     ctx: RunMutationCtx,
     args: {
       name: string;
       dailySpendLimitCents?: number;
       lifetimeSpendLimitCents?: number;
+      dailyTokenLimit?: number;
+      lifetimeTokenLimit?: number;
+      enforcement?: "hard" | "soft";
       disabled?: boolean;
     }
   ) {

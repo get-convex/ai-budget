@@ -24,19 +24,44 @@ const DEFAULT_PRICES: Record<string, { input: number; output: number }> = {
 // actual cost replaces the estimate the moment the request settles.
 const ESTIMATED_OUTPUT_TOKENS = 800;
 // A request still "pending" after this long is presumed dead (its action
-// crashed before settling); the reconciler releases its reservation.
-const STALE_PENDING_MS = 5 * 60 * 1000;
+// crashed before settling); the reconciler releases its reservation. Set well
+// above any real call duration — a long reasoning/agent generation that is
+// still billing must not be swept and mis-recorded as free. A late
+// finishRequest is a no-op once swept (see finishRequest's terminal guard), so
+// the only cost of a generous timeout is a briefly-held reservation.
+const STALE_PENDING_MS = 30 * 60 * 1000;
 
 const dayStamp = () => new Date().toISOString().slice(0, 10);
+
+// Conservative fallback for any model not in the price table: the max of every
+// known price dimension. Falling back to 0 would be fail-open — an unpriced
+// model would reserve 0, pass every cap, and log 0¢ while the AI Gateway still
+// bills real money. Charging the conservative max instead keeps the caps honest
+// (over-counting is the safe direction); admins can pin an exact price via
+// setPrice, which also clears the `unpricedModel` flag on future requests.
+const CONSERVATIVE_PRICE = Object.values(DEFAULT_PRICES).reduce(
+  (m, p) => ({
+    input: Math.max(m.input, p.input),
+    output: Math.max(m.output, p.output),
+  }),
+  { input: 0, output: 0 }
+);
 
 async function getPrice(ctx: MutationCtx, model: string) {
   const override = await ctx.db
     .query("prices")
     .withIndex("model", (q) => q.eq("model", model))
     .unique();
-  return override
-    ? { input: override.inputCentsPerMTok, output: override.outputCentsPerMTok }
-    : DEFAULT_PRICES[model] ?? { input: 0, output: 0 };
+  if (override) {
+    return {
+      input: override.inputCentsPerMTok,
+      output: override.outputCentsPerMTok,
+      known: true,
+    };
+  }
+  const known = DEFAULT_PRICES[model];
+  if (known) return { ...known, known: true };
+  return { ...CONSERVATIVE_PRICE, known: false };
 }
 
 const costOf = (
@@ -45,13 +70,82 @@ const costOf = (
   price: { input: number; output: number }
 ) => (inputTokens / 1e6) * price.input + (outputTokens / 1e6) * price.output;
 
-function estimateCost(
+// Up-front estimate of a request's cost and token count, reserved before the
+// call so concurrent in-flight requests are visible to each other's caps.
+function estimateUsage(
   messages: { content: string }[],
   price: { input: number; output: number }
 ) {
   const chars = messages.reduce((s, m) => s + (m.content?.length ?? 0), 0);
-  return costOf(Math.ceil(chars / 4), ESTIMATED_OUTPUT_TOKENS, price);
+  const inputTokens = Math.ceil(chars / 4);
+  return {
+    cost: costOf(inputTokens, ESTIMATED_OUTPUT_TOKENS, price),
+    tokens: inputTokens + ESTIMATED_OUTPUT_TOKENS,
+  };
 }
+
+// Evaluate an entity's (user or action) spend + token budgets against
+// committed + reserved + this request's estimate. Returns a hard rejection
+// (block) or a list of soft warnings (allow), per the entity's enforcement.
+function evaluateCaps(o: {
+  label: string;
+  name: string;
+  enforcement: "hard" | "soft";
+  estCost: number;
+  estTokens: number;
+  spendToday: number;
+  reservedSpendToday: number;
+  totalSpend: number;
+  reservedSpendTotal: number;
+  tokensToday: number;
+  reservedTokensToday: number;
+  totalTokens: number;
+  reservedTokensTotal: number;
+  dailySpendLimitCents?: number;
+  lifetimeSpendLimitCents?: number;
+  dailyTokenLimit?: number;
+  lifetimeTokenLimit?: number;
+}): { hard?: { code: string; reason: string }; warnings: string[] } {
+  const violations: { code: string; reason: string }[] = [];
+  const push = (code: string, reason: string) =>
+    violations.push({ code: `${o.label}_${code}`, reason });
+
+  if (
+    o.dailySpendLimitCents !== undefined &&
+    o.spendToday + o.reservedSpendToday + o.estCost > o.dailySpendLimitCents
+  )
+    push("daily_spend_limit", `Daily spend limit reached for ${o.label} "${o.name}" (${o.dailySpendLimitCents}¢/day)`);
+  if (
+    o.lifetimeSpendLimitCents !== undefined &&
+    o.totalSpend + o.reservedSpendTotal + o.estCost > o.lifetimeSpendLimitCents
+  )
+    push("lifetime_spend_limit", `Lifetime spend limit reached for ${o.label} "${o.name}"`);
+  if (
+    o.dailyTokenLimit !== undefined &&
+    o.tokensToday + o.reservedTokensToday + o.estTokens > o.dailyTokenLimit
+  )
+    push("daily_token_limit", `Daily token limit reached for ${o.label} "${o.name}" (${o.dailyTokenLimit}/day)`);
+  if (
+    o.lifetimeTokenLimit !== undefined &&
+    o.totalTokens + o.reservedTokensTotal + o.estTokens > o.lifetimeTokenLimit
+  )
+    push("lifetime_token_limit", `Lifetime token limit reached for ${o.label} "${o.name}"`);
+
+  if (violations.length === 0) return { warnings: [] };
+  if (o.enforcement === "soft") return { warnings: violations.map((v) => v.reason) };
+  return { hard: violations[0], warnings: [] };
+}
+
+const hasAnyCap = (e: {
+  dailySpendLimitCents?: number;
+  lifetimeSpendLimitCents?: number;
+  dailyTokenLimit?: number;
+  lifetimeTokenLimit?: number;
+}) =>
+  e.dailySpendLimitCents !== undefined ||
+  e.lifetimeSpendLimitCents !== undefined ||
+  e.dailyTokenLimit !== undefined ||
+  e.lifetimeTokenLimit !== undefined;
 
 async function getOrCreateUser(ctx: MutationCtx, userId: string) {
   const existing = await ctx.db
@@ -87,8 +181,19 @@ async function getOrCreateAction(ctx: MutationCtx, name: string) {
   return (await ctx.db.get(id))!;
 }
 
+async function getSettings(ctx: MutationCtx) {
+  return await ctx.db
+    .query("settings")
+    .withIndex("key", (q) => q.eq("key", "singleton"))
+    .unique();
+}
+
 const vStartResult = v.union(
-  v.object({ allowed: v.literal(true), requestId: v.id("requests") }),
+  v.object({
+    allowed: v.literal(true),
+    requestId: v.id("requests"),
+    warnings: v.array(v.string()),
+  }),
   v.object({
     allowed: v.literal(false),
     code: v.string(),
@@ -119,12 +224,27 @@ export const startRequest = mutation({
     };
 
     const today = dayStamp();
-    // Cost this request could incur, reserved up front so concurrent in-flight
-    // requests are visible to each other's limit checks.
-    const estimate = estimateCost(args.messages, await getPrice(ctx, args.model));
+    const priceInfo = await getPrice(ctx, args.model);
+    const est = estimateUsage(args.messages, priceInfo);
+    const warnings: string[] = [];
 
     if (user.blocked) {
       return reject("blocked", `User "${args.userId}" is blocked`);
+    }
+    // Model allow/deny policy (component-wide).
+    const policy = await getSettings(ctx);
+    if (policy) {
+      const mode = policy.modelMode ?? "open";
+      const list = policy.models ?? [];
+      if (mode === "allowlist" && !list.includes(args.model)) {
+        return reject(
+          "model_not_allowed",
+          `Model "${args.model}" is not on the allowlist`
+        );
+      }
+      if (mode === "denylist" && list.includes(args.model)) {
+        return reject("model_denied", `Model "${args.model}" is denied`);
+      }
     }
     if (user.requestsPerMinute !== undefined) {
       const recent = await ctx.db
@@ -140,32 +260,32 @@ export const startRequest = mutation({
         );
       }
     }
-    // Committed spend + already-reserved in-flight spend + this estimate must
-    // fit under the cap. This is decided and reserved in one transaction, so
-    // Convex's serializable isolation makes it a true atomic check-and-reserve.
+    // Committed + already-reserved in-flight usage + this estimate must fit
+    // under each cap. Decided and reserved in one transaction, so Convex's
+    // serializable isolation makes it a true atomic check-and-reserve. Soft
+    // enforcement turns a violation into a warning instead of a block.
     const userSameDay = user.dayStamp === today;
-    const userSpendToday = userSameDay ? user.spendTodayCents : 0;
-    const userReservedToday = userSameDay ? user.reservedTodayCents ?? 0 : 0;
-    const userReservedTotal = user.reservedTotalCents ?? 0;
-    if (
-      user.dailySpendLimitCents !== undefined &&
-      userSpendToday + userReservedToday + estimate > user.dailySpendLimitCents
-    ) {
-      return reject(
-        "daily_spend_limit",
-        `Daily spend limit reached for "${args.userId}" (${user.dailySpendLimitCents}¢/day)`
-      );
-    }
-    if (
-      user.lifetimeSpendLimitCents !== undefined &&
-      user.totalSpendCents + userReservedTotal + estimate >
-        user.lifetimeSpendLimitCents
-    ) {
-      return reject(
-        "lifetime_spend_limit",
-        `Lifetime spend limit reached for "${args.userId}"`
-      );
-    }
+    const userEval = evaluateCaps({
+      label: "user",
+      name: args.userId,
+      enforcement: user.enforcement ?? "hard",
+      estCost: est.cost,
+      estTokens: est.tokens,
+      spendToday: userSameDay ? user.spendTodayCents : 0,
+      reservedSpendToday: userSameDay ? user.reservedTodayCents ?? 0 : 0,
+      totalSpend: user.totalSpendCents,
+      reservedSpendTotal: user.reservedTotalCents ?? 0,
+      tokensToday: userSameDay ? user.tokensToday ?? 0 : 0,
+      reservedTokensToday: userSameDay ? user.reservedTodayTokens ?? 0 : 0,
+      totalTokens: user.totalTokens,
+      reservedTokensTotal: user.reservedTotalTokens ?? 0,
+      dailySpendLimitCents: user.dailySpendLimitCents,
+      lifetimeSpendLimitCents: user.lifetimeSpendLimitCents,
+      dailyTokenLimit: user.dailyTokenLimit,
+      lifetimeTokenLimit: user.lifetimeTokenLimit,
+    });
+    if (userEval.hard) return reject(userEval.hard.code, userEval.hard.reason);
+    warnings.push(...userEval.warnings);
 
     let action: Doc<"actions"> | null = null;
     if (args.actionName !== undefined) {
@@ -174,68 +294,67 @@ export const startRequest = mutation({
         return reject("action_disabled", `Action "${action.name}" is disabled`);
       }
       const aSameDay = action.dayStamp === today;
-      const aSpendToday = aSameDay ? action.spendTodayCents : 0;
-      const aReservedToday = aSameDay ? action.reservedTodayCents ?? 0 : 0;
-      const aReservedTotal = action.reservedTotalCents ?? 0;
-      if (
-        action.dailySpendLimitCents !== undefined &&
-        aSpendToday + aReservedToday + estimate > action.dailySpendLimitCents
-      ) {
-        return reject(
-          "action_daily_spend_limit",
-          `Daily spend limit reached for action "${action.name}" (${action.dailySpendLimitCents}¢/day)`
-        );
-      }
-      if (
-        action.lifetimeSpendLimitCents !== undefined &&
-        action.totalSpendCents + aReservedTotal + estimate >
-          action.lifetimeSpendLimitCents
-      ) {
-        return reject(
-          "action_lifetime_spend_limit",
-          `Lifetime spend limit reached for action "${action.name}"`
-        );
-      }
+      const actionEval = evaluateCaps({
+        label: "action",
+        name: action.name,
+        enforcement: action.enforcement ?? "hard",
+        estCost: est.cost,
+        estTokens: est.tokens,
+        spendToday: aSameDay ? action.spendTodayCents : 0,
+        reservedSpendToday: aSameDay ? action.reservedTodayCents ?? 0 : 0,
+        totalSpend: action.totalSpendCents,
+        reservedSpendTotal: action.reservedTotalCents ?? 0,
+        tokensToday: aSameDay ? action.tokensToday ?? 0 : 0,
+        reservedTokensToday: aSameDay ? action.reservedTodayTokens ?? 0 : 0,
+        totalTokens: action.totalTokens,
+        reservedTokensTotal: action.reservedTotalTokens ?? 0,
+        dailySpendLimitCents: action.dailySpendLimitCents,
+        lifetimeSpendLimitCents: action.lifetimeSpendLimitCents,
+        dailyTokenLimit: action.dailyTokenLimit,
+        lifetimeTokenLimit: action.lifetimeTokenLimit,
+      });
+      if (actionEval.hard) return reject(actionEval.hard.code, actionEval.hard.reason);
+      warnings.push(...actionEval.warnings);
     }
 
-    // Passed — reserve, but ONLY on entities that actually have a spend cap.
-    // Writing an uncapped entity's row here would serialize every request that
-    // shares it (e.g. all callers of one action), so we skip it: with no cap
-    // there is no reserved amount to consult. Totals are still accrued later,
-    // asynchronously, in foldOne.
-    const userHasSpendCap =
-      user.dailySpendLimitCents !== undefined ||
-      user.lifetimeSpendLimitCents !== undefined;
-    if (userHasSpendCap) {
+    // Passed — reserve, but ONLY on entities that actually have a cap. Writing
+    // an uncapped entity's row here would serialize every request that shares it
+    // (e.g. all callers of one action); with no cap there's no reserved amount
+    // to consult. Totals are still accrued later, asynchronously, in foldOne.
+    if (hasAnyCap(user)) {
       await ctx.db.patch(user._id, {
         dayStamp: today,
-        spendTodayCents: userSpendToday,
-        reservedTodayCents: userReservedToday + estimate,
-        reservedTotalCents: userReservedTotal + estimate,
+        spendTodayCents: userSameDay ? user.spendTodayCents : 0,
+        tokensToday: userSameDay ? user.tokensToday ?? 0 : 0,
+        reservedTodayCents: (userSameDay ? user.reservedTodayCents ?? 0 : 0) + est.cost,
+        reservedTotalCents: (user.reservedTotalCents ?? 0) + est.cost,
+        reservedTodayTokens: (userSameDay ? user.reservedTodayTokens ?? 0 : 0) + est.tokens,
+        reservedTotalTokens: (user.reservedTotalTokens ?? 0) + est.tokens,
         pendingCount: (user.pendingCount ?? 0) + 1,
       });
     }
-    if (
-      action &&
-      (action.dailySpendLimitCents !== undefined ||
-        action.lifetimeSpendLimitCents !== undefined)
-    ) {
+    if (action && hasAnyCap(action)) {
       const aSameDay = action.dayStamp === today;
       await ctx.db.patch(action._id, {
         dayStamp: today,
         spendTodayCents: aSameDay ? action.spendTodayCents : 0,
-        reservedTodayCents:
-          (aSameDay ? action.reservedTodayCents ?? 0 : 0) + estimate,
-        reservedTotalCents: (action.reservedTotalCents ?? 0) + estimate,
+        tokensToday: aSameDay ? action.tokensToday ?? 0 : 0,
+        reservedTodayCents: (aSameDay ? action.reservedTodayCents ?? 0 : 0) + est.cost,
+        reservedTotalCents: (action.reservedTotalCents ?? 0) + est.cost,
+        reservedTodayTokens: (aSameDay ? action.reservedTodayTokens ?? 0 : 0) + est.tokens,
+        reservedTotalTokens: (action.reservedTotalTokens ?? 0) + est.tokens,
         pendingCount: (action.pendingCount ?? 0) + 1,
       });
     }
     const requestId = await ctx.db.insert("requests", {
       ...args,
       status: "pending",
-      estimatedCents: estimate,
+      estimatedCents: est.cost,
+      estimatedTokens: est.tokens,
+      ...(priceInfo.known ? {} : { unpricedModel: true }),
+      ...(warnings.length > 0 ? { overBudget: true } : {}),
     });
-    return { allowed: true as const, requestId };
+    return { allowed: true as const, requestId, warnings };
   },
 });
 
@@ -253,14 +372,24 @@ export const finishRequest = mutation({
     const request = await ctx.db.get(args.requestId);
     if (!request) throw new Error("Unknown request");
 
+    // Exactly-once settlement. A request that already reached a terminal state
+    // — finished normally, or expired by the reconciler's stale sweep — must
+    // not be settled again. Without this, a merely-slow request that the sweep
+    // already folded would be re-opened and folded a SECOND time when it
+    // finally completes: totals double-count and the reservation is released
+    // twice, dropping the reserved pool below reality and letting the atomic
+    // check-and-reserve admit requests it should block.
+    if (request.status !== "pending") {
+      return { costCents: request.costCents ?? 0 };
+    }
+
     // Clamp caller-supplied token counts: negatives would produce negative cost
     // and could refund a user below their cap.
     const promptTokens = Math.max(0, args.promptTokens ?? 0);
     const completionTokens = Math.max(0, args.completionTokens ?? 0);
-    const costCents = costOf(
-      promptTokens,
-      completionTokens,
-      await getPrice(ctx, request.model)
+    const costCents = Math.max(
+      0,
+      costOf(promptTokens, completionTokens, await getPrice(ctx, request.model))
     );
 
     // Durable write to the request's OWN row only — uncontended, so it always
@@ -292,8 +421,9 @@ export const finishRequest = mutation({
 async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   if (!req || req.settled !== false) return;
   const actual = req.costCents ?? 0;
-  const estimate = req.estimatedCents ?? 0;
+  const estCost = req.estimatedCents ?? 0;
   const tokens = (req.promptTokens ?? 0) + (req.completionTokens ?? 0);
+  const estTokens = req.estimatedTokens ?? 0;
   const today = dayStamp();
 
   const user = await getOrCreateUser(ctx, req.userId);
@@ -304,11 +434,11 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
     totalTokens: user.totalTokens + tokens,
     dayStamp: today,
     spendTodayCents: (uSameDay ? user.spendTodayCents : 0) + actual,
-    reservedTodayCents: Math.max(
-      0,
-      (uSameDay ? user.reservedTodayCents ?? 0 : 0) - estimate
-    ),
-    reservedTotalCents: Math.max(0, (user.reservedTotalCents ?? 0) - estimate),
+    tokensToday: (uSameDay ? user.tokensToday ?? 0 : 0) + tokens,
+    reservedTodayCents: Math.max(0, (uSameDay ? user.reservedTodayCents ?? 0 : 0) - estCost),
+    reservedTotalCents: Math.max(0, (user.reservedTotalCents ?? 0) - estCost),
+    reservedTodayTokens: Math.max(0, (uSameDay ? user.reservedTodayTokens ?? 0 : 0) - estTokens),
+    reservedTotalTokens: Math.max(0, (user.reservedTotalTokens ?? 0) - estTokens),
     pendingCount: Math.max(0, (user.pendingCount ?? 0) - 1),
   });
 
@@ -321,14 +451,11 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
       totalTokens: action.totalTokens + tokens,
       dayStamp: today,
       spendTodayCents: (aSameDay ? action.spendTodayCents : 0) + actual,
-      reservedTodayCents: Math.max(
-        0,
-        (aSameDay ? action.reservedTodayCents ?? 0 : 0) - estimate
-      ),
-      reservedTotalCents: Math.max(
-        0,
-        (action.reservedTotalCents ?? 0) - estimate
-      ),
+      tokensToday: (aSameDay ? action.tokensToday ?? 0 : 0) + tokens,
+      reservedTodayCents: Math.max(0, (aSameDay ? action.reservedTodayCents ?? 0 : 0) - estCost),
+      reservedTotalCents: Math.max(0, (action.reservedTotalCents ?? 0) - estCost),
+      reservedTodayTokens: Math.max(0, (aSameDay ? action.reservedTodayTokens ?? 0 : 0) - estTokens),
+      reservedTotalTokens: Math.max(0, (action.reservedTotalTokens ?? 0) - estTokens),
       pendingCount: Math.max(0, (action.pendingCount ?? 0) - 1),
     });
   }
@@ -435,6 +562,9 @@ export const setLimits = mutation({
     requestsPerMinute: v.optional(v.number()),
     dailySpendLimitCents: v.optional(v.number()),
     lifetimeSpendLimitCents: v.optional(v.number()),
+    dailyTokenLimit: v.optional(v.number()),
+    lifetimeTokenLimit: v.optional(v.number()),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     blocked: v.optional(v.boolean()),
   },
   returns: v.null(),
@@ -482,6 +612,9 @@ export const setActionLimits = mutation({
     name: v.string(),
     dailySpendLimitCents: v.optional(v.number()),
     lifetimeSpendLimitCents: v.optional(v.number()),
+    dailyTokenLimit: v.optional(v.number()),
+    lifetimeTokenLimit: v.optional(v.number()),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     disabled: v.optional(v.boolean()),
   },
   returns: v.null(),
@@ -489,6 +622,53 @@ export const setActionLimits = mutation({
     const action = await getOrCreateAction(ctx, args.name);
     const { name: _name, ...limits } = args;
     await ctx.db.patch(action._id, limits);
+    return null;
+  },
+});
+
+export const getModelPolicy = query({
+  args: {},
+  returns: v.object({
+    mode: v.union(
+      v.literal("open"),
+      v.literal("allowlist"),
+      v.literal("denylist")
+    ),
+    models: v.array(v.string()),
+  }),
+  handler: async (ctx) => {
+    const s = await ctx.db
+      .query("settings")
+      .withIndex("key", (q) => q.eq("key", "singleton"))
+      .unique();
+    return { mode: s?.modelMode ?? "open", models: s?.models ?? [] };
+  },
+});
+
+export const setModelPolicy = mutation({
+  args: {
+    mode: v.union(
+      v.literal("open"),
+      v.literal("allowlist"),
+      v.literal("denylist")
+    ),
+    models: v.array(v.string()),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const existing = await getSettings(ctx);
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        modelMode: args.mode,
+        models: args.models,
+      });
+    } else {
+      await ctx.db.insert("settings", {
+        key: "singleton",
+        modelMode: args.mode,
+        models: args.models,
+      });
+    }
     return null;
   },
 });
@@ -501,6 +681,11 @@ export const setPrice = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    // Negative prices would make costOf return a negative cost, which folds
+    // into totals as a spend *refund* — pushing a user back under their cap.
+    if (args.inputCentsPerMTok < 0 || args.outputCentsPerMTok < 0) {
+      throw new Error("Prices must be non-negative");
+    }
     const existing = await ctx.db
       .query("prices")
       .withIndex("model", (q) => q.eq("model", args.model))

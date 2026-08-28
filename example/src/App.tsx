@@ -19,6 +19,7 @@ type ChatEntry = {
   who: "user" | "ai" | "error";
   text: string;
   costCents?: number;
+  warnings?: string[];
 };
 
 export default function App() {
@@ -122,7 +123,7 @@ function Chat({ userId, model }: { userId: string; model: string }) {
     setBusy(true);
     try {
       const res = await send({ userId, prompt, model });
-      push({ who: "ai", text: res.text, costCents: res.costCents });
+      push({ who: "ai", text: res.text, costCents: res.costCents, warnings: res.warnings });
     } catch (e: any) {
       const data = e?.data;
       push({
@@ -161,6 +162,13 @@ function Chat({ userId, model }: { userId: string; model: string }) {
             }}
           >
             {m.text}
+            {m.warnings && m.warnings.length > 0 && (
+              <div style={{ fontSize: 11, color: "var(--accent2)", marginTop: 4 }}>
+                {m.warnings.map((w, j) => (
+                  <div key={j}>⚠ {w}</div>
+                ))}
+              </div>
+            )}
             {m.costCents !== undefined && (
               <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
                 cost: {cents(m.costCents)}
@@ -245,7 +253,17 @@ function Requests() {
               <td className="mono">{new Date(r._creationTime).toLocaleTimeString()}</td>
               <td>{r.userId}</td>
               <td className="mono">{r.actionName ?? "—"}</td>
-              <td className="mono">{r.model}</td>
+              <td className="mono">
+                {r.model}
+                {r.unpricedModel && (
+                  <span
+                    title="No known price — charged the conservative fallback. Add a price via setPrice."
+                    style={{ marginLeft: 6, color: "var(--accent2)" }}
+                  >
+                    ⚠ unpriced
+                  </span>
+                )}
+              </td>
               <td>
                 <span className={`pill ${r.status}`}>{r.status}</span>
                 {r.rerunOf && <span style={{ marginLeft: 6, fontSize: 11, color: "var(--muted)" }}>rerun</span>}
@@ -432,8 +450,10 @@ function Users() {
           <th>tokens</th>
           <th>spend today</th>
           <th>total spend</th>
-          <th>req/min limit</th>
-          <th>daily limit (¢)</th>
+          <th>req/min</th>
+          <th>daily ¢</th>
+          <th>daily tokens</th>
+          <th>soft</th>
           <th>blocked</th>
         </tr>
       </thead>
@@ -455,6 +475,21 @@ function Users() {
               <LimitInput
                 value={u.dailySpendLimitCents}
                 onSave={(n) => setLimits({ userId: u.userId, dailySpendLimitCents: n })}
+              />
+            </td>
+            <td>
+              <LimitInput
+                value={u.dailyTokenLimit}
+                onSave={(n) => setLimits({ userId: u.userId, dailyTokenLimit: n })}
+              />
+            </td>
+            <td title="Soft = warn but allow; unchecked = hard block">
+              <input
+                type="checkbox"
+                checked={u.enforcement === "soft"}
+                onChange={(e) =>
+                  setLimits({ userId: u.userId, enforcement: e.target.checked ? "soft" : "hard" })
+                }
               />
             </td>
             <td>
