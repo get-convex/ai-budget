@@ -749,7 +749,7 @@ const DEFAULT_SYSTEMS = [
 ];
 
 function Experiment({ userId }: { userId: string }) {
-  const [mode, setMode] = useState<"matrix" | "backtest">("matrix");
+  const [mode, setMode] = useState<"matrix" | "backtest" | "evolve">("matrix");
   return (
     <div>
       <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
@@ -759,8 +759,87 @@ function Experiment({ userId }: { userId: string }) {
         <button className={mode === "backtest" ? "" : "ghost"} onClick={() => setMode("backtest")}>
           Backtest on real traffic
         </button>
+        <button className={mode === "evolve" ? "" : "ghost"} onClick={() => setMode("evolve")}>
+          🧬 Evolve (budget-bounded)
+        </button>
       </div>
-      {mode === "matrix" ? <Matrix userId={userId} /> : <Backtest />}
+      {mode === "matrix" ? <Matrix userId={userId} /> : mode === "backtest" ? <Backtest /> : <Evolve />}
+    </div>
+  );
+}
+
+function Evolve() {
+  const evolve = useAction(api.ai.evolve);
+  const [goal, setGoal] = useState("Explain like I'm five, warmly, with a concrete analogy.");
+  const [seedSystem, setSeedSystem] = useState("You are a helpful assistant.");
+  const [rounds, setRounds] = useState(5);
+  const [budget, setBudget] = useState(0.02); // dollars
+  const [out, setOut] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const run = async () => {
+    setBusy(true); setOut(null);
+    try {
+      setOut(await evolve({ goal, seedSystem, rounds, sampleSize: 2, budgetNanos: Math.round(budget * NANOS) }));
+    } catch (e: any) {
+      setOut({ error: String(e?.data?.reason ?? e?.message ?? e) });
+    } finally { setBusy(false); }
+  };
+  const maxScore = 10;
+  return (
+    <div style={{ maxWidth: 900 }}>
+      <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
+        An LLM evolves the system prompt toward your goal, scoring each candidate on
+        real chat requests. It runs until it hits the round limit <b>or the budget</b> —
+        the spend cap is what makes an autonomous optimization loop safe to walk away from.
+      </p>
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>goal</label>
+      <textarea style={{ width: "100%", minHeight: 40, marginBottom: 8 }} value={goal} onChange={(e) => setGoal(e.target.value)} />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>seed system prompt</label>
+      <textarea style={{ width: "100%", minHeight: 40, marginBottom: 8 }} value={seedSystem} onChange={(e) => setSeedSystem(e.target.value)} />
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 14 }}>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>max rounds</label>
+        <input type="number" style={{ width: 56 }} value={rounds} onChange={(e) => setRounds(Number(e.target.value))} />
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>budget $</label>
+        <input type="number" step="0.01" style={{ width: 70 }} value={budget} onChange={(e) => setBudget(Number(e.target.value))} />
+        <button onClick={run} disabled={busy}>{busy ? "Evolving…" : "🧬 Evolve"}</button>
+      </div>
+      {out?.error && <div style={{ color: "var(--red)" }}>{out.error}</div>}
+      {out?.history && (
+        <>
+          <div style={{ marginBottom: 12, fontSize: 13 }}>
+            stopped by{" "}
+            <b style={{ color: out.stopped === "budget" ? "var(--accent2)" : "var(--muted)" }}>
+              {out.stopped === "budget" ? "🛑 budget reached" : "round limit"}
+            </b>{" "}
+            · spent <b>{cents(out.spentNanos)}</b> · corpus {out.corpusSize} real requests
+          </div>
+          {out.history.map((h: any) => {
+            const isBest = h.system === out.best.system;
+            return (
+              <div key={h.round} style={{
+                display: "flex", gap: 10, alignItems: "flex-start", padding: "8px 0",
+                borderBottom: "1px solid var(--border)",
+              }}>
+                <div className="mono" style={{ width: 60, color: "var(--muted)", fontSize: 12 }}>#{h.round}</div>
+                <div style={{ width: 120 }}>
+                  <div style={{ background: "var(--panel2)", borderRadius: 4, height: 8, overflow: "hidden" }}>
+                    <div style={{ width: `${(h.score / maxScore) * 100}%`, height: "100%", background: isBest ? "var(--green)" : "var(--accent)" }} />
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>{h.score.toFixed(1)}/10 · {cents(h.spentNanos)}</div>
+                </div>
+                <div style={{ flex: 1, fontSize: 13 }}>
+                  {isBest && <span style={{ color: "var(--green)" }}>★ </span>}
+                  {h.system}
+                </div>
+              </div>
+            );
+          })}
+          <div style={{ marginTop: 14, background: "var(--panel2)", border: "1px solid var(--green)", borderRadius: 8, padding: 12 }}>
+            <div style={{ fontSize: 12, color: "var(--green)", marginBottom: 4 }}>best prompt · {out.best.score.toFixed(1)}/10</div>
+            <div style={{ whiteSpace: "pre-wrap" }}>{out.best.system}</div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
