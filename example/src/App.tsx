@@ -28,7 +28,9 @@ type ChatEntry = {
 export default function App() {
   const [userId, setUserId] = useState(PERSONAS[0]);
   const [model, setModel] = useState(MODELS[0]);
-  const [tab, setTab] = useState<"requests" | "users" | "actions">("requests");
+  const [tab, setTab] = useState<
+    "requests" | "users" | "actions" | "experiment"
+  >("requests");
 
   return (
     <div style={{ display: "flex", height: "100vh" }}>
@@ -97,10 +99,24 @@ export default function App() {
           >
             Actions & Budgets
           </button>
+          <button
+            className={tab === "experiment" ? "" : "ghost"}
+            onClick={() => setTab("experiment")}
+          >
+            🧪 Experiment
+          </button>
           <Totals />
         </div>
         <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
-          {tab === "requests" ? <Requests /> : tab === "users" ? <Users /> : <Actions />}
+          {tab === "requests" ? (
+            <Requests />
+          ) : tab === "users" ? (
+            <Users />
+          ) : tab === "actions" ? (
+            <Actions />
+          ) : (
+            <Experiment userId={userId} />
+          )}
         </div>
       </div>
     </div>
@@ -323,6 +339,9 @@ function Inspector({
   const [model, setModel] = useState(request.model);
   const [result, setResult] = useState<any>(null);
   const [busy, setBusy] = useState(false);
+  const [diff, setDiff] = useState(false);
+  // the request this one was changed from (immediate parent in the chain)
+  const original = lineage?.ancestors?.[lineage.ancestors.length - 1];
 
   const run = async () => {
     setBusy(true);
@@ -401,29 +420,61 @@ function Inspector({
             ))}
           </div>
         )}
-        <label style={{ fontSize: 12, color: "var(--muted)" }}>model</label>
-        <select value={model} onChange={(e) => setModel(e.target.value)} style={{ width: "100%", marginBottom: 10 }}>
-          {MODELS.map((m) => <option key={m}>{m}</option>)}
-        </select>
-        {messages.map((m, i) => (
-          <div key={i} style={{ marginBottom: 8 }}>
-            <label style={{ fontSize: 12, color: "var(--muted)" }}>{m.role}</label>
-            <textarea
-              style={{ width: "100%", minHeight: 60 }}
-              value={m.content}
-              onChange={(e) =>
-                setMessages(messages.map((mm, j) => (j === i ? { ...mm, content: e.target.value } : mm)))
-              }
-            />
-          </div>
-        ))}
-        {request.responseText && (
-          <div style={{ background: "var(--panel2)", borderRadius: 8, padding: 10, marginBottom: 10 }}>
-            <div style={{ fontSize: 12, color: "var(--muted)" }}>
-              original response · {cents(request.costNanos)}
+        {original && (
+          <button
+            className={diff ? "" : "ghost"}
+            style={{ marginBottom: 10 }}
+            onClick={() => setDiff((d) => !d)}
+          >
+            {diff ? "✕ hide diff" : "⇄ diff vs original"}
+          </button>
+        )}
+        {diff && original ? (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+              prompt diff <span style={{ color: "var(--red)" }}>original</span> →{" "}
+              <span style={{ color: "var(--green)" }}>this</span>
             </div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{request.responseText}</div>
+            {mergeRoles(original.messages, messages).map((pair, i) => (
+              <div key={i} style={{ marginBottom: 8 }}>
+                <label style={{ fontSize: 11, color: "var(--muted)" }}>{pair.role}</label>
+                <div style={{ background: "var(--panel2)", borderRadius: 6, padding: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
+                  <DiffText a={pair.a} b={pair.b} />
+                </div>
+              </div>
+            ))}
+            <div style={{ fontSize: 12, color: "var(--muted)", margin: "10px 0 6px" }}>output diff</div>
+            <div style={{ background: "var(--panel2)", borderRadius: 6, padding: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
+              <DiffText a={original.responseText ?? ""} b={request.responseText ?? ""} />
+            </div>
           </div>
+        ) : (
+          <>
+            <label style={{ fontSize: 12, color: "var(--muted)" }}>model</label>
+            <select value={model} onChange={(e) => setModel(e.target.value)} style={{ width: "100%", marginBottom: 10 }}>
+              {MODELS.map((m) => <option key={m}>{m}</option>)}
+            </select>
+            {messages.map((m, i) => (
+              <div key={i} style={{ marginBottom: 8 }}>
+                <label style={{ fontSize: 12, color: "var(--muted)" }}>{m.role}</label>
+                <textarea
+                  style={{ width: "100%", minHeight: 60 }}
+                  value={m.content}
+                  onChange={(e) =>
+                    setMessages(messages.map((mm, j) => (j === i ? { ...mm, content: e.target.value } : mm)))
+                  }
+                />
+              </div>
+            ))}
+            {request.responseText && (
+              <div style={{ background: "var(--panel2)", borderRadius: 8, padding: 10, marginBottom: 10 }}>
+                <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                  response · {cents(request.costNanos)}
+                </div>
+                <div style={{ whiteSpace: "pre-wrap" }}>{request.responseText}</div>
+              </div>
+            )}
+          </>
         )}
         {request.error && (
           <div style={{ color: "var(--red)", marginBottom: 10 }}>{request.error}</div>
@@ -620,5 +671,181 @@ function MoneyInput({
       onBlur={save}
       onKeyDown={(e) => e.key === "Enter" && save()}
     />
+  );
+}
+
+// ---------- diff ----------
+
+// Pair up messages by position for a side-by-side prompt diff.
+function mergeRoles(
+  a: { role: string; content: string }[] = [],
+  b: { role: string; content: string }[] = []
+) {
+  const n = Math.max(a.length, b.length);
+  const out: { role: string; a: string; b: string }[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push({
+      role: b[i]?.role ?? a[i]?.role ?? "",
+      a: a[i]?.content ?? "",
+      b: b[i]?.content ?? "",
+    });
+  }
+  return out;
+}
+
+// Word-level LCS diff, rendered with removals struck red and additions green.
+function DiffText({ a, b }: { a: string; b: string }) {
+  const A = a.split(/(\s+)/);
+  const B = b.split(/(\s+)/);
+  const m = A.length,
+    n = B.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--)
+    for (let j = n - 1; j >= 0; j--)
+      dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const parts: { t: string; k: "same" | "del" | "add" }[] = [];
+  let i = 0,
+    j = 0;
+  while (i < m && j < n) {
+    if (A[i] === B[j]) { parts.push({ t: A[i], k: "same" }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { parts.push({ t: A[i], k: "del" }); i++; }
+    else { parts.push({ t: B[j], k: "add" }); j++; }
+  }
+  while (i < m) parts.push({ t: A[i++], k: "del" });
+  while (j < n) parts.push({ t: B[j++], k: "add" });
+  if (a === b) return <span style={{ color: "var(--muted)" }}>{a || "(empty)"}</span>;
+  return (
+    <>
+      {parts.map((p, idx) =>
+        p.k === "same" ? (
+          <span key={idx}>{p.t}</span>
+        ) : p.k === "del" ? (
+          <span key={idx} style={{ color: "var(--red)", textDecoration: "line-through" }}>{p.t}</span>
+        ) : (
+          <span key={idx} style={{ color: "var(--green)" }}>{p.t}</span>
+        )
+      )}
+    </>
+  );
+}
+
+// ---------- experiment ----------
+
+const DEFAULT_SYSTEMS = [
+  "You are a concise, friendly assistant. Keep replies short.",
+  "You are a witty assistant who answers in a single vivid sentence.",
+];
+
+function Experiment({ userId }: { userId: string }) {
+  const experiment = useAction(api.ai.experiment);
+  const judge = useAction(api.ai.judge);
+  const [prompt, setPrompt] = useState("Explain recursion to a five-year-old.");
+  const [systems, setSystems] = useState<string[]>(DEFAULT_SYSTEMS);
+  const [models, setModels] = useState<string[]>(["openai/gpt-4o-mini", "openai/gpt-4o"]);
+  const [results, setResults] = useState<any[] | null>(null);
+  const [verdict, setVerdict] = useState<any>(null);
+  const [busy, setBusy] = useState<"" | "run" | "judge">("");
+
+  const toggleModel = (m: string) =>
+    setModels((ms) => (ms.includes(m) ? ms.filter((x) => x !== m) : [...ms, m]));
+
+  const run = async () => {
+    setBusy("run"); setResults(null); setVerdict(null);
+    try {
+      setResults(await experiment({ userId, prompt, systems: systems.filter((s) => s.trim()), models }));
+    } finally { setBusy(""); }
+  };
+  const doJudge = async () => {
+    if (!results) return;
+    setBusy("judge");
+    try {
+      const candidates = results
+        .filter((r) => r.text)
+        .map((r, i) => ({ label: String.fromCharCode(65 + i), text: r.text }));
+      setVerdict(await judge({ prompt, candidates }));
+    } finally { setBusy(""); }
+  };
+  // winner may come back as "B" or "Candidate B" — match the trailing token.
+  const wins = (label: string) =>
+    !!verdict?.winner && String(verdict.winner).trim().split(/\s+/).pop() === label;
+
+  return (
+    <div style={{ maxWidth: 1100 }}>
+      <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
+        Run one prompt across every <b>system prompt × model</b> combination — every
+        cell is a tracked, budgeted request — then let a judge model pick the best.
+      </p>
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>prompt</label>
+      <textarea style={{ width: "100%", minHeight: 54, marginBottom: 10 }} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>system prompt variants</label>
+      {systems.map((s, i) => (
+        <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+          <textarea style={{ flex: 1, minHeight: 34 }} value={s}
+            onChange={(e) => setSystems(systems.map((x, j) => (j === i ? e.target.value : x)))} />
+          <button className="ghost" onClick={() => setSystems(systems.filter((_, j) => j !== i))}>✕</button>
+        </div>
+      ))}
+      <button className="ghost" style={{ marginBottom: 10 }} onClick={() => setSystems([...systems, ""])}>+ variant</button>
+      <div style={{ marginBottom: 12 }}>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>models (A/B)</label>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+          {MODELS.map((m) => (
+            <label key={m} style={{ fontSize: 12, display: "flex", gap: 4, alignItems: "center" }}>
+              <input type="checkbox" checked={models.includes(m)} onChange={() => toggleModel(m)} /> {m}
+            </label>
+          ))}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <button onClick={run} disabled={busy !== "" || !models.length}>
+          {busy === "run" ? "Running…" : `▶ Run ${systems.filter((s) => s.trim()).length * models.length} variants`}
+        </button>
+        {results && (
+          <button className="ghost" onClick={doJudge} disabled={busy !== ""}>
+            {busy === "judge" ? "Judging…" : "⚖️ Judge the outputs"}
+          </button>
+        )}
+      </div>
+
+      {verdict && (
+        <div style={{ background: "var(--panel2)", border: "1px solid var(--accent)", borderRadius: 8, padding: 12, marginBottom: 14 }}>
+          <b style={{ color: "var(--accent2)" }}>Winner: {verdict.winner ?? "—"}</b> · {verdict.rationale}
+          {verdict.ranking?.length ? (
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>ranking: {verdict.ranking.join(" > ")}</div>
+          ) : null}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 12 }}>
+        {results?.map((r, i) => {
+          const label = String.fromCharCode(65 + i);
+          return (
+            <div key={i} style={{
+              background: "var(--panel)", border: `1px solid ${wins(label) ? "var(--green)" : "var(--border)"}`,
+              borderRadius: 10, padding: 12,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                <span className="mono"><b>{label}</b> · {r.model.split("/")[1]}</span>
+                {wins(label) && <span style={{ color: "var(--green)" }}>★ best</span>}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--muted)", margin: "4px 0", fontStyle: "italic" }}>
+                {r.system}
+              </div>
+              {r.error ? (
+                <div style={{ color: "var(--red)", fontSize: 13 }}>🚫 {r.error}</div>
+              ) : (
+                <>
+                  <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{r.text}</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
+                    {cents(r.costNanos)} · {r.promptTokens}→{r.completionTokens} tok
+                    {r.cachedTokens ? <span style={{ color: "var(--green)" }}> ⚡{r.cachedTokens}</span> : null}
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }

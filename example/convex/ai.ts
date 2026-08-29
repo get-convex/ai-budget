@@ -55,6 +55,92 @@ export const summarize = action({
   },
 });
 
+// Run one prompt across a matrix of system-prompt variants × models. Every run
+// is a tracked request (attributed to "ai:experiment"), so cost/tokens are
+// captured per variant for side-by-side comparison and A/B testing.
+export const experiment = action({
+  args: {
+    userId: v.string(),
+    prompt: v.string(),
+    systems: v.optional(v.array(v.string())),
+    models: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, { userId, prompt, systems, models }) => {
+    const sys = systems?.length ? systems : [SYSTEM_PROMPT];
+    const mods = models?.length ? models : ["openai/gpt-4o-mini"];
+    const combos = sys.flatMap((system) => mods.map((model) => ({ system, model })));
+    return await Promise.all(
+      combos.map(async ({ system, model }) => {
+        try {
+          const r = await ai.chat(ctx, {
+            userId,
+            model,
+            action: "ai:experiment",
+            messages: [
+              { role: "system", content: system },
+              { role: "user", content: prompt },
+            ],
+          });
+          return {
+            system,
+            model,
+            requestId: r.requestId,
+            text: r.text,
+            costNanos: r.costNanos,
+            promptTokens: r.promptTokens,
+            completionTokens: r.completionTokens,
+            cachedTokens: r.cachedTokens,
+            error: null as string | null,
+          };
+        } catch (e: any) {
+          return {
+            system,
+            model,
+            error: String(e?.data?.reason ?? e?.message ?? e),
+          };
+        }
+      })
+    );
+  },
+});
+
+// Have a judge model rank candidate outputs for a prompt and pick the best.
+export const judge = action({
+  args: {
+    prompt: v.string(),
+    candidates: v.array(v.object({ label: v.string(), text: v.string() })),
+    model: v.optional(v.string()),
+  },
+  handler: async (ctx, { prompt, candidates, model }) => {
+    const list = candidates
+      .map((c) => `### Candidate ${c.label}\n${c.text}`)
+      .join("\n\n");
+    const res = await ai.chat(ctx, {
+      userId: "judge",
+      model: model ?? "openai/gpt-4o",
+      action: "ai:judge",
+      messages: [
+        {
+          role: "system",
+          content:
+            'You are an impartial evaluator. Given a user prompt and candidate responses, rank them by quality and pick the best. Respond ONLY as JSON: {"winner":"<label>","rationale":"<one sentence>","ranking":["<label>", ...]}.',
+        },
+        {
+          role: "user",
+          content: `User prompt:\n${prompt}\n\nCandidates:\n${list}\n\nReturn only the JSON.`,
+        },
+      ],
+    });
+    let parsed: any;
+    try {
+      parsed = JSON.parse(res.text.match(/\{[\s\S]*\}/)?.[0] ?? res.text);
+    } catch {
+      parsed = { winner: null, rationale: res.text, ranking: [] };
+    }
+    return { ...parsed, costNanos: res.costNanos };
+  },
+});
+
 export const rerun = action({
   args: {
     requestId: v.string(),
