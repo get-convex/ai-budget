@@ -870,6 +870,7 @@ function Backtest() {
   const [newSystem, setNewSystem] = useState(
     "You are a warm, encouraging assistant. Answer with a concrete example."
   );
+  const [criteria, setCriteria] = useState("Accurate, concise, and friendly.");
   const [model, setModel] = useState("");
   const [limit, setLimit] = useState(5);
   const [out, setOut] = useState<any>(null);
@@ -877,7 +878,7 @@ function Backtest() {
   const run = async () => {
     setBusy(true); setOut(null);
     try {
-      setOut(await backtest({ action, newSystem, model: model || undefined, limit }));
+      setOut(await backtest({ action, newSystem, criteria: criteria || undefined, model: model || undefined, limit }));
     } catch (e: any) {
       setOut({ error: String(e?.data?.reason ?? e?.message ?? e) });
     } finally { setBusy(false); }
@@ -899,6 +900,8 @@ function Backtest() {
       </div>
       <label style={{ fontSize: 12, color: "var(--muted)" }}>candidate system prompt</label>
       <textarea style={{ width: "100%", minHeight: 54, marginBottom: 10 }} value={newSystem} onChange={(e) => setNewSystem(e.target.value)} />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>evaluation criteria (how the judge decides)</label>
+      <textarea style={{ width: "100%", minHeight: 34, marginBottom: 10 }} value={criteria} onChange={(e) => setCriteria(e.target.value)} />
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
         <label style={{ fontSize: 12, color: "var(--muted)" }}>model override</label>
         <select value={model} onChange={(e) => setModel(e.target.value)}>
@@ -951,6 +954,7 @@ function Matrix({ userId }: { userId: string }) {
   const experiment = useAction(api.ai.experiment);
   const judge = useAction(api.ai.judge);
   const [prompt, setPrompt] = useState("Explain recursion to a five-year-old.");
+  const [criteria, setCriteria] = useState("Clear for a five-year-old, warm, uses an analogy.");
   const [systems, setSystems] = useState<string[]>(DEFAULT_SYSTEMS);
   const [models, setModels] = useState<string[]>(["openai/gpt-4o-mini", "openai/gpt-4o"]);
   const [results, setResults] = useState<any[] | null>(null);
@@ -973,7 +977,7 @@ function Matrix({ userId }: { userId: string }) {
       const candidates = results
         .filter((r) => r.text)
         .map((r, i) => ({ label: String.fromCharCode(65 + i), text: r.text }));
-      setVerdict(await judge({ prompt, candidates }));
+      setVerdict(await judge({ prompt, candidates, criteria: criteria || undefined }));
     } finally { setBusy(""); }
   };
   // winner may come back as "B" or "Candidate B" — match the trailing token.
@@ -988,6 +992,8 @@ function Matrix({ userId }: { userId: string }) {
       </p>
       <label style={{ fontSize: 12, color: "var(--muted)" }}>prompt</label>
       <textarea style={{ width: "100%", minHeight: 54, marginBottom: 10 }} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>judge criteria (how the winner is chosen)</label>
+      <textarea style={{ width: "100%", minHeight: 34, marginBottom: 10 }} value={criteria} onChange={(e) => setCriteria(e.target.value)} />
       <label style={{ fontSize: 12, color: "var(--muted)" }}>system prompt variants</label>
       {systems.map((s, i) => (
         <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6 }}>

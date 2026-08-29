@@ -109,9 +109,11 @@ export const judge = action({
   args: {
     prompt: v.string(),
     candidates: v.array(v.object({ label: v.string(), text: v.string() })),
+    criteria: v.optional(v.string()),
     model: v.optional(v.string()),
   },
-  handler: async (ctx, { prompt, candidates, model }) => {
+  handler: async (ctx, { prompt, candidates, criteria, model }) => {
+    const rubric = criteria?.trim() || "overall quality and helpfulness";
     const list = candidates
       .map((c) => `### Candidate ${c.label}\n${c.text}`)
       .join("\n\n");
@@ -123,7 +125,7 @@ export const judge = action({
         {
           role: "system",
           content:
-            'You are an impartial evaluator. Given a user prompt and candidate responses, rank them by quality and pick the best. Respond ONLY as JSON: {"winner":"<label>","rationale":"<one sentence>","ranking":["<label>", ...]}.',
+            `You are an impartial evaluator. Rank the candidate responses by how well they meet these criteria: "${rubric}". Respond ONLY as JSON: {"winner":"<label>","rationale":"<one sentence>","ranking":["<label>", ...]}.`,
         },
         {
           role: "user",
@@ -149,10 +151,12 @@ export const backtest = action({
     // which action's real traffic to backtest (its prompt is what you're tuning)
     action: v.string(),
     newSystem: v.string(),
+    criteria: v.optional(v.string()),
     model: v.optional(v.string()),
     limit: v.optional(v.number()),
   },
-  handler: async (ctx, { action: targetAction, newSystem, model, limit }) => {
+  handler: async (ctx, { action: targetAction, newSystem, criteria, model, limit }) => {
+    const rubric = criteria?.trim() || "overall quality and helpfulness";
     const N = Math.min(limit ?? 5, 10);
     const all = await ai.requests.list(ctx, { limit: 200 });
     const sample = all
@@ -183,7 +187,7 @@ export const backtest = action({
               {
                 role: "system",
                 content:
-                  'Two assistant responses answer the same user request. Which is better? Respond ONLY JSON: {"better":"original"|"new"|"tie","why":"<short>"}.',
+                  `Two assistant responses answer the same user request. Which better meets these criteria: "${rubric}"? Respond ONLY JSON: {"better":"original"|"new"|"tie","why":"<short>"}.`,
               },
               {
                 role: "user",
@@ -231,12 +235,14 @@ export const evolve = action({
   args: {
     action: v.string(),
     goal: v.string(),
+    criteria: v.optional(v.string()),
     seedSystem: v.string(),
     rounds: v.optional(v.number()),
     sampleSize: v.optional(v.number()),
     budgetNanos: v.optional(v.number()),
   },
-  handler: async (ctx, { action: targetAction, goal, seedSystem, rounds, sampleSize, budgetNanos }) => {
+  handler: async (ctx, { action: targetAction, goal, criteria, seedSystem, rounds, sampleSize, budgetNanos }) => {
+    const rubric = criteria?.trim() || goal;
     const maxRounds = Math.min(rounds ?? 4, 8);
     const N = Math.min(sampleSize ?? 3, 5);
     const budget = budgetNanos ?? Infinity;
@@ -278,7 +284,7 @@ export const evolve = action({
           userId: "evolve-judge",
           model: "openai/gpt-4o-mini",
           messages: [
-            { role: "system", content: `Rate 0-10 how well the response meets this goal: "${goal}". Respond ONLY JSON {"score":<number>}.` },
+            { role: "system", content: `Rate 0-10 how well the response meets these criteria: "${rubric}". Respond ONLY JSON {"score":<number>}.` },
             { role: "user", content: `User: ${s.convo.map((m: any) => m.content).join(" ")}\n\nResponse: ${gen.text}` },
           ],
         });
