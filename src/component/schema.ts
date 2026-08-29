@@ -90,6 +90,8 @@ export default defineSchema({
     error: v.optional(v.string()),
     promptTokens: v.optional(v.number()),
     completionTokens: v.optional(v.number()),
+    // subset of promptTokens served from the provider's prompt cache (cheaper).
+    cachedTokens: v.optional(v.number()),
     costNanos: v.optional(v.number()),
     latencyMs: v.optional(v.number()),
     rerunOf: v.optional(v.id("requests")),

@@ -38,6 +38,9 @@
     "dist",
     "src"
   ],
+  "dependencies": {
+    "@convex-dev/sharded-counter": "^0.2.1"
+  },
   "peerDependencies": {
     "@convex-dev/ai-sdk-provider": "*",
     "ai": "^5.0.0 || ^6.0.0 || ^7.0.0",

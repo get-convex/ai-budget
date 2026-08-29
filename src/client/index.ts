@@ -111,6 +111,7 @@ export type ChatResult = {
   costNanos: number;
   promptTokens: number;
   completionTokens: number;
+  cachedTokens: number;
   /** Soft-limit warnings raised at admission (empty unless a soft cap was hit). */
   warnings: string[];
 };
@@ -128,10 +129,19 @@ function toTokenCount(x: any): number {
 function extractUsage(usage: any): {
   promptTokens: number;
   completionTokens: number;
+  cachedTokens: number;
 } {
   return {
     promptTokens: toTokenCount(usage?.inputTokens ?? usage?.promptTokens),
     completionTokens: toTokenCount(usage?.outputTokens ?? usage?.completionTokens),
+    // cached prompt tokens: AI SDK v5 `cachedInputTokens`, OpenAI-compat
+    // `prompt_tokens_details.cached_tokens` / `cached_tokens`.
+    cachedTokens: toTokenCount(
+      usage?.cachedInputTokens ??
+        usage?.promptTokensDetails?.cachedTokens ??
+        usage?.prompt_tokens_details?.cached_tokens ??
+        usage?.cached_tokens
+    ),
   };
 }
 
@@ -229,9 +239,18 @@ export class AIBudget {
     await this.fireSoftLimit({ userId, action: actionName, requestId, warnings });
     const start = Date.now();
     try {
+      // The full chain (incl. system) is stored on the request for audit/replay,
+      // but the AI SDK wants system prompts in the `system` option, not messages.
+      const system =
+        messages
+          .filter((m) => m.role === "system")
+          .map((m) => m.content)
+          .join("\n\n") || undefined;
+      const convo = messages.filter((m) => m.role !== "system");
       const result = await generateText({
         model: convexGateway(model),
-        messages: messages as any,
+        ...(system ? { system } : {}),
+        messages: convo as any,
       });
       const usage = extractUsage(result.usage);
       const { costNanos } = await ctx.runMutation(

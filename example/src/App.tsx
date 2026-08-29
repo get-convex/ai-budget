@@ -122,10 +122,14 @@ function Chat({ userId, model }: { userId: string; model: string }) {
     if (!input.trim() || busy) return;
     const prompt = input;
     setInput("");
+    // prior turns become history so the stored request holds the full chain
+    const history = entries
+      .filter((e) => e.who !== "error")
+      .map((e) => ({ role: e.who === "user" ? "user" : "assistant", content: e.text }));
     push({ who: "user", text: prompt });
     setBusy(true);
     try {
-      const res = await send({ userId, prompt, model });
+      const res = await send({ userId, prompt, history, model });
       push({ who: "ai", text: res.text, costNanos: res.costNanos, warnings: res.warnings });
     } catch (e: any) {
       const data = e?.data;
@@ -273,6 +277,11 @@ function Requests() {
               </td>
               <td className="mono">
                 {r.promptTokens !== undefined ? `${r.promptTokens}→${r.completionTokens}` : "—"}
+                {r.cachedTokens ? (
+                  <span title="prompt tokens served from cache" style={{ color: "var(--green)", marginLeft: 6 }}>
+                    ⚡{r.cachedTokens}
+                  </span>
+                ) : null}
               </td>
               <td className="mono">{cents(r.costNanos)}</td>
               <td className="mono">{r.latencyMs ? `${r.latencyMs}ms` : "—"}</td>

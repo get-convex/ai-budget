@@ -12,14 +12,30 @@ const ai = new AIBudget(components.aiBudget, {
   defaultModel: "openai/gpt-4o-mini",
 });
 
+const SYSTEM_PROMPT = "You are a concise, friendly assistant. Keep replies short.";
+
 export const sendMessage = action({
   args: {
     userId: v.string(),
     prompt: v.string(),
+    // prior turns (excluding the system message, which is prepended here)
+    history: v.optional(
+      v.array(v.object({ role: v.string(), content: v.string() }))
+    ),
     model: v.optional(v.string()),
   },
-  handler: async (ctx, args) => {
-    return await ai.chat(ctx, args);
+  handler: async (ctx, { userId, prompt, history, model }) => {
+    // Send the full chain — system + conversation history + new turn — so the
+    // stored request holds it all (inspect/edit any message, then re-run).
+    return await ai.chat(ctx, {
+      userId,
+      model,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...(history ?? []),
+        { role: "user", content: prompt },
+      ],
+    });
   },
 });
 

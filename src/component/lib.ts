@@ -465,6 +465,7 @@ export const finishRequest = mutation({
     error: v.optional(v.string()),
     promptTokens: v.optional(v.number()),
     completionTokens: v.optional(v.number()),
+    cachedTokens: v.optional(v.number()),
     latencyMs: v.optional(v.number()),
   },
   returns: v.object({ costNanos: v.number() }),
@@ -487,6 +488,7 @@ export const finishRequest = mutation({
     // and could refund a user below their cap.
     const promptTokens = Math.max(0, args.promptTokens ?? 0);
     const completionTokens = Math.max(0, args.completionTokens ?? 0);
+    const cachedTokens = Math.min(promptTokens, Math.max(0, args.cachedTokens ?? 0));
     const costNanos = Math.max(
       0,
       costOf(promptTokens, completionTokens, await getPrice(ctx, request.model))
@@ -501,6 +503,7 @@ export const finishRequest = mutation({
       error: args.error,
       promptTokens,
       completionTokens,
+      ...(cachedTokens > 0 ? { cachedTokens } : {}),
       costNanos,
       latencyMs: args.latencyMs,
       settled: false,
