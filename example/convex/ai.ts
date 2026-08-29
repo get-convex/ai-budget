@@ -141,6 +141,85 @@ export const judge = action({
   },
 });
 
+// Backtest a system-prompt (and/or model) change against REAL historical chat
+// requests: replay each with the new prompt, then judge new-vs-original. The
+// audit log becomes an eval set; the whole run is budget-capped like any other.
+export const backtest = action({
+  args: {
+    newSystem: v.string(),
+    model: v.optional(v.string()),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, { newSystem, model, limit }) => {
+    const N = Math.min(limit ?? 5, 10);
+    const all = await ai.requests.list(ctx, { limit: 100 });
+    const sample = all
+      .filter(
+        (r: any) =>
+          r.status === "success" &&
+          r.actionName === "ai:sendMessage" &&
+          r.responseText &&
+          r.messages?.some((m: any) => m.role === "user")
+      )
+      .slice(0, N);
+
+    const results = await Promise.all(
+      sample.map(async (r: any) => {
+        const convo = r.messages.filter((m: any) => m.role !== "system");
+        try {
+          const rr = await ai.chat(ctx, {
+            userId: r.userId,
+            model: model ?? r.model,
+            action: "ai:backtest",
+            messages: [{ role: "system", content: newSystem }, ...convo],
+          });
+          const j = await ai.chat(ctx, {
+            userId: "judge",
+            model: "openai/gpt-4o",
+            action: "ai:judge",
+            messages: [
+              {
+                role: "system",
+                content:
+                  'Two assistant responses answer the same user request. Which is better? Respond ONLY JSON: {"better":"original"|"new"|"tie","why":"<short>"}.',
+              },
+              {
+                role: "user",
+                content: `Request:\n${convo.map((m: any) => `${m.role}: ${m.content}`).join("\n")}\n\nORIGINAL:\n${r.responseText}\n\nNEW:\n${rr.text}`,
+              },
+            ],
+          });
+          let v2: any;
+          try {
+            v2 = JSON.parse(j.text.match(/\{[\s\S]*\}/)?.[0] ?? j.text);
+          } catch {
+            v2 = { better: "tie", why: j.text };
+          }
+          return {
+            prompt: convo.map((m: any) => m.content).join(" / "),
+            original: r.responseText,
+            updated: rr.text,
+            better: v2.better,
+            why: v2.why,
+            costNanos: (rr.costNanos ?? 0) + (j.costNanos ?? 0),
+          };
+        } catch (e: any) {
+          return {
+            prompt: convo.map((m: any) => m.content).join(" / "),
+            error: String(e?.data?.reason ?? e?.message ?? e),
+          };
+        }
+      })
+    );
+    return {
+      results,
+      total: results.length,
+      improved: results.filter((r) => r.better === "new").length,
+      regressed: results.filter((r) => r.better === "original").length,
+    };
+  },
+});
+
 export const rerun = action({
   args: {
     requestId: v.string(),

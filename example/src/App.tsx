@@ -339,7 +339,8 @@ function Inspector({
   const [model, setModel] = useState(request.model);
   const [result, setResult] = useState<any>(null);
   const [busy, setBusy] = useState(false);
-  const [diff, setDiff] = useState(false);
+  // default diff on when this request is a re-run of another
+  const [diff, setDiff] = useState(!!request.rerunOf);
   // the request this one was changed from (immediate parent in the chain)
   const original = lineage?.ancestors?.[lineage.ancestors.length - 1];
 
@@ -431,6 +432,17 @@ function Inspector({
         )}
         {diff && original ? (
           <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, marginBottom: 8 }}>
+              <span style={{ color: "var(--muted)" }}>model: </span>
+              <span className="mono" style={{ color: original.model === request.model ? "var(--muted)" : "var(--red)" }}>
+                {original.model}
+              </span>
+              {" → "}
+              <span className="mono" style={{ color: original.model === request.model ? "var(--muted)" : "var(--green)" }}>
+                {request.model}
+              </span>
+              {original.model === request.model && <span style={{ color: "var(--muted)" }}> (unchanged)</span>}
+            </div>
             <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
               prompt diff <span style={{ color: "var(--red)" }}>original</span> →{" "}
               <span style={{ color: "var(--green)" }}>this</span>
@@ -737,6 +749,98 @@ const DEFAULT_SYSTEMS = [
 ];
 
 function Experiment({ userId }: { userId: string }) {
+  const [mode, setMode] = useState<"matrix" | "backtest">("matrix");
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        <button className={mode === "matrix" ? "" : "ghost"} onClick={() => setMode("matrix")}>
+          Prompt × model matrix
+        </button>
+        <button className={mode === "backtest" ? "" : "ghost"} onClick={() => setMode("backtest")}>
+          Backtest on real traffic
+        </button>
+      </div>
+      {mode === "matrix" ? <Matrix userId={userId} /> : <Backtest />}
+    </div>
+  );
+}
+
+function Backtest() {
+  const backtest = useAction(api.ai.backtest);
+  const [newSystem, setNewSystem] = useState(
+    "You are a warm, encouraging assistant. Answer with a concrete example."
+  );
+  const [model, setModel] = useState("");
+  const [limit, setLimit] = useState(5);
+  const [out, setOut] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const run = async () => {
+    setBusy(true); setOut(null);
+    try {
+      setOut(await backtest({ newSystem, model: model || undefined, limit }));
+    } catch (e: any) {
+      setOut({ error: String(e?.data?.reason ?? e?.message ?? e) });
+    } finally { setBusy(false); }
+  };
+  return (
+    <div style={{ maxWidth: 1000 }}>
+      <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
+        Replay a new system prompt against your last N <b>real</b> chat requests, and
+        let a judge decide whether it improved each one. The audit log is your eval
+        set; the whole backtest is budget-capped. (Chat a few times first to build a
+        corpus.)
+      </p>
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>candidate system prompt</label>
+      <textarea style={{ width: "100%", minHeight: 54, marginBottom: 10 }} value={newSystem} onChange={(e) => setNewSystem(e.target.value)} />
+      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>model override</label>
+        <select value={model} onChange={(e) => setModel(e.target.value)}>
+          <option value="">(keep original)</option>
+          {MODELS.map((m) => <option key={m}>{m}</option>)}
+        </select>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>last</label>
+        <input type="number" style={{ width: 56 }} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
+        <button onClick={run} disabled={busy}>{busy ? "Backtesting…" : "▶ Backtest"}</button>
+      </div>
+      {out?.error && <div style={{ color: "var(--red)" }}>{out.error}</div>}
+      {out?.results && (
+        <>
+          <div style={{ background: "var(--panel2)", borderRadius: 8, padding: 12, marginBottom: 12 }}>
+            <b style={{ color: "var(--green)" }}>{out.improved} improved</b>
+            {" · "}<b style={{ color: "var(--red)" }}>{out.regressed} regressed</b>
+            {" · "}{out.total - out.improved - out.regressed} tie · over {out.total} real requests
+          </div>
+          {out.results.map((r: any, i: number) => (
+            <div key={i} style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 12, marginBottom: 10 }}>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+                {r.error ? "🚫 " + r.error : <><b>prompt:</b> {r.prompt.slice(0, 120)}</>}
+              </div>
+              {!r.error && (
+                <>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 11, color: r.better === "original" ? "var(--green)" : "var(--muted)" }}>original {r.better === "original" && "✓"}</div>
+                      <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>{r.original}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 11, color: r.better === "new" ? "var(--green)" : "var(--muted)" }}>new {r.better === "new" && "✓"}</div>
+                      <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}><DiffText a={r.original} b={r.updated} /></div>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--accent2)", marginTop: 6 }}>
+                    judge: <b>{r.better}</b> — {r.why} · {cents(r.costNanos)}
+                  </div>
+                </>
+              )}
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+function Matrix({ userId }: { userId: string }) {
   const experiment = useAction(api.ai.experiment);
   const judge = useAction(api.ai.judge);
   const [prompt, setPrompt] = useState("Explain recursion to a five-year-old.");
