@@ -349,6 +349,30 @@ npx convex dev      # terminal 1 — provisions a dev deployment
 npm run dev         # terminal 2 — Vite app
 ```
 
+### What's in the component vs. the demo
+
+The component (`src/`) is **only** the metering/budget primitive — it knows
+nothing about chat or evaluation. Everything below lives in `example/` as
+**application code that uses the component**, not as part of the published API:
+
+- The real features being metered — `sendMessage`, `summarize`, the agent (`agentDemo.ts`).
+- An **eval playground** — a 🧪 Experiment tab with three modes:
+  - **Matrix** — run one prompt across a system-prompt × model grid; an LLM judge
+    ranks them by *your* criteria.
+  - **Backtest** — replay a candidate system prompt against a specific action's
+    real historical requests and judge whether it improved each one.
+  - **Evolve** — an LLM iteratively improves a prompt toward a goal, scored on
+    real traffic, **stopping when it hits a spend budget.**
+- The public endpoints and UI wiring that drive the admin panel.
+
+These are built entirely on two component primitives: `ai.chat(...)` (every eval
+call is budgeted and tracked) and `ai.requests.list(...)` (the audit log *is* the
+eval dataset). They're a **"how to build on it" reference, not the component's
+surface** — a real, non-trivial feature (budget-capped prompt backtesting on live
+traffic) that falls out of the primitives without the component needing to know
+eval exists. If you productize this, it belongs in your app or its own component
+that *composes* `@convex-dev/ai-budget` — never folded back into it.
+
 ---
 
 ## Development
@@ -361,12 +385,16 @@ npm run build       # emit dist/ (client + component) for publishing
 
 ## Layout
 
-- `src/component/` — the component: tables (`users`, `actions`, `requests`,
-  `prices`, `settings`), the reserve/settle mutations (`startRequest` /
-  `finishRequest`), the idempotent `foldTotals`, and the `reconcile` cron.
-- `src/client/` — the `AIBudget` class: `chat`, `languageModel` (AI SDK
-  middleware around `convexGateway`), `rerun`, and the admin methods above.
-- `example/` — the demo app.
+- `src/component/` — **the component** (published): tables (`users`, `actions`,
+  `requests`, `prices`, `settings`), the reserve/settle mutations (`startRequest` /
+  `finishRequest`), the idempotent `foldTotals`, the `reconcile` cron, and the
+  admin functions. Mounts `@convex-dev/sharded-counter` for the global total.
+- `src/client/` — **the client** (published): the `AIBudget` class — `chat`,
+  `languageModel` (AI SDK middleware around `convexGateway`), and the namespaced
+  admin API (`ai.users.*`, `ai.actions.*`, `ai.global.*`, `ai.models.*`,
+  `ai.prices.*`, `ai.requests.*`).
+- `example/` — **the demo app** (not published): real features, the eval
+  playground, and the UI, all built on the two files above.
 
 ## License
 
