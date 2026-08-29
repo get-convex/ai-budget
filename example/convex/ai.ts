@@ -146,18 +146,20 @@ export const judge = action({
 // audit log becomes an eval set; the whole run is budget-capped like any other.
 export const backtest = action({
   args: {
+    // which action's real traffic to backtest (its prompt is what you're tuning)
+    action: v.string(),
     newSystem: v.string(),
     model: v.optional(v.string()),
     limit: v.optional(v.number()),
   },
-  handler: async (ctx, { newSystem, model, limit }) => {
+  handler: async (ctx, { action: targetAction, newSystem, model, limit }) => {
     const N = Math.min(limit ?? 5, 10);
-    const all = await ai.requests.list(ctx, { limit: 100 });
+    const all = await ai.requests.list(ctx, { limit: 200 });
     const sample = all
       .filter(
         (r: any) =>
           r.status === "success" &&
-          r.actionName === "ai:sendMessage" &&
+          r.actionName === targetAction &&
           r.responseText &&
           r.messages?.some((m: any) => m.role === "user")
       )
@@ -227,23 +229,24 @@ export const backtest = action({
 // natural stopping condition for an otherwise-unbounded optimization loop.
 export const evolve = action({
   args: {
+    action: v.string(),
     goal: v.string(),
     seedSystem: v.string(),
     rounds: v.optional(v.number()),
     sampleSize: v.optional(v.number()),
     budgetNanos: v.optional(v.number()),
   },
-  handler: async (ctx, { goal, seedSystem, rounds, sampleSize, budgetNanos }) => {
+  handler: async (ctx, { action: targetAction, goal, seedSystem, rounds, sampleSize, budgetNanos }) => {
     const maxRounds = Math.min(rounds ?? 4, 8);
     const N = Math.min(sampleSize ?? 3, 5);
     const budget = budgetNanos ?? Infinity;
 
-    const all = await ai.requests.list(ctx, { limit: 100 });
+    const all = await ai.requests.list(ctx, { limit: 200 });
     const sample = all
       .filter(
         (r: any) =>
           r.status === "success" &&
-          r.actionName === "ai:sendMessage" &&
+          r.actionName === targetAction &&
           r.messages?.some((m: any) => m.role === "user")
       )
       .slice(0, N)

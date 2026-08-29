@@ -770,6 +770,8 @@ function Experiment({ userId }: { userId: string }) {
 
 function Evolve() {
   const evolve = useAction(api.ai.evolve);
+  const tunable = useTunableActions();
+  const [action, setAction] = useState("ai:sendMessage");
   const [goal, setGoal] = useState("Explain like I'm five, warmly, with a concrete analogy.");
   const [seedSystem, setSeedSystem] = useState("You are a helpful assistant.");
   const [rounds, setRounds] = useState(5);
@@ -779,7 +781,7 @@ function Evolve() {
   const run = async () => {
     setBusy(true); setOut(null);
     try {
-      setOut(await evolve({ goal, seedSystem, rounds, sampleSize: 2, budgetNanos: Math.round(budget * NANOS) }));
+      setOut(await evolve({ action, goal, seedSystem, rounds, sampleSize: 2, budgetNanos: Math.round(budget * NANOS) }));
     } catch (e: any) {
       setOut({ error: String(e?.data?.reason ?? e?.message ?? e) });
     } finally { setBusy(false); }
@@ -788,10 +790,19 @@ function Evolve() {
   return (
     <div style={{ maxWidth: 900 }}>
       <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
-        An LLM evolves the system prompt toward your goal, scoring each candidate on
-        real chat requests. It runs until it hits the round limit <b>or the budget</b> —
-        the spend cap is what makes an autonomous optimization loop safe to walk away from.
+        An LLM evolves the system prompt for a chosen feature (action) toward your goal,
+        scoring each candidate on <b>that feature's</b> real requests. It runs until the
+        round limit <b>or the budget</b> — the spend cap is what makes an autonomous
+        optimization loop safe to walk away from.
       </p>
+      <div style={{ marginBottom: 8 }}>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>action (feature to tune) </label>
+        <select value={action} onChange={(e) => setAction(e.target.value)}>
+          {[action, ...tunable.filter((a: string) => a !== action)].map((a: string) => (
+            <option key={a}>{a}</option>
+          ))}
+        </select>
+      </div>
       <label style={{ fontSize: 12, color: "var(--muted)" }}>goal</label>
       <textarea style={{ width: "100%", minHeight: 40, marginBottom: 8 }} value={goal} onChange={(e) => setGoal(e.target.value)} />
       <label style={{ fontSize: 12, color: "var(--muted)" }}>seed system prompt</label>
@@ -844,8 +855,18 @@ function Evolve() {
   );
 }
 
+// Actions worth tuning — real features, not the meta eval actions.
+function useTunableActions() {
+  const actions = useQuery(api.ai.listActions) ?? [];
+  return actions
+    .map((a: any) => a.name)
+    .filter((n: string) => !/^ai:(backtest|judge|evolve|experiment)$/.test(n));
+}
+
 function Backtest() {
   const backtest = useAction(api.ai.backtest);
+  const tunable = useTunableActions();
+  const [action, setAction] = useState("ai:sendMessage");
   const [newSystem, setNewSystem] = useState(
     "You are a warm, encouraging assistant. Answer with a concrete example."
   );
@@ -856,7 +877,7 @@ function Backtest() {
   const run = async () => {
     setBusy(true); setOut(null);
     try {
-      setOut(await backtest({ newSystem, model: model || undefined, limit }));
+      setOut(await backtest({ action, newSystem, model: model || undefined, limit }));
     } catch (e: any) {
       setOut({ error: String(e?.data?.reason ?? e?.message ?? e) });
     } finally { setBusy(false); }
@@ -864,11 +885,18 @@ function Backtest() {
   return (
     <div style={{ maxWidth: 1000 }}>
       <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
-        Replay a new system prompt against your last N <b>real</b> chat requests, and
-        let a judge decide whether it improved each one. The audit log is your eval
-        set; the whole backtest is budget-capped. (Chat a few times first to build a
-        corpus.)
+        Pick a feature (action), then replay a new system prompt against <b>its</b> last N
+        real requests and let a judge decide whether it improved each one. Each feature
+        has its own prompt, so each is backtested separately. Budget-capped.
       </p>
+      <div style={{ marginBottom: 10 }}>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>action (feature to tune) </label>
+        <select value={action} onChange={(e) => setAction(e.target.value)}>
+          {[action, ...tunable.filter((a: string) => a !== action)].map((a: string) => (
+            <option key={a}>{a}</option>
+          ))}
+        </select>
+      </div>
       <label style={{ fontSize: 12, color: "var(--muted)" }}>candidate system prompt</label>
       <textarea style={{ width: "100%", minHeight: 54, marginBottom: 10 }} value={newSystem} onChange={(e) => setNewSystem(e.target.value)} />
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
