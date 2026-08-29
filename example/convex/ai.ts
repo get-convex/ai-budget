@@ -220,6 +220,105 @@ export const backtest = action({
   },
 });
 
+// Evolve a system prompt toward a goal, bounded by a budget. Each round scores
+// the current prompt on real requests (judge rates goal-fit 0-10), then an LLM
+// proposes an improvement. The loop stops at `rounds` OR when the component's
+// tracked spend for the run reaches `budgetNanos` — the budget is the safe,
+// natural stopping condition for an otherwise-unbounded optimization loop.
+export const evolve = action({
+  args: {
+    goal: v.string(),
+    seedSystem: v.string(),
+    rounds: v.optional(v.number()),
+    sampleSize: v.optional(v.number()),
+    budgetNanos: v.optional(v.number()),
+  },
+  handler: async (ctx, { goal, seedSystem, rounds, sampleSize, budgetNanos }) => {
+    const maxRounds = Math.min(rounds ?? 4, 8);
+    const N = Math.min(sampleSize ?? 3, 5);
+    const budget = budgetNanos ?? Infinity;
+
+    const all = await ai.requests.list(ctx, { limit: 100 });
+    const sample = all
+      .filter(
+        (r: any) =>
+          r.status === "success" &&
+          r.actionName === "ai:sendMessage" &&
+          r.messages?.some((m: any) => m.role === "user")
+      )
+      .slice(0, N)
+      .map((r: any) => ({
+        userId: r.userId,
+        model: r.model,
+        convo: r.messages.filter((m: any) => m.role !== "system"),
+      }));
+    if (!sample.length)
+      return { error: "No real chat requests to evolve against. Chat first." };
+
+    let spent = 0;
+    const chat = async (args: any) => {
+      const r = await ai.chat(ctx, { action: "ai:evolve", ...args });
+      spent += r.costNanos ?? 0;
+      return r;
+    };
+    const scoreSystem = async (system: string) => {
+      let total = 0;
+      const outs: string[] = [];
+      for (const s of sample) {
+        const gen = await chat({
+          userId: s.userId,
+          model: s.model,
+          messages: [{ role: "system", content: system }, ...s.convo],
+        });
+        outs.push(gen.text);
+        const jr = await chat({
+          userId: "evolve-judge",
+          model: "openai/gpt-4o-mini",
+          messages: [
+            { role: "system", content: `Rate 0-10 how well the response meets this goal: "${goal}". Respond ONLY JSON {"score":<number>}.` },
+            { role: "user", content: `User: ${s.convo.map((m: any) => m.content).join(" ")}\n\nResponse: ${gen.text}` },
+          ],
+        });
+        let sc = 0;
+        try { sc = Number(JSON.parse(jr.text.match(/\{[\s\S]*\}/)?.[0] ?? "{}").score) || 0; } catch {}
+        total += sc;
+      }
+      return { avg: total / sample.length, outs };
+    };
+
+    const history: any[] = [];
+    let current = seedSystem;
+    let best = { system: seedSystem, score: -1 };
+    let stopped: "rounds" | "budget" = "rounds";
+
+    try {
+      for (let round = 0; round < maxRounds; round++) {
+        if (spent >= budget) { stopped = "budget"; break; }
+        const { avg, outs } = await scoreSystem(current);
+        history.push({ round: round + 1, system: current, score: avg, spentNanos: spent });
+        if (avg > best.score) best = { system: current, score: avg };
+        if (spent >= budget) { stopped = "budget"; break; }
+        const prop = await chat({
+          userId: "evolve",
+          model: "openai/gpt-4o",
+          messages: [
+            { role: "system", content: `You refine system prompts toward a goal: "${goal}". Given the current prompt (scored ${avg.toFixed(1)}/10) and sample outputs, propose a better system prompt. Respond ONLY JSON {"system":"<new prompt>"}.` },
+            { role: "user", content: `Current system prompt:\n${current}\n\nSample outputs:\n${outs.map((o) => `- ${o.slice(0, 140)}`).join("\n")}` },
+          ],
+        });
+        let next: string | undefined;
+        try { next = JSON.parse(prop.text.match(/\{[\s\S]*\}/s)?.[0] ?? "{}").system; } catch {}
+        if (!next) break;
+        current = next;
+      }
+    } catch (e: any) {
+      if (e?.data?.kind === "AIBudgetLimit") stopped = "budget";
+      else throw e;
+    }
+    return { history, best, spentNanos: spent, stopped, corpusSize: sample.length };
+  },
+});
+
 export const rerun = action({
   args: {
     requestId: v.string(),
