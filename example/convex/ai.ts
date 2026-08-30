@@ -376,6 +376,37 @@ export const listActions = query({
   },
 });
 
+// Pull REAL per-token prices from OpenRouter (public API; ids match the
+// gateway's provider/model naming) and store them via the component's setPrice.
+// Prices are $/token → nanodollars per Mtok = $/token * 1e15. This is app/ops
+// code: the component just stores whatever prices you give it.
+export const syncPrices = action({
+  args: {},
+  handler: async (ctx) => {
+    const res = await fetch("https://openrouter.ai/api/v1/models");
+    const { data } = (await res.json()) as { data: any[] };
+    const byId = new Map(data.map((m) => [m.id, m]));
+    const models = [
+      "openai/gpt-4o-mini",
+      "openai/gpt-4o",
+      "anthropic/claude-sonnet-4.5",
+      "anthropic/claude-haiku-4.5",
+      "openai/gpt-5",
+      "openai/gpt-5-mini",
+    ];
+    const updated: any[] = [];
+    for (const model of models) {
+      const p = byId.get(model)?.pricing;
+      if (!p) continue;
+      const inputNanosPerMTok = Math.round(Number(p.prompt) * 1e15);
+      const outputNanosPerMTok = Math.round(Number(p.completion) * 1e15);
+      await ai.prices.set(ctx, { model, inputNanosPerMTok, outputNanosPerMTok });
+      updated.push({ model, inputNanosPerMTok, outputNanosPerMTok });
+    }
+    return { updated };
+  },
+});
+
 export const setPrice = mutation({
   args: {
     model: v.string(),

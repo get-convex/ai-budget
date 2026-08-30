@@ -242,13 +242,31 @@ ai.models.getPolicy(ctx)
 
 ### Pricing
 
-Prices are in **cents per million tokens**. Sensible defaults ship for common
-models; override or add any model:
+Prices are in **nanodollars per million tokens**. Sensible defaults ship for
+common models (validated against OpenRouter's public pricing); override or add
+any model:
 
 ```ts
 ai.prices.set(ctx, { model, inputNanosPerMTok, outputNanosPerMTok })  // must be ≥ 0
 ai.prices.list(ctx)
 ```
+
+**Real prices from an API.** The gateway's `provider/model` ids match
+OpenRouter's, whose public models endpoint returns per-token pricing — so you can
+keep prices current from your own action (this is app code; the component just
+stores what you give it):
+
+```ts
+const { data } = await (await fetch("https://openrouter.ai/api/v1/models")).json();
+const p = data.find((m) => m.id === "openai/gpt-4o-mini").pricing;
+await ai.prices.set(ctx, {
+  model: "openai/gpt-4o-mini",
+  inputNanosPerMTok: Math.round(Number(p.prompt) * 1e15),   // $/token → nano/Mtok
+  outputNanosPerMTok: Math.round(Number(p.completion) * 1e15),
+});
+```
+
+See `example/convex/ai.ts` → `syncPrices` for a full sync over several models.
 
 An unpriced model is charged the conservative maximum of the known table (so a
 cap can never be bypassed by naming an unlisted model) and its request rows are
