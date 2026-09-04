@@ -1,9 +1,13 @@
 name: Release
 
-# Publishes to npm when a version tag (v*) is pushed. Uses an npm **automation**
-# token (secrets.NPM_TOKEN) so no 2FA/OTP prompt. The dist-tag is derived from
-# the version: a prerelease like 0.0.2-alpha.0 publishes under `alpha`, a plain
-# 0.1.0 under `latest`.
+# Publishes to npm when a version tag (v*) is pushed, using npm **trusted
+# publishing** (OIDC) — no stored token. Provenance is attested automatically.
+# The dist-tag is derived from the version: a prerelease like 0.0.2-alpha.0
+# publishes under `alpha`, a plain 0.1.0 under `latest`.
+#
+# Setup (one time, on npmjs.com): the package settings for
+# @convex-dev/ai-budget → "Trusted Publisher" → GitHub Actions, pointing at
+# repo get-convex/ai-budget and workflow file `release.yml`.
 on:
   push:
     tags:
@@ -14,16 +18,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write # OIDC token for npm trusted publishing
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
+      # Trusted publishing requires npm >= 11.5.1
+      - run: npm install -g npm@latest
       - run: npm install
       - run: npm run build
       - run: npm test
-      - name: Publish
+      - name: Publish (trusted publishing, no token)
         run: |
           VERSION=$(node -p "require('./package.json').version")
           if [[ "$VERSION" == *-* ]]; then
@@ -33,5 +40,3 @@ jobs:
           fi
           echo "Publishing @convex-dev/ai-budget@$VERSION under dist-tag: $TAG"
           npm publish --tag "$TAG" --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
