@@ -3,6 +3,9 @@ node_modules/
 **/node_modules
 **/node_modules/
 **/_generated/
+# ...but DO commit the component's generated code — CI/consumers build from it.
+!src/component/_generated/
+!src/component/_generated/**
 .env.local
 .env
 dist/
