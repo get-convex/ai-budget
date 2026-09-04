@@ -465,7 +465,7 @@ export const setActionLimits = mutation({
     dailyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
-    disabled: v.optional(v.boolean()),
+    blocked: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     await ai.actions.setLimits(ctx, args);

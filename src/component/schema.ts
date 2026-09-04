@@ -6,20 +6,29 @@ export const vMessage = v.object({
   content: v.string(),
 });
 
+// One attribution tag: a (dimension, value) pair, e.g. {dimension:"user",
+// value:"alice"} or {dimension:"customer", value:"acme"}. `user` and `action`
+// are built-in dimensions; apps can add any others (team, project, env, …).
+export const vTag = v.object({ dimension: v.string(), value: v.string() });
+
 export default defineSchema({
-  users: defineTable({
-    userId: v.string(), // app-provided stable key (your user id)
+  // A budget holder, keyed by (dimension, value). Unifies what used to be the
+  // `users` and `actions` tables — those are just the "user" and "action"
+  // dimensions now. Any tag a request carries can have its own budget here.
+  buckets: defineTable({
+    dimension: v.string(),
+    value: v.string(),
     // limits (all optional — unlimited by default)
-    requestsPerMinute: v.optional(v.number()),
+    requestsPerMinute: v.optional(v.number()), // enforced on the "user" dimension
     dailySpendLimitNanos: v.optional(v.number()),
     lifetimeSpendLimitNanos: v.optional(v.number()),
     dailyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
-    blocked: v.optional(v.boolean()),
+    blocked: v.optional(v.boolean()), // hard block (was `blocked`/`disabled`)
     // "hard" (default): exceeding a budget blocks. "soft": warn but allow.
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
-    // one-time bumps ("approve another $X") added on top of the cap. Daily bump
-    // is scoped to bumpDayStamp (resets with the day); lifetime bump is permanent.
+    // one-time bumps ("approve another $X"). Daily bump is scoped to bumpDayStamp
+    // (resets with the day); lifetime bump is permanent.
     dailyBumpNanos: v.optional(v.number()),
     lifetimeBumpNanos: v.optional(v.number()),
     bumpDayStamp: v.optional(v.string()),
@@ -28,7 +37,7 @@ export default defineSchema({
     totalRequests: v.number(),
     totalTokens: v.number(),
     // daily window
-    dayStamp: v.string(), // e.g. "2026-08-27" (UTC)
+    dayStamp: v.string(),
     spendTodayNanos: v.number(),
     tokensToday: v.optional(v.number()),
     // in-flight reservations (pessimistic holds; released on settle/expiry)
@@ -37,36 +46,16 @@ export default defineSchema({
     reservedTodayTokens: v.optional(v.number()),
     reservedTotalTokens: v.optional(v.number()),
     pendingCount: v.optional(v.number()),
-  }).index("userId", ["userId"]),
-
-  // per-action-name budgets and running totals (e.g. "chat", "summarize")
-  actions: defineTable({
-    name: v.string(),
-    dailySpendLimitNanos: v.optional(v.number()),
-    lifetimeSpendLimitNanos: v.optional(v.number()),
-    dailyTokenLimit: v.optional(v.number()),
-    lifetimeTokenLimit: v.optional(v.number()),
-    disabled: v.optional(v.boolean()),
-    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
-    dailyBumpNanos: v.optional(v.number()),
-    lifetimeBumpNanos: v.optional(v.number()),
-    bumpDayStamp: v.optional(v.string()),
-    totalSpendNanos: v.number(),
-    totalRequests: v.number(),
-    totalTokens: v.number(),
-    dayStamp: v.string(),
-    spendTodayNanos: v.number(),
-    tokensToday: v.optional(v.number()),
-    reservedTodayNanos: v.optional(v.number()),
-    reservedTotalNanos: v.optional(v.number()),
-    reservedTodayTokens: v.optional(v.number()),
-    reservedTotalTokens: v.optional(v.number()),
-    pendingCount: v.optional(v.number()),
-  }).index("name", ["name"]),
+  })
+    .index("dim_value", ["dimension", "value"])
+    .index("dimension", ["dimension"]),
 
   requests: defineTable({
+    // `user` and `action` stay first-class + indexed (the hot-path filters and
+    // rate limiting); the full attribution incl. extra tags lives in `tags`.
     userId: v.string(),
     actionName: v.optional(v.string()),
+    tags: v.optional(v.array(vTag)),
     model: v.string(),
     // pessimistic holds placed at start; reconciled to actual on settle
     estimatedNanos: v.optional(v.number()),
@@ -122,12 +111,12 @@ export default defineSchema({
       )
     ),
     models: v.optional(v.array(v.string())),
-    // Deployment-wide ("global") spend cap across ALL users and actions. The
-    // running totals live in a sharded counter (high write throughput); only
-    // the limit config lives here. The cap is enforced approximately — the
-    // sharded total is read without a reservation, so under heavy concurrency
-    // it can overshoot by a bounded amount. Right for a global killswitch;
-    // per-user/per-action caps stay exact via reserve/settle.
+    // Deployment-wide ("global") spend cap across ALL requests. Running totals
+    // live in a sharded counter (high write throughput) since every request
+    // touches it; only the limit config lives here. Enforced approximately —
+    // the sharded total is read without a reservation, so under heavy
+    // concurrency it can overshoot by a bounded amount. Right for a global
+    // killswitch; per-bucket caps stay exact via reserve/settle.
     globalDailySpendLimitNanos: v.optional(v.number()),
     globalLifetimeSpendLimitNanos: v.optional(v.number()),
     globalEnforcement: v.optional(

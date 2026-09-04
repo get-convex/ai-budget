@@ -537,7 +537,7 @@ function Users() {
       <tbody>
         {users.map((u: any) => (
           <tr key={u._id}>
-            <td><b>{u.userId}</b></td>
+            <td><b>{u.value}</b></td>
             <td className="mono">{u.totalRequests}</td>
             <td className="mono">{u.totalTokens.toLocaleString()}</td>
             <td className="mono">{dollars(u.spendTodayNanos)}</td>
@@ -545,19 +545,19 @@ function Users() {
             <td>
               <LimitInput
                 value={u.requestsPerMinute}
-                onSave={(n) => setLimits({ userId: u.userId, requestsPerMinute: n })}
+                onSave={(n) => setLimits({ userId: u.value, requestsPerMinute: n })}
               />
             </td>
             <td>
               <MoneyInput
                 value={u.dailySpendLimitNanos}
-                onSave={(n) => setLimits({ userId: u.userId, dailySpendLimitNanos: n })}
+                onSave={(n) => setLimits({ userId: u.value, dailySpendLimitNanos: n })}
               />
             </td>
             <td>
               <LimitInput
                 value={u.dailyTokenLimit}
-                onSave={(n) => setLimits({ userId: u.userId, dailyTokenLimit: n })}
+                onSave={(n) => setLimits({ userId: u.value, dailyTokenLimit: n })}
               />
             </td>
             <td title="Soft = warn but allow; unchecked = hard block">
@@ -565,7 +565,7 @@ function Users() {
                 type="checkbox"
                 checked={u.enforcement === "soft"}
                 onChange={(e) =>
-                  setLimits({ userId: u.userId, enforcement: e.target.checked ? "soft" : "hard" })
+                  setLimits({ userId: u.value, enforcement: e.target.checked ? "soft" : "hard" })
                 }
               />
             </td>
@@ -573,13 +573,13 @@ function Users() {
               <input
                 type="checkbox"
                 checked={!!u.blocked}
-                onChange={(e) => setLimits({ userId: u.userId, blocked: e.target.checked })}
+                onChange={(e) => setLimits({ userId: u.value, blocked: e.target.checked })}
               />
             </td>
             <td title="One-time bump: approve another $1 of daily budget">
               <button
                 className="ghost"
-                onClick={() => bumpUser({ userId: u.userId, dailyNanos: NANOS })}
+                onClick={() => bumpUser({ userId: u.value, dailyNanos: NANOS })}
               >
                 +$1 today
               </button>
@@ -609,13 +609,13 @@ function Actions() {
             <th>spend today</th>
             <th>total spend</th>
             <th>daily limit ($)</th>
-            <th>disabled</th>
+            <th>blocked</th>
           </tr>
         </thead>
         <tbody>
           {actions.map((a: any) => (
             <tr key={a._id}>
-              <td className="mono"><b>{a.name}</b></td>
+              <td className="mono"><b>{a.value}</b></td>
               <td className="mono">{a.totalRequests}</td>
               <td className="mono">{a.totalTokens.toLocaleString()}</td>
               <td className="mono">{dollars(a.spendTodayNanos)}</td>
@@ -623,14 +623,14 @@ function Actions() {
               <td>
                 <MoneyInput
                   value={a.dailySpendLimitNanos}
-                  onSave={(n) => setLimits({ name: a.name, dailySpendLimitNanos: n })}
+                  onSave={(n) => setLimits({ name: a.value, dailySpendLimitNanos: n })}
                 />
               </td>
               <td>
                 <input
                   type="checkbox"
-                  checked={!!a.disabled}
-                  onChange={(e) => setLimits({ name: a.name, disabled: e.target.checked })}
+                  checked={!!a.blocked}
+                  onChange={(e) => setLimits({ name: a.value, blocked: e.target.checked })}
                 />
               </td>
             </tr>

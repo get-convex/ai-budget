@@ -6,7 +6,7 @@ import {
   type MutationCtx,
 } from "./_generated/server";
 import { api, internal, components } from "./_generated/api";
-import { vMessage } from "./schema";
+import { vMessage, vTag } from "./schema";
 import type { Doc } from "./_generated/dataModel";
 import { ShardedCounter } from "@convex-dev/sharded-counter";
 
@@ -18,6 +18,13 @@ import { ShardedCounter } from "@convex-dev/sharded-counter";
 // currency code alongside these amounts and convert here, at the one boundary.
 const NANOS_PER_DOLLAR = 1e9;
 const fmtUsd = (nanos: number) => `$${(nanos / NANOS_PER_DOLLAR).toFixed(4)}`;
+
+// Built-in attribution dimensions. `user` and `action` are always populated
+// from a request's userId/actionName; apps can add any other dimensions
+// (team, project, customer, env, …) as tags. These two names are reserved —
+// tags carrying them are ignored in favor of the first-class fields.
+const USER_DIM = "user";
+const ACTION_DIM = "action";
 
 // Deployment-wide spend totals (nanodollars), sharded for high write throughput.
 // Keyed "total" (lifetime) and "day:<UTC date>" (natural daily reset).
@@ -111,9 +118,48 @@ function estimateUsage(
   };
 }
 
-// Evaluate an entity's (user or action) spend + token budgets against
-// committed + reserved + this request's estimate. Returns a hard rejection
-// (block) or a list of soft warnings (allow), per the entity's enforcement.
+// The full set of attribution buckets a request touches: the built-in `user`
+// and `action` dimensions plus any extra tags. Reserved dimensions in `extra`
+// are dropped (userId/actionName own them), and (dimension, value) pairs are
+// de-duplicated. Used identically at reserve time (startRequest) and settle
+// time (foldOne), so a request always settles exactly the buckets it reserved.
+function requestBuckets(
+  userId: string,
+  actionName: string | undefined,
+  extra: { dimension: string; value: string }[] | undefined
+): { dimension: string; value: string }[] {
+  const out = [{ dimension: USER_DIM, value: userId }];
+  if (actionName !== undefined)
+    out.push({ dimension: ACTION_DIM, value: actionName });
+  for (const t of extra ?? []) {
+    if (t.dimension === USER_DIM || t.dimension === ACTION_DIM) continue;
+    if (!t.dimension || !t.value) continue;
+    if (out.some((x) => x.dimension === t.dimension && x.value === t.value))
+      continue;
+    out.push({ dimension: t.dimension, value: t.value });
+  }
+  return out;
+}
+
+// Drop reserved/empty/duplicate tags from a caller-supplied list, leaving the
+// "extra" dimensions stored on the request row.
+function sanitizeExtraTags(
+  extra: { dimension: string; value: string }[] | undefined
+): { dimension: string; value: string }[] {
+  const out: { dimension: string; value: string }[] = [];
+  for (const t of extra ?? []) {
+    if (t.dimension === USER_DIM || t.dimension === ACTION_DIM) continue;
+    if (!t.dimension || !t.value) continue;
+    if (out.some((x) => x.dimension === t.dimension && x.value === t.value))
+      continue;
+    out.push({ dimension: t.dimension, value: t.value });
+  }
+  return out;
+}
+
+// Evaluate a bucket's spend + token budgets against committed + reserved + this
+// request's estimate. Returns a hard rejection (block) or a list of soft
+// warnings (allow), per the bucket's enforcement.
 function evaluateCaps(o: {
   label: string;
   name: string;
@@ -179,31 +225,25 @@ const hasAnyCap = (e: {
   e.dailyTokenLimit !== undefined ||
   e.lifetimeTokenLimit !== undefined;
 
-async function getOrCreateUser(ctx: MutationCtx, userId: string) {
-  const existing = await ctx.db
-    .query("users")
-    .withIndex("userId", (q) => q.eq("userId", userId))
+async function getBucketDoc(ctx: MutationCtx, dimension: string, value: string) {
+  return await ctx.db
+    .query("buckets")
+    .withIndex("dim_value", (q) =>
+      q.eq("dimension", dimension).eq("value", value)
+    )
     .unique();
-  if (existing) return existing;
-  const id = await ctx.db.insert("users", {
-    userId,
-    totalSpendNanos: 0,
-    totalRequests: 0,
-    totalTokens: 0,
-    dayStamp: dayStamp(),
-    spendTodayNanos: 0,
-  });
-  return (await ctx.db.get(id))!;
 }
 
-async function getOrCreateAction(ctx: MutationCtx, name: string) {
-  const existing = await ctx.db
-    .query("actions")
-    .withIndex("name", (q) => q.eq("name", name))
-    .unique();
+async function getOrCreateBucket(
+  ctx: MutationCtx,
+  dimension: string,
+  value: string
+) {
+  const existing = await getBucketDoc(ctx, dimension, value);
   if (existing) return existing;
-  const id = await ctx.db.insert("actions", {
-    name,
+  const id = await ctx.db.insert("buckets", {
+    dimension,
+    value,
     totalSpendNanos: 0,
     totalRequests: 0,
     totalTokens: 0,
@@ -237,13 +277,16 @@ export const startRequest = mutation({
   args: {
     userId: v.string(),
     actionName: v.optional(v.string()),
+    // Extra attribution dimensions to bill/limit (team, customer, env, …).
+    // `user` and `action` are reserved (owned by userId/actionName).
+    tags: v.optional(v.array(vTag)),
     model: v.string(),
     messages: v.array(vMessage),
     rerunOf: v.optional(v.id("requests")),
   },
   returns: vStartResult,
   handler: async (ctx, args) => {
-    const user = await getOrCreateUser(ctx, args.userId);
+    const extraTags = sanitizeExtraTags(args.tags);
     // Record the blocked attempt and return a rejection (throwing would roll
     // back the record). `persist` is false for the high-frequency-by-design
     // rejections (rate limit, blocked user) that a client retries in a tight
@@ -252,7 +295,12 @@ export const startRequest = mutation({
     const reject = async (code: string, reason: string, persist = true) => {
       if (persist) {
         await ctx.db.insert("requests", {
-          ...args,
+          userId: args.userId,
+          actionName: args.actionName,
+          ...(extraTags.length ? { tags: extraTags } : {}),
+          model: args.model,
+          messages: args.messages,
+          rerunOf: args.rerunOf,
           status: "blocked" as const,
           error: reason,
         });
@@ -265,14 +313,11 @@ export const startRequest = mutation({
     const est = estimateUsage(args.messages, priceInfo);
     const warnings: string[] = [];
 
-    if (user.blocked) {
-      return reject("blocked", `User "${args.userId}" is blocked`, false);
-    }
     // Model allow/deny policy (component-wide).
-    const policy = await getSettings(ctx);
-    if (policy) {
-      const mode = policy.modelMode ?? "open";
-      const list = policy.models ?? [];
+    const settings = await getSettings(ctx);
+    if (settings) {
+      const mode = settings.modelMode ?? "open";
+      const list = settings.models ?? [];
       if (mode === "allowlist" && !list.includes(args.model)) {
         return reject(
           "model_not_allowed",
@@ -283,9 +328,35 @@ export const startRequest = mutation({
         return reject("model_denied", `Model "${args.model}" is denied`);
       }
     }
-    if (user.requestsPerMinute !== undefined) {
+
+    // Fetch/create every bucket this request is attributed to (user, action,
+    // and any extra tags). Each may carry its own budget.
+    const bucketTags = requestBuckets(args.userId, args.actionName, extraTags);
+    const buckets: Doc<"buckets">[] = [];
+    for (const t of bucketTags) {
+      buckets.push(await getOrCreateBucket(ctx, t.dimension, t.value));
+    }
+
+    // A hard block on ANY bucket rejects the request. The user dimension's block
+    // isn't persisted (retried in a loop); config-level blocks on other
+    // dimensions are rarer, so they persist for the audit log.
+    for (const b of buckets) {
+      if (b.blocked) {
+        const label = b.dimension === USER_DIM ? "User" : b.dimension;
+        return reject(
+          `${b.dimension}_blocked`,
+          `${label} "${b.value}" is blocked`,
+          b.dimension !== USER_DIM
+        );
+      }
+    }
+
+    // Rate limit is enforced on the `user` dimension (the requests table is
+    // indexed by userId, so the 60s window is a bounded index read).
+    const userBucket = buckets.find((b) => b.dimension === USER_DIM)!;
+    if (userBucket.requestsPerMinute !== undefined) {
       // Bounded read: we only need to know whether non-blocked requests in the
-      // window have reached the limit. Reading limit+1 non-blocked rows is
+      // window have reached the limit. Reading limit+50 non-blocked rows is
       // enough, and .take caps the scan even if the window is flooded. Blocked
       // rows aren't persisted for rate-limit/blocked rejections (see reject),
       // so the window stays small.
@@ -294,106 +365,74 @@ export const startRequest = mutation({
         .withIndex("userId", (q) =>
           q.eq("userId", args.userId).gt("_creationTime", Date.now() - 60_000)
         )
-        .take(user.requestsPerMinute + 50);
+        .take(userBucket.requestsPerMinute + 50);
       if (
         recent.filter((r) => r.status !== "blocked").length >=
-        user.requestsPerMinute
+        userBucket.requestsPerMinute
       ) {
         return reject(
           "rate_limit",
-          `Rate limit exceeded for "${args.userId}" (${user.requestsPerMinute}/min)`,
+          `Rate limit exceeded for "${args.userId}" (${userBucket.requestsPerMinute}/min)`,
           false
         );
       }
     }
-    // Committed + already-reserved in-flight usage + this estimate must fit
-    // under each cap. Decided and reserved in one transaction, so Convex's
-    // serializable isolation makes it a true atomic check-and-reserve. Soft
-    // enforcement turns a violation into a warning instead of a block.
-    const userSameDay = user.dayStamp === today;
-    const userEval = evaluateCaps({
-      label: "user",
-      name: args.userId,
-      enforcement: user.enforcement ?? "hard",
-      estCost: est.cost,
-      estTokens: est.tokens,
-      spendToday: userSameDay ? user.spendTodayNanos : 0,
-      reservedSpendToday: userSameDay ? user.reservedTodayNanos ?? 0 : 0,
-      totalSpend: user.totalSpendNanos,
-      reservedSpendTotal: user.reservedTotalNanos ?? 0,
-      tokensToday: userSameDay ? user.tokensToday ?? 0 : 0,
-      reservedTokensToday: userSameDay ? user.reservedTodayTokens ?? 0 : 0,
-      totalTokens: user.totalTokens,
-      reservedTokensTotal: user.reservedTotalTokens ?? 0,
-      dailySpendLimitNanos: withBump(
-        user.dailySpendLimitNanos,
-        user.bumpDayStamp === today ? user.dailyBumpNanos : 0
-      ),
-      lifetimeSpendLimitNanos: withBump(
-        user.lifetimeSpendLimitNanos,
-        user.lifetimeBumpNanos
-      ),
-      dailyTokenLimit: user.dailyTokenLimit,
-      lifetimeTokenLimit: user.lifetimeTokenLimit,
-    });
-    if (userEval.hard) return reject(userEval.hard.code, userEval.hard.reason);
-    warnings.push(...userEval.warnings);
 
-    let action: Doc<"actions"> | null = null;
-    if (args.actionName !== undefined) {
-      action = await getOrCreateAction(ctx, args.actionName);
-      if (action.disabled) {
-        return reject("action_disabled", `Action "${action.name}" is disabled`);
-      }
-      const aSameDay = action.dayStamp === today;
-      const actionEval = evaluateCaps({
-        label: "action",
-        name: action.name,
-        enforcement: action.enforcement ?? "hard",
+    // Committed + already-reserved in-flight usage + this estimate must fit
+    // under EACH bucket's cap. Decided and reserved in one transaction, so
+    // Convex's serializable isolation makes it a true atomic check-and-reserve
+    // across every capped bucket. Soft enforcement turns a violation into a
+    // warning instead of a block.
+    for (const b of buckets) {
+      const sameDay = b.dayStamp === today;
+      const ev = evaluateCaps({
+        label: b.dimension,
+        name: b.value,
+        enforcement: b.enforcement ?? "hard",
         estCost: est.cost,
         estTokens: est.tokens,
-        spendToday: aSameDay ? action.spendTodayNanos : 0,
-        reservedSpendToday: aSameDay ? action.reservedTodayNanos ?? 0 : 0,
-        totalSpend: action.totalSpendNanos,
-        reservedSpendTotal: action.reservedTotalNanos ?? 0,
-        tokensToday: aSameDay ? action.tokensToday ?? 0 : 0,
-        reservedTokensToday: aSameDay ? action.reservedTodayTokens ?? 0 : 0,
-        totalTokens: action.totalTokens,
-        reservedTokensTotal: action.reservedTotalTokens ?? 0,
+        spendToday: sameDay ? b.spendTodayNanos : 0,
+        reservedSpendToday: sameDay ? b.reservedTodayNanos ?? 0 : 0,
+        totalSpend: b.totalSpendNanos,
+        reservedSpendTotal: b.reservedTotalNanos ?? 0,
+        tokensToday: sameDay ? b.tokensToday ?? 0 : 0,
+        reservedTokensToday: sameDay ? b.reservedTodayTokens ?? 0 : 0,
+        totalTokens: b.totalTokens,
+        reservedTokensTotal: b.reservedTotalTokens ?? 0,
         dailySpendLimitNanos: withBump(
-          action.dailySpendLimitNanos,
-          action.bumpDayStamp === today ? action.dailyBumpNanos : 0
+          b.dailySpendLimitNanos,
+          b.bumpDayStamp === today ? b.dailyBumpNanos : 0
         ),
         lifetimeSpendLimitNanos: withBump(
-          action.lifetimeSpendLimitNanos,
-          action.lifetimeBumpNanos
+          b.lifetimeSpendLimitNanos,
+          b.lifetimeBumpNanos
         ),
-        dailyTokenLimit: action.dailyTokenLimit,
-        lifetimeTokenLimit: action.lifetimeTokenLimit,
+        dailyTokenLimit: b.dailyTokenLimit,
+        lifetimeTokenLimit: b.lifetimeTokenLimit,
       });
-      if (actionEval.hard) return reject(actionEval.hard.code, actionEval.hard.reason);
-      warnings.push(...actionEval.warnings);
+      if (ev.hard) return reject(ev.hard.code, ev.hard.reason);
+      warnings.push(...ev.warnings);
     }
 
     // Deployment-wide ("global") spend cap — same reserve-then-settle model and
-    // the SAME evaluateCaps logic as the per-entity caps above, so the guarantee
+    // the SAME evaluateCaps logic as the per-bucket caps above, so the guarantee
     // statement is uniform: a request is admitted only if
     // committed + reserved + estimate <= cap. The ONE difference is the holder:
-    // per-user/per-action reserve on a single row (an exact atomic
+    // per-bucket caps reserve on a single row (an exact atomic
     // check-and-reserve), while the global holder is a sharded counter for
     // throughput — its committed total is read as an eventually-consistent sum
     // with no cross-request reservation, so a hard global cap can overshoot by a
     // bounded amount under burst. That's the deliberate exactness/throughput
     // trade for a deployment-wide killswitch; it's the only approximate scope.
     if (
-      policy &&
-      (policy.globalDailySpendLimitNanos !== undefined ||
-        policy.globalLifetimeSpendLimitNanos !== undefined)
+      settings &&
+      (settings.globalDailySpendLimitNanos !== undefined ||
+        settings.globalLifetimeSpendLimitNanos !== undefined)
     ) {
       const globalEval = evaluateCaps({
         label: "global",
         name: "deployment",
-        enforcement: policy.globalEnforcement ?? "hard",
+        enforcement: settings.globalEnforcement ?? "hard",
         estCost: est.cost,
         estTokens: est.tokens,
         spendToday: await globalSpend.count(ctx, globalDayKey(today)),
@@ -405,49 +444,44 @@ export const startRequest = mutation({
         totalTokens: 0,
         reservedTokensTotal: 0,
         dailySpendLimitNanos: withBump(
-          policy.globalDailySpendLimitNanos,
-          policy.globalBumpDayStamp === today ? policy.globalDailyBumpNanos : 0
+          settings.globalDailySpendLimitNanos,
+          settings.globalBumpDayStamp === today ? settings.globalDailyBumpNanos : 0
         ),
         lifetimeSpendLimitNanos: withBump(
-          policy.globalLifetimeSpendLimitNanos,
-          policy.globalLifetimeBumpNanos
+          settings.globalLifetimeSpendLimitNanos,
+          settings.globalLifetimeBumpNanos
         ),
       });
       if (globalEval.hard) return reject(globalEval.hard.code, globalEval.hard.reason);
       warnings.push(...globalEval.warnings);
     }
 
-    // Passed — reserve, but ONLY on entities that actually have a cap. Writing
-    // an uncapped entity's row here would serialize every request that shares it
-    // (e.g. all callers of one action); with no cap there's no reserved amount
-    // to consult. Totals are still accrued later, asynchronously, in foldOne.
-    if (hasAnyCap(user)) {
-      await ctx.db.patch(user._id, {
+    // Passed — reserve, but ONLY on buckets that actually have a cap. Writing an
+    // uncapped bucket's row here would serialize every request that shares it
+    // (e.g. all callers of one action, or every request in one env); with no cap
+    // there's no reserved amount to consult. Totals are still accrued later,
+    // asynchronously, in foldOne — for every bucket, capped or not.
+    for (const b of buckets) {
+      if (!hasAnyCap(b)) continue;
+      const sameDay = b.dayStamp === today;
+      await ctx.db.patch(b._id, {
         dayStamp: today,
-        spendTodayNanos: userSameDay ? user.spendTodayNanos : 0,
-        tokensToday: userSameDay ? user.tokensToday ?? 0 : 0,
-        reservedTodayNanos: (userSameDay ? user.reservedTodayNanos ?? 0 : 0) + est.cost,
-        reservedTotalNanos: (user.reservedTotalNanos ?? 0) + est.cost,
-        reservedTodayTokens: (userSameDay ? user.reservedTodayTokens ?? 0 : 0) + est.tokens,
-        reservedTotalTokens: (user.reservedTotalTokens ?? 0) + est.tokens,
-        pendingCount: (user.pendingCount ?? 0) + 1,
-      });
-    }
-    if (action && hasAnyCap(action)) {
-      const aSameDay = action.dayStamp === today;
-      await ctx.db.patch(action._id, {
-        dayStamp: today,
-        spendTodayNanos: aSameDay ? action.spendTodayNanos : 0,
-        tokensToday: aSameDay ? action.tokensToday ?? 0 : 0,
-        reservedTodayNanos: (aSameDay ? action.reservedTodayNanos ?? 0 : 0) + est.cost,
-        reservedTotalNanos: (action.reservedTotalNanos ?? 0) + est.cost,
-        reservedTodayTokens: (aSameDay ? action.reservedTodayTokens ?? 0 : 0) + est.tokens,
-        reservedTotalTokens: (action.reservedTotalTokens ?? 0) + est.tokens,
-        pendingCount: (action.pendingCount ?? 0) + 1,
+        spendTodayNanos: sameDay ? b.spendTodayNanos : 0,
+        tokensToday: sameDay ? b.tokensToday ?? 0 : 0,
+        reservedTodayNanos: (sameDay ? b.reservedTodayNanos ?? 0 : 0) + est.cost,
+        reservedTotalNanos: (b.reservedTotalNanos ?? 0) + est.cost,
+        reservedTodayTokens: (sameDay ? b.reservedTodayTokens ?? 0 : 0) + est.tokens,
+        reservedTotalTokens: (b.reservedTotalTokens ?? 0) + est.tokens,
+        pendingCount: (b.pendingCount ?? 0) + 1,
       });
     }
     const requestId = await ctx.db.insert("requests", {
-      ...args,
+      userId: args.userId,
+      actionName: args.actionName,
+      ...(extraTags.length ? { tags: extraTags } : {}),
+      model: args.model,
+      messages: args.messages,
+      rerunOf: args.rerunOf,
       status: "pending",
       estimatedNanos: est.cost,
       estimatedTokens: est.tokens,
@@ -509,7 +543,7 @@ export const finishRequest = mutation({
       settled: false,
     });
 
-    // Fold into the (hot) user/action counters in a separate mutation. If it
+    // Fold into the (hot) per-bucket counters in a separate mutation. If it
     // exhausts retries under contention, the cron reconciler picks it up.
     await ctx.scheduler.runAfter(0, internal.lib.foldTotals, {
       requestId: args.requestId,
@@ -518,9 +552,9 @@ export const finishRequest = mutation({
   },
 });
 
-// Fold one finished request into the user/action running totals, releasing its
-// reservation. Idempotent: guarded by `settled` so the scheduler and the cron
-// reconciler can never double-count.
+// Fold one finished request into every attributed bucket's running totals,
+// releasing its reservation. Idempotent: guarded by `settled` so the scheduler
+// and the cron reconciler can never double-count.
 async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   if (!req || req.settled !== false) return;
   const actual = req.costNanos ?? 0;
@@ -529,47 +563,32 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   const estTokens = req.estimatedTokens ?? 0;
   const today = dayStamp();
 
-  const user = await getOrCreateUser(ctx, req.userId);
-  const uSameDay = user.dayStamp === today;
-  await ctx.db.patch(user._id, {
-    totalSpendNanos: user.totalSpendNanos + actual,
-    totalRequests: user.totalRequests + 1,
-    totalTokens: user.totalTokens + tokens,
-    dayStamp: today,
-    spendTodayNanos: (uSameDay ? user.spendTodayNanos : 0) + actual,
-    tokensToday: (uSameDay ? user.tokensToday ?? 0 : 0) + tokens,
-    reservedTodayNanos: Math.max(0, (uSameDay ? user.reservedTodayNanos ?? 0 : 0) - estCost),
-    reservedTotalNanos: Math.max(0, (user.reservedTotalNanos ?? 0) - estCost),
-    reservedTodayTokens: Math.max(0, (uSameDay ? user.reservedTodayTokens ?? 0 : 0) - estTokens),
-    reservedTotalTokens: Math.max(0, (user.reservedTotalTokens ?? 0) - estTokens),
-    pendingCount: Math.max(0, (user.pendingCount ?? 0) - 1),
-  });
-
-  if (req.actionName !== undefined) {
-    const action = await getOrCreateAction(ctx, req.actionName);
-    const aSameDay = action.dayStamp === today;
-    await ctx.db.patch(action._id, {
-      totalSpendNanos: action.totalSpendNanos + actual,
-      totalRequests: action.totalRequests + 1,
-      totalTokens: action.totalTokens + tokens,
+  // Accrue into every attributed bucket (user, action, and each tag) — capped
+  // or not. Buckets that never held a reservation have their reserved fields
+  // clamped at 0 by Math.max, so subtracting an estimate is a harmless no-op.
+  for (const t of requestBuckets(req.userId, req.actionName, req.tags)) {
+    const b = await getOrCreateBucket(ctx, t.dimension, t.value);
+    const sameDay = b.dayStamp === today;
+    await ctx.db.patch(b._id, {
+      totalSpendNanos: b.totalSpendNanos + actual,
+      totalRequests: b.totalRequests + 1,
+      totalTokens: b.totalTokens + tokens,
       dayStamp: today,
-      spendTodayNanos: (aSameDay ? action.spendTodayNanos : 0) + actual,
-      tokensToday: (aSameDay ? action.tokensToday ?? 0 : 0) + tokens,
-      reservedTodayNanos: Math.max(0, (aSameDay ? action.reservedTodayNanos ?? 0 : 0) - estCost),
-      reservedTotalNanos: Math.max(0, (action.reservedTotalNanos ?? 0) - estCost),
-      reservedTodayTokens: Math.max(0, (aSameDay ? action.reservedTodayTokens ?? 0 : 0) - estTokens),
-      reservedTotalTokens: Math.max(0, (action.reservedTotalTokens ?? 0) - estTokens),
-      pendingCount: Math.max(0, (action.pendingCount ?? 0) - 1),
+      spendTodayNanos: (sameDay ? b.spendTodayNanos : 0) + actual,
+      tokensToday: (sameDay ? b.tokensToday ?? 0 : 0) + tokens,
+      reservedTodayNanos: Math.max(0, (sameDay ? b.reservedTodayNanos ?? 0 : 0) - estCost),
+      reservedTotalNanos: Math.max(0, (b.reservedTotalNanos ?? 0) - estCost),
+      reservedTodayTokens: Math.max(0, (sameDay ? b.reservedTodayTokens ?? 0 : 0) - estTokens),
+      reservedTotalTokens: Math.max(0, (b.reservedTotalTokens ?? 0) - estTokens),
+      pendingCount: Math.max(0, (b.pendingCount ?? 0) - 1),
     });
   }
+
   // Deployment-wide totals via the sharded counter (only when a global cap is
   // configured — otherwise skip the writes entirely). Distributed across shards,
   // so this does not serialize on a single row.
   if (actual > 0) {
-    const settings = await ctx.db
-      .query("settings")
-      .withIndex("key", (q) => q.eq("key", "singleton"))
-      .unique();
+    const settings = await getSettings(ctx);
     if (
       settings &&
       (settings.globalDailySpendLimitNanos !== undefined ||
@@ -703,23 +722,45 @@ export const listRequests = query({
 });
 
 const ADMIN_LIST_CAP = 2000;
-export const listUsers = query({
-  args: {},
-  handler: async (ctx) => {
+
+// List budget buckets, optionally filtered to one dimension ("user", "action",
+// or any custom tag dimension). Today's spend is zeroed for stale day windows.
+export const listBuckets = query({
+  args: { dimension: v.optional(v.string()) },
+  handler: async (ctx, args) => {
     // Bounded to avoid an unbounded full-table scan on this reactive query.
-    // Paginate (ctx.db.query("users").paginate(...)) for larger deployments.
-    const users = await ctx.db.query("users").take(ADMIN_LIST_CAP);
+    // Paginate (ctx.db.query("buckets").paginate(...)) for larger deployments.
+    const rows =
+      args.dimension !== undefined
+        ? await ctx.db
+            .query("buckets")
+            .withIndex("dimension", (q) => q.eq("dimension", args.dimension!))
+            .take(ADMIN_LIST_CAP)
+        : await ctx.db.query("buckets").take(ADMIN_LIST_CAP);
     const today = dayStamp();
-    return users.map((u) => ({
-      ...u,
-      spendTodayNanos: u.dayStamp === today ? u.spendTodayNanos : 0,
+    return rows.map((b) => ({
+      ...b,
+      spendTodayNanos: b.dayStamp === today ? b.spendTodayNanos : 0,
     }));
   },
 });
 
-export const setLimits = mutation({
+export const getBucket = query({
+  args: { dimension: v.string(), value: v.string() },
+  handler: async (ctx, args) => {
+    const b = await getBucketDoc(ctx as any, args.dimension, args.value);
+    if (!b) return null;
+    const today = dayStamp();
+    return { ...b, spendTodayNanos: b.dayStamp === today ? b.spendTodayNanos : 0 };
+  },
+});
+
+// Set a bucket's limits/controls. `user` and `action` are just dimensions here;
+// the client's ai.users / ai.actions namespaces are thin wrappers over this.
+export const setBucketLimits = mutation({
   args: {
-    userId: v.string(),
+    dimension: v.string(),
+    value: v.string(),
     requestsPerMinute: v.optional(v.number()),
     dailySpendLimitNanos: v.optional(v.number()),
     lifetimeSpendLimitNanos: v.optional(v.number()),
@@ -730,50 +771,10 @@ export const setLimits = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const user = await getOrCreateUser(ctx, args.userId);
-    const { userId: _userId, ...limits } = args;
-    await ctx.db.patch(user._id, limits);
+    const bucket = await getOrCreateBucket(ctx, args.dimension, args.value);
+    const { dimension: _d, value: _v, ...limits } = args;
+    await ctx.db.patch(bucket._id, limits);
     return null;
-  },
-});
-
-// Delete a user and all their request rows (e.g. account deletion / GDPR).
-// Deletes in bounded batches and self-reschedules so it never exceeds the
-// per-transaction document limit — a user with millions of rows still deletes.
-const DELETE_BATCH = 500;
-export const deleteUser = mutation({
-  args: { userId: v.string() },
-  returns: v.object({ deletedThisBatch: v.number(), done: v.boolean() }),
-  handler: async (ctx, { userId }) => {
-    const rows = await ctx.db
-      .query("requests")
-      .withIndex("userId", (q) => q.eq("userId", userId))
-      .take(DELETE_BATCH);
-    for (const r of rows) await ctx.db.delete(r._id);
-    if (rows.length === DELETE_BATCH) {
-      // More to go — continue in a fresh transaction.
-      await ctx.scheduler.runAfter(0, api.lib.deleteUser, { userId });
-      return { deletedThisBatch: rows.length, done: false };
-    }
-    // Last batch: remove the user row itself.
-    const user = await ctx.db
-      .query("users")
-      .withIndex("userId", (q) => q.eq("userId", userId))
-      .unique();
-    if (user) await ctx.db.delete(user._id);
-    return { deletedThisBatch: rows.length + (user ? 1 : 0), done: true };
-  },
-});
-
-export const listActions = query({
-  args: {},
-  handler: async (ctx) => {
-    const actions = await ctx.db.query("actions").take(ADMIN_LIST_CAP);
-    const today = dayStamp();
-    return actions.map((a) => ({
-      ...a,
-      spendTodayNanos: a.dayStamp === today ? a.spendTodayNanos : 0,
-    }));
   },
 });
 
@@ -782,74 +783,55 @@ const vBumpArgs = {
   lifetimeNanos: v.optional(v.number()),
 };
 
-// One-time "approve another $X" bumps, added on top of the standing cap without
-// changing it. Daily bumps apply to today only; lifetime bumps are permanent.
-export const bumpUser = mutation({
-  args: { userId: v.string(), ...vBumpArgs },
+// One-time "approve another $X" bumps, added on top of a bucket's standing cap
+// without changing it. Daily bumps apply to today only; lifetime bumps persist.
+export const bumpBucket = mutation({
+  args: { dimension: v.string(), value: v.string(), ...vBumpArgs },
   returns: v.null(),
-  handler: async (ctx, { userId, dailyNanos, lifetimeNanos }) => {
-    const user = await getOrCreateUser(ctx, userId);
+  handler: async (ctx, { dimension, value, dailyNanos, lifetimeNanos }) => {
+    const bucket = await getOrCreateBucket(ctx, dimension, value);
     const today = dayStamp();
-    const curDaily = user.bumpDayStamp === today ? user.dailyBumpNanos ?? 0 : 0;
-    await ctx.db.patch(user._id, {
+    const curDaily =
+      bucket.bumpDayStamp === today ? bucket.dailyBumpNanos ?? 0 : 0;
+    await ctx.db.patch(bucket._id, {
       bumpDayStamp: today,
       dailyBumpNanos: curDaily + (dailyNanos ?? 0),
-      lifetimeBumpNanos: (user.lifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
+      lifetimeBumpNanos: (bucket.lifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
     });
     return null;
   },
 });
 
-export const bumpAction = mutation({
-  args: { name: v.string(), ...vBumpArgs },
-  returns: v.null(),
-  handler: async (ctx, { name, dailyNanos, lifetimeNanos }) => {
-    const action = await getOrCreateAction(ctx, name);
-    const today = dayStamp();
-    const curDaily = action.bumpDayStamp === today ? action.dailyBumpNanos ?? 0 : 0;
-    await ctx.db.patch(action._id, {
-      bumpDayStamp: today,
-      dailyBumpNanos: curDaily + (dailyNanos ?? 0),
-      lifetimeBumpNanos: (action.lifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
-    });
-    return null;
-  },
-});
-
-export const bumpGlobal = mutation({
-  args: vBumpArgs,
-  returns: v.null(),
-  handler: async (ctx, { dailyNanos, lifetimeNanos }) => {
-    const today = dayStamp();
-    const s = await getSettings(ctx);
-    const curDaily = s?.globalBumpDayStamp === today ? s?.globalDailyBumpNanos ?? 0 : 0;
-    const patch = {
-      globalBumpDayStamp: today,
-      globalDailyBumpNanos: curDaily + (dailyNanos ?? 0),
-      globalLifetimeBumpNanos: (s?.globalLifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
-    };
-    if (s) await ctx.db.patch(s._id, patch);
-    else await ctx.db.insert("settings", { key: "singleton", ...patch });
-    return null;
-  },
-});
-
-export const setActionLimits = mutation({
-  args: {
-    name: v.string(),
-    dailySpendLimitNanos: v.optional(v.number()),
-    lifetimeSpendLimitNanos: v.optional(v.number()),
-    dailyTokenLimit: v.optional(v.number()),
-    lifetimeTokenLimit: v.optional(v.number()),
-    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
-    disabled: v.optional(v.boolean()),
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    const action = await getOrCreateAction(ctx, args.name);
-    const { name: _name, ...limits } = args;
-    await ctx.db.patch(action._id, limits);
-    return null;
+// Delete a bucket and (for the `user` dimension) all of that user's request
+// rows — e.g. account deletion / GDPR. Deletes requests in bounded batches and
+// self-reschedules so it never exceeds the per-transaction document limit.
+const DELETE_BATCH = 500;
+export const deleteBucket = mutation({
+  args: { dimension: v.string(), value: v.string() },
+  returns: v.object({ deletedThisBatch: v.number(), done: v.boolean() }),
+  handler: async (ctx, { dimension, value }) => {
+    // Only the user dimension owns request rows (indexed by userId). Other
+    // dimensions just drop their budget-holder row.
+    if (dimension === USER_DIM) {
+      const rows = await ctx.db
+        .query("requests")
+        .withIndex("userId", (q) => q.eq("userId", value))
+        .take(DELETE_BATCH);
+      for (const r of rows) await ctx.db.delete(r._id);
+      if (rows.length === DELETE_BATCH) {
+        await ctx.scheduler.runAfter(0, api.lib.deleteBucket, {
+          dimension,
+          value,
+        });
+        return { deletedThisBatch: rows.length, done: false };
+      }
+      const bucket = await getBucketDoc(ctx, dimension, value);
+      if (bucket) await ctx.db.delete(bucket._id);
+      return { deletedThisBatch: rows.length + (bucket ? 1 : 0), done: true };
+    }
+    const bucket = await getBucketDoc(ctx, dimension, value);
+    if (bucket) await ctx.db.delete(bucket._id);
+    return { deletedThisBatch: bucket ? 1 : 0, done: true };
   },
 });
 
@@ -916,6 +898,24 @@ export const setGlobalLimits = mutation({
     } else {
       await ctx.db.insert("settings", { key: "singleton", ...patch });
     }
+    return null;
+  },
+});
+
+export const bumpGlobal = mutation({
+  args: vBumpArgs,
+  returns: v.null(),
+  handler: async (ctx, { dailyNanos, lifetimeNanos }) => {
+    const today = dayStamp();
+    const s = await getSettings(ctx);
+    const curDaily = s?.globalBumpDayStamp === today ? s?.globalDailyBumpNanos ?? 0 : 0;
+    const patch = {
+      globalBumpDayStamp: today,
+      globalDailyBumpNanos: curDaily + (dailyNanos ?? 0),
+      globalLifetimeBumpNanos: (s?.globalLifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
+    };
+    if (s) await ctx.db.patch(s._id, patch);
+    else await ctx.db.insert("settings", { key: "singleton", ...patch });
     return null;
   },
 });

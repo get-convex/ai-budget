@@ -32,18 +32,24 @@ async function settle(t: any, requestId: any, p = 10, c = 5) {
   await t.finishAllScheduledFunctions(vi.runAllTimers);
   vi.useRealTimers();
 }
-const userOf = async (t: any, userId: string) =>
-  (await t.query(api.lib.listUsers, {})).find((u: any) => u.userId === userId);
+const setUserLimits = (t: any, userId: string, limits: any) =>
+  t.mutation(api.lib.setBucketLimits, {
+    dimension: "user",
+    value: userId,
+    ...limits,
+  });
+const bucketOf = async (t: any, dimension: string, value: string) =>
+  (await t.query(api.lib.listBuckets, { dimension })).find(
+    (b: any) => b.value === value
+  );
+const userOf = (t: any, userId: string) => bucketOf(t, "user", userId);
 
 describe("reserve / settle spend caps", () => {
   test("a daily cap below one request's reservation blocks up front", async () => {
     const t = convexTest(schema, modules);
     // one gpt-4o-mini request reserves ~480_000 nanodollars ($0.00048); a
     // 1_000-nano ($0.000001) cap can't fit it.
-    await t.mutation(api.lib.setLimits, {
-      userId: "u",
-      dailySpendLimitNanos: 1_000,
-    });
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 1_000 });
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(false);
     expect(r.code).toBe("user_daily_spend_limit");
@@ -51,10 +57,7 @@ describe("reserve / settle spend caps", () => {
 
   test("reservation is released and settled to the real cost", async () => {
     const t = convexTest(schema, modules);
-    await t.mutation(api.lib.setLimits, {
-      userId: "u",
-      dailySpendLimitNanos: 1_000_000_000, // $1/day
-    });
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 1_000_000_000 }); // $1/day
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(true);
     await settle(t, r.requestId, 1_000_000, 1_000_000); // 1M in, 1M out
@@ -64,6 +67,38 @@ describe("reserve / settle spend caps", () => {
     expect(u.reservedTotalNanos ?? 0).toBe(0);
     expect(u.pendingCount ?? 0).toBe(0);
     expect(u.totalRequests).toBe(1);
+  });
+});
+
+describe("tagged attribution buckets", () => {
+  test("a cap on a custom tag blocks, and settlement accrues to every bucket", async () => {
+    const t = convexTest(schema, modules);
+    // A tiny cap on customer "acme" — the user is uncapped.
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "customer",
+      value: "acme",
+      dailySpendLimitNanos: 1_000,
+    });
+    const blocked = await start(t, {
+      userId: "u",
+      tags: [{ dimension: "customer", value: "acme" }],
+    });
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.code).toBe("customer_daily_spend_limit");
+
+    // A different customer with no cap goes through, and the spend lands on
+    // BOTH the user bucket and the customer bucket.
+    const ok = await start(t, {
+      userId: "u",
+      tags: [{ dimension: "customer", value: "globex" }],
+    });
+    expect(ok.allowed).toBe(true);
+    await settle(t, ok.requestId, 1_000_000, 1_000_000); // $0.75
+    const user = await userOf(t, "u");
+    const cust = await bucketOf(t, "customer", "globex");
+    expect(user.totalSpendNanos).toBe(750_000_000);
+    expect(cust.totalSpendNanos).toBe(750_000_000);
+    expect(cust.totalRequests).toBe(1);
   });
 });
 
@@ -85,7 +120,7 @@ describe("D-00 exactly-once settlement", () => {
 describe("token quotas", () => {
   test("a tiny daily token cap blocks (estimate exceeds it)", async () => {
     const t = convexTest(schema, modules);
-    await t.mutation(api.lib.setLimits, { userId: "u", dailyTokenLimit: 10 });
+    await setUserLimits(t, "u", { dailyTokenLimit: 10 });
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(false);
     expect(r.code).toBe("user_daily_token_limit");
@@ -95,15 +130,14 @@ describe("token quotas", () => {
 describe("soft enforcement", () => {
   test("over a soft budget: allowed, warned, flagged overBudget", async () => {
     const t = convexTest(schema, modules);
-    await t.mutation(api.lib.setLimits, {
-      userId: "u",
+    await setUserLimits(t, "u", {
       dailySpendLimitNanos: 1, // 1 nanodollar — one estimate blows past it
       enforcement: "soft",
     });
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(true);
     expect(r.warnings.length).toBeGreaterThan(0);
-    const req = await t.query(api.lib.getRequest, { requestId: r.requestId });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
     expect(req.overBudget).toBe(true);
   });
 });
@@ -145,7 +179,7 @@ describe("F-04 fail-closed pricing", () => {
     const u = await userOf(t, "u");
     // conservative = max over table = {$3 in, $15 out}/Mtok => $18 = 18e9 nano.
     expect(u.totalSpendNanos).toBe(18_000_000_000);
-    const req = await t.query(api.lib.getRequest, { requestId: r.requestId });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
     expect(req.unpricedModel).toBe(true);
   });
 });

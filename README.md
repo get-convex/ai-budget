@@ -25,10 +25,11 @@ full audit log you can replay later.
 |---|---|
 | **Usage & cost tracking** | Every request stored with messages, response, tokens, latency, and per-request cost. |
 | **Attribution** | Each call is attributed to a `userId` **and** to the Convex action that made it — auto-detected via `ctx.meta`, no manual tagging. Running totals per user and per action. |
+| **Tagged budgets** | `user` and `action` are just built-in *dimensions* — add your own (team, project, customer, env, feature…) by passing `tags`, and cap any of them with `ai.tag("customer").setLimits(...)`. One request can be billed to several buckets at once. |
 | **Spend & token limits** | Per-user daily / lifetime **spend** and **token** budgets, plus a requests-per-minute rate limit and a block switch. |
 | **Concurrency-safe caps** | A reserve-then-settle design makes admission a true atomic check — concurrent in-flight requests can't blow past the cap (a naive implementation overshoots ~40×). |
 | **Hard or soft** | Each limit either **blocks** (`hard`) or **allows-with-a-warning** (`soft`). |
-| **Per-feature budgets** | Cap or disable a whole action (e.g. `summarize`) independently of any user. |
+| **Per-feature budgets** | Cap or block a whole action (e.g. `summarize`) independently of any user. |
 | **Global killswitch** | A deployment-wide spend cap across all users and actions (sharded for throughput; enforced approximately). |
 | **One-time bumps** | "Approve another $X" at any level (user / action / global) without changing the standing cap — daily bumps are today-only, lifetime bumps permanent. |
 | **Model policy** | Allow/deny lists for models; an unknown/unpriced model **fails closed** (charged a conservative max, never $0). |
@@ -136,6 +137,7 @@ ai.chat(ctx, {
   messages?,         // [{ role, content }]
   model?,            // defaults to defaultModel
   action?,           // attribution name; defaults to the calling Convex action
+  tags?,             // extra dimensions: [{ dimension: "customer", value: "acme" }, …]
 }): Promise<{ text, requestId, costNanos, promptTokens, completionTokens, warnings }>
 ```
 
@@ -208,9 +210,41 @@ ai.actions.setLimits(ctx, {
   dailyTokenLimit?,
   lifetimeTokenLimit?,
   enforcement?,                  // "hard" | "soft"
-  disabled?,                     // kill switch for the whole feature
+  blocked?,                      // kill switch for the whole feature
 })
 ```
+
+### Tagged budgets (custom dimensions)
+
+`user` and `action` are the two built-in *dimensions*. To classify or budget
+along any other axis — team, project, tenant, customer, environment, feature —
+attach `tags` to a call and cap a value with `ai.tag(dimension)`:
+
+```ts
+// Bill this call to a user, an action (implicit), AND a customer + env.
+await ai.chat(ctx, {
+  prompt,
+  tags: [
+    { dimension: "customer", value: "acme" },
+    { dimension: "env", value: "prod" },
+  ],
+});
+
+// Cap the customer "acme" to $50/day — independent of any per-user cap.
+await ai.tag("customer").setLimits(ctx, {
+  value: "acme",
+  dailySpendLimitNanos: 50 * 1_000_000_000,
+});
+await ai.tag("customer").bump(ctx, { value: "acme", dailyNanos: 10 * 1_000_000_000 });
+await ai.tag("customer").list(ctx);                 // every customer's spend & caps
+await ai.tag("customer").get(ctx, { value: "acme" }); // one bucket
+```
+
+A single request is admitted only if it fits **every** bucket it touches (user,
+action, and each tag) — the same exact reserve-then-settle check runs per bucket.
+Uncapped buckets never serialize, so adding tags you don't cap is free at
+admission; their running totals still accrue for reporting. `ai.users.*` and
+`ai.actions.*` are simply sugar over `ai.tag("user")` / `ai.tag("action")`.
 
 ### Global (deployment-wide) budget
 
@@ -279,6 +313,7 @@ flagged `unpricedModel: true` so you know to add a real price.
 ```ts
 ai.users.list(ctx)                      // per-user spend today / total / tokens / limits
 ai.actions.list(ctx)                    // per-action spend & totals
+ai.tag("customer").list(ctx)            // spend & caps for any custom dimension
 ai.requests.list(ctx, { userId?, limit? })  // the audit log (blocked attempts included)
 ```
 
@@ -305,15 +340,18 @@ same pre-spend total and all pass, so spend blows past the cap (measured at
    **exactly-once** (a terminal request is never re-folded), so a slow request
    that the reconciler already swept can't double-count when it finally returns.
 
-Reservations are only taken on entities that actually have a cap, so uncapped
-traffic never serializes. The `error.md` file documents the adversarial audits
-this design survived, with live repros.
+Reservations are only taken on buckets that actually have a cap, so uncapped
+traffic never serializes — this is what makes arbitrary `tags` cheap: a request
+reserves on one row per *capped* dimension it carries, and nothing else. The
+`error.md` file documents the adversarial audits this design survived, with live
+repros.
 
-**One guarantee, all scopes.** Per-user, per-action, and global caps run through
-the *same* admission check — a request is admitted only when
-`committed + reserved + estimate ≤ cap` (bumps included). The only thing that
-differs is the holder: per-user and per-action reserve on a single document, an
-exact atomic check-and-reserve; the **global** killswitch is backed by a sharded
+**One guarantee, all scopes.** Every per-bucket cap — user, action, or any
+custom tag dimension — and the global cap run through the *same* admission check:
+a request is admitted only when `committed + reserved + estimate ≤ cap` (bumps
+included) for **every** bucket it touches. The only thing that differs is the
+holder: each per-bucket cap reserves on a single document, an exact atomic
+check-and-reserve; the **global** killswitch is backed by a sharded
 counter for throughput, so its committed total is read as an eventually-consistent
 sum with no cross-request reservation. That makes the global cap **approximate** —
 it can overshoot by a bounded amount under a burst — the deliberate

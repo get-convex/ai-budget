@@ -24,10 +24,15 @@ import type { FunctionReference } from "convex/server";
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
     lib: {
-      bumpAction: FunctionReference<
+      bumpBucket: FunctionReference<
         "mutation",
         "internal",
-        { dailyNanos?: number; lifetimeNanos?: number; name: string },
+        {
+          dailyNanos?: number;
+          dimension: string;
+          lifetimeNanos?: number;
+          value: string;
+        },
         null,
         Name
       >;
@@ -38,17 +43,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         null,
         Name
       >;
-      bumpUser: FunctionReference<
+      deleteBucket: FunctionReference<
         "mutation",
         "internal",
-        { dailyNanos?: number; lifetimeNanos?: number; userId: string },
-        null,
-        Name
-      >;
-      deleteUser: FunctionReference<
-        "mutation",
-        "internal",
-        { userId: string },
+        { dimension: string; value: string },
         { deletedThisBatch: number; done: boolean },
         Name
       >;
@@ -65,6 +63,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           responseText?: string;
         },
         { costNanos: number },
+        Name
+      >;
+      getBucket: FunctionReference<
+        "query",
+        "internal",
+        { dimension: string; value: string },
+        any,
         Name
       >;
       getGlobalStatus: FunctionReference<
@@ -101,7 +106,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         any,
         Name
       >;
-      listActions: FunctionReference<"query", "internal", {}, any, Name>;
+      listBuckets: FunctionReference<
+        "query",
+        "internal",
+        { dimension?: string },
+        any,
+        Name
+      >;
       listPrices: FunctionReference<"query", "internal", {}, any, Name>;
       listRequests: FunctionReference<
         "query",
@@ -110,18 +121,19 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         any,
         Name
       >;
-      listUsers: FunctionReference<"query", "internal", {}, any, Name>;
-      setActionLimits: FunctionReference<
+      setBucketLimits: FunctionReference<
         "mutation",
         "internal",
         {
+          blocked?: boolean;
           dailySpendLimitNanos?: number;
           dailyTokenLimit?: number;
-          disabled?: boolean;
+          dimension: string;
           enforcement?: "hard" | "soft";
           lifetimeSpendLimitNanos?: number;
           lifetimeTokenLimit?: number;
-          name: string;
+          requestsPerMinute?: number;
+          value: string;
         },
         null,
         Name
@@ -133,22 +145,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           dailySpendLimitNanos?: number;
           enforcement?: "hard" | "soft";
           lifetimeSpendLimitNanos?: number;
-        },
-        null,
-        Name
-      >;
-      setLimits: FunctionReference<
-        "mutation",
-        "internal",
-        {
-          blocked?: boolean;
-          dailySpendLimitNanos?: number;
-          dailyTokenLimit?: number;
-          enforcement?: "hard" | "soft";
-          lifetimeSpendLimitNanos?: number;
-          lifetimeTokenLimit?: number;
-          requestsPerMinute?: number;
-          userId: string;
         },
         null,
         Name
@@ -186,6 +182,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           messages: Array<{ content: string; role: string }>;
           model: string;
           rerunOf?: string;
+          tags?: Array<{ dimension: string; value: string }>;
           userId: string;
         },
         | { allowed: true; requestId: string; warnings: Array<string> }

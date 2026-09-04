@@ -41,10 +41,19 @@ export type AIBudgetApi = UseApi<typeof api>;
 /** @deprecated use AIBudgetApi */
 export type AIGatewayApi = AIBudgetApi;
 
+/**
+ * One attribution tag: a (dimension, value) pair, e.g. {dimension:"customer",
+ * value:"acme"}. `user` and `action` are built-in dimensions (set via
+ * userId/action); use tags for anything else — team, project, tenant, env, ….
+ * Any tagged bucket can carry its own budget (see `ai.tag(dimension)`).
+ */
+export type Tag = { dimension: string; value: string };
+
 /** Fired when a request is admitted over a *soft* limit. */
 export type SoftLimitInfo = {
   userId: string;
   action?: string;
+  tags?: Tag[];
   requestId: string;
   warnings: string[];
 };
@@ -213,6 +222,8 @@ export class AIBudget {
       rerunOf?: string;
       /** Attribute spend to this action name. Defaults to the calling Convex action. */
       action?: string;
+      /** Extra attribution dimensions to bill/limit (team, customer, env, …). */
+      tags?: Tag[];
     } = {}
   ): Promise<ChatResult> {
     const model = args.model ?? this.defaultModel;
@@ -223,6 +234,7 @@ export class AIBudget {
     const started = await ctx.runMutation(this.component.lib.startRequest, {
       userId,
       actionName,
+      tags: args.tags,
       model,
       messages,
       rerunOf: args.rerunOf as any,
@@ -236,7 +248,13 @@ export class AIBudget {
     }
     const requestId = started.requestId;
     const warnings = started.warnings;
-    await this.fireSoftLimit({ userId, action: actionName, requestId, warnings });
+    await this.fireSoftLimit({
+      userId,
+      action: actionName,
+      tags: args.tags,
+      requestId,
+      warnings,
+    });
     const start = Date.now();
     try {
       // The full chain (incl. system) is stored on the request for audit/replay,
@@ -281,7 +299,13 @@ export class AIBudget {
    */
   languageModel(
     ctx: RunMutationCtx,
-    opts: { userId?: string; model?: string; action?: string } = {}
+    opts: {
+      userId?: string;
+      model?: string;
+      action?: string;
+      /** Extra attribution dimensions to bill/limit (team, customer, env, …). */
+      tags?: Tag[];
+    } = {}
   ): LanguageModel {
     const modelId = opts.model ?? this.defaultModel;
     const component = this.component;
@@ -293,6 +317,7 @@ export class AIBudget {
       const started = await ctx.runMutation(component.lib.startRequest, {
         userId,
         actionName,
+        tags: opts.tags,
         model: modelId,
         messages: simplifyPrompt(params.prompt),
       });
@@ -306,6 +331,7 @@ export class AIBudget {
       await fireSoftLimit({
         userId,
         action: actionName,
+        tags: opts.tags,
         requestId: started.requestId,
         warnings: started.warnings,
       });
@@ -409,6 +435,7 @@ export class AIBudget {
       messages: args.messages ?? original.messages,
       rerunOf: args.requestId,
       action: original.actionName,
+      tags: original.tags,
     });
   }
 
@@ -431,11 +458,55 @@ export class AIBudget {
     };
   }
 
-  /** Per-user budgets and controls. */
+  /**
+   * Budgets and controls for an arbitrary attribution dimension — the
+   * generalization of `users`/`actions`. Give it any dimension name (team,
+   * project, tenant, customer, env, feature, …) and set caps per value:
+   *
+   *   ai.tag("customer").setLimits(ctx, { value: "acme", dailySpendLimitNanos });
+   *   ai.tag("customer").list(ctx);
+   *
+   * Attribute a call to it by passing `tags` to `chat`/`languageModel`.
+   */
+  tag(dimension: string) {
+    const c = this.component;
+    return {
+      /** All buckets in this dimension. */
+      list: (ctx: RunQueryCtx) =>
+        ctx.runQuery(c.lib.listBuckets, { dimension }),
+      /** One bucket's limits + spend (null if it has none yet). */
+      get: (ctx: RunQueryCtx, args: { value: string }) =>
+        ctx.runQuery(c.lib.getBucket, { dimension, value: args.value }),
+      setLimits: (
+        ctx: RunMutationCtx,
+        args: {
+          value: string;
+          requestsPerMinute?: number;
+          dailySpendLimitNanos?: number;
+          lifetimeSpendLimitNanos?: number;
+          dailyTokenLimit?: number;
+          lifetimeTokenLimit?: number;
+          enforcement?: "hard" | "soft";
+          blocked?: boolean;
+        }
+      ) => ctx.runMutation(c.lib.setBucketLimits, { dimension, ...args }),
+      /** One-time "approve another $X" bump (daily is today-only). */
+      bump: (
+        ctx: RunMutationCtx,
+        args: { value: string; dailyNanos?: number; lifetimeNanos?: number }
+      ) => ctx.runMutation(c.lib.bumpBucket, { dimension, ...args }),
+      /** Delete the bucket (for "user", also its request rows). */
+      delete: (ctx: RunMutationCtx, args: { value: string }) =>
+        ctx.runMutation(c.lib.deleteBucket, { dimension, value: args.value }),
+    };
+  }
+
+  /** Per-user budgets and controls — sugar over the "user" dimension. */
   get users() {
     const c = this.component;
     return {
-      list: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.listUsers, {}),
+      list: (ctx: RunQueryCtx) =>
+        ctx.runQuery(c.lib.listBuckets, { dimension: "user" }),
       setLimits: (
         ctx: RunMutationCtx,
         args: {
@@ -448,23 +519,40 @@ export class AIBudget {
           enforcement?: "hard" | "soft";
           blocked?: boolean;
         }
-      ) => ctx.runMutation(c.lib.setLimits, args),
+      ) => {
+        const { userId, ...limits } = args;
+        return ctx.runMutation(c.lib.setBucketLimits, {
+          dimension: "user",
+          value: userId,
+          ...limits,
+        });
+      },
       /** One-time "approve another $X" bump (daily is today-only). */
       bump: (
         ctx: RunMutationCtx,
         args: { userId: string; dailyNanos?: number; lifetimeNanos?: number }
-      ) => ctx.runMutation(c.lib.bumpUser, args),
+      ) =>
+        ctx.runMutation(c.lib.bumpBucket, {
+          dimension: "user",
+          value: args.userId,
+          dailyNanos: args.dailyNanos,
+          lifetimeNanos: args.lifetimeNanos,
+        }),
       /** Delete a user and all their request rows. */
       delete: (ctx: RunMutationCtx, args: { userId: string }) =>
-        ctx.runMutation(c.lib.deleteUser, args),
+        ctx.runMutation(c.lib.deleteBucket, {
+          dimension: "user",
+          value: args.userId,
+        }),
     };
   }
 
-  /** Per-action (per-feature) budgets. */
+  /** Per-action (per-feature) budgets — sugar over the "action" dimension. */
   get actions() {
     const c = this.component;
     return {
-      list: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.listActions, {}),
+      list: (ctx: RunQueryCtx) =>
+        ctx.runQuery(c.lib.listBuckets, { dimension: "action" }),
       setLimits: (
         ctx: RunMutationCtx,
         args: {
@@ -474,13 +562,27 @@ export class AIBudget {
           dailyTokenLimit?: number;
           lifetimeTokenLimit?: number;
           enforcement?: "hard" | "soft";
-          disabled?: boolean;
+          /** Hard-block this action (was `disabled`). */
+          blocked?: boolean;
         }
-      ) => ctx.runMutation(c.lib.setActionLimits, args),
+      ) => {
+        const { name, ...limits } = args;
+        return ctx.runMutation(c.lib.setBucketLimits, {
+          dimension: "action",
+          value: name,
+          ...limits,
+        });
+      },
       bump: (
         ctx: RunMutationCtx,
         args: { name: string; dailyNanos?: number; lifetimeNanos?: number }
-      ) => ctx.runMutation(c.lib.bumpAction, args),
+      ) =>
+        ctx.runMutation(c.lib.bumpBucket, {
+          dimension: "action",
+          value: args.name,
+          dailyNanos: args.dailyNanos,
+          lifetimeNanos: args.lifetimeNanos,
+        }),
     };
   }
 
