@@ -40,7 +40,9 @@ full audit log you can replay later.
 ## Install
 
 Requires `convex@^1.45`, AI SDK 5+, and a Convex team on a paid plan (the
-gateway is a paid feature).
+gateway is a paid feature). Runs in Convex's **default runtime** — no
+`"use node"` required (the component is pure V8 mutations/queries/crons, and
+`ai.chat` / `ai.languageModel` are `fetch`-based).
 
 ```sh
 npm install @convex-dev/ai-budget @convex-dev/ai-sdk-provider ai
