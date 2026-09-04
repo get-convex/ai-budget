@@ -1,0 +1,37 @@
+name: Release
+
+# Publishes to npm when a version tag (v*) is pushed. Uses an npm **automation**
+# token (secrets.NPM_TOKEN) so no 2FA/OTP prompt. The dist-tag is derived from
+# the version: a prerelease like 0.0.2-alpha.0 publishes under `alpha`, a plain
+# 0.1.0 under `latest`.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install
+      - run: npm run build
+      - run: npm test
+      - name: Publish
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$VERSION" == *-* ]]; then
+            TAG="${VERSION#*-}"; TAG="${TAG%%.*}"
+          else
+            TAG="latest"
+          fi
+          echo "Publishing @convex-dev/ai-budget@$VERSION under dist-tag: $TAG"
+          npm publish --tag "$TAG" --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

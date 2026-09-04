@@ -28,8 +28,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "prepack": "npm run build",
-    "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
-    "release": "npm version patch && npm publish && git push --follow-tags"
+    "alpha": "npm version prerelease --preid alpha && git push --follow-tags",
+    "release": "npm version patch && git push --follow-tags"
   },
   "files": [
     "dist",
