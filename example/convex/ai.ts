@@ -342,7 +342,11 @@ export const rerun = action({
 });
 
 export const listRequests = query({
-  args: { userId: v.optional(v.string()) },
+  args: {
+    userId: v.optional(v.string()),
+    dimension: v.optional(v.string()),
+    value: v.optional(v.string()),
+  },
   handler: async (ctx, args) => {
     return await ai.requests.list(ctx, { ...args, limit: 100 });
   },
@@ -461,14 +465,53 @@ export const setActionLimits = mutation({
   args: {
     name: v.string(),
     dailySpendLimitNanos: v.optional(v.number()),
+    monthlySpendLimitNanos: v.optional(v.number()),
     lifetimeSpendLimitNanos: v.optional(v.number()),
     dailyTokenLimit: v.optional(v.number()),
+    monthlyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     blocked: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     await ai.actions.setLimits(ctx, args);
+  },
+});
+
+// Durable spend history for a bucket (per day or per month). Survives retention.
+export const usageHistory = query({
+  args: {
+    dimension: v.string(),
+    value: v.string(),
+    period: v.union(v.literal("day"), v.literal("month")),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, { dimension, value, period, limit }) =>
+    ai.tag(dimension).history(ctx, { value, period, limit }),
+});
+
+// Manual credit (negative) / debit (positive) against a bucket.
+export const adjust = mutation({
+  args: {
+    dimension: v.string(),
+    value: v.string(),
+    deltaNanos: v.number(),
+    reason: v.optional(v.string()),
+  },
+  handler: async (ctx, { dimension, value, deltaNanos, reason }) =>
+    ai.tag(dimension).adjust(ctx, { value, deltaNanos, reason }),
+});
+
+export const listAdjustments = query({
+  args: { dimension: v.string(), value: v.string() },
+  handler: async (ctx, { dimension, value }) =>
+    ai.tag(dimension).adjustments(ctx, { value }),
+});
+
+export const setAlertDefaults = mutation({
+  args: { warnAtPct: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    await ai.global.setAlertDefaults(ctx, args);
   },
 });
 
@@ -515,10 +558,14 @@ export const setLimits = mutation({
   args: {
     userId: v.string(),
     requestsPerMinute: v.optional(v.number()),
+    maxConcurrent: v.optional(v.number()),
     dailySpendLimitNanos: v.optional(v.number()),
+    monthlySpendLimitNanos: v.optional(v.number()),
     lifetimeSpendLimitNanos: v.optional(v.number()),
     dailyTokenLimit: v.optional(v.number()),
+    monthlyTokenLimit: v.optional(v.number()),
     lifetimeTokenLimit: v.optional(v.number()),
+    warnAtPct: v.optional(v.number()),
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
     blocked: v.optional(v.boolean()),
   },

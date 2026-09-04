@@ -93,8 +93,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {},
         {
           dailySpendLimitNanos: number | null;
+          defaultWarnAtPct: number | null;
           enforcement: "hard" | "soft";
           lifetimeSpendLimitNanos: number | null;
+          retentionMs: number | null;
           spentTodayNanos: number;
           spentTotalNanos: number;
         },

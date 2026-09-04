@@ -39,6 +39,7 @@ full audit log you can replay later.
 | **Model policy** | Allow/deny lists for models; an unknown/unpriced model **fails closed** (charged a conservative max, never $0). |
 | **Replay** | Re-run any stored request with edited messages or a different model; re-runs are linked to their original (lineage). |
 | **Agent-ready** | `ai.languageModel(ctx, { userId })` is a standard AI SDK model — drop it into [`@convex-dev/agent`](https://www.npmjs.com/package/@convex-dev/agent) and every agent generation is budgeted. |
+| **Built-in dashboard** | `ai.registerRoutes(http)` mounts a self-contained admin dashboard (buckets, requests, usage charts, settings) at a URL — one line, no UI to build. |
 
 ---
 
@@ -377,6 +378,36 @@ ai.users.history(ctx, { userId, period: "month" })   // durable spend-over-time
 ai.requests.list(ctx, { userId?, limit? })           // the audit log (blocked included)
 ai.requests.list(ctx, { dimension: "customer", value: "acme" })  // filter the log by any tag
 ```
+
+### Built-in admin dashboard
+
+The component ships a self-contained admin dashboard — buckets & limits, the
+request log, spend-over-time charts, and global settings. Mount it on your HTTP
+router with **one call** (no UI to build, no extra queries to write):
+
+```ts
+// convex/http.ts
+import { httpRouter } from "convex/server";
+import { components } from "./_generated/api";
+import { AIBudget } from "@convex-dev/ai-budget";
+
+const ai = new AIBudget(components.aiBudget);
+const http = httpRouter();
+
+ai.registerRoutes(http, {
+  // Gate it — the endpoint is public. Recommended: check the caller is an admin.
+  authorize: async (ctx) => (await ctx.auth.getUserIdentity())?.role === "admin",
+});
+
+export default http;
+```
+
+It then lives at `https://<deployment>.convex.site/aibudget` (override with
+`path`). **It is a public internet endpoint, so you must gate it**: pass
+`authorize` (return `true` to allow), or set the `AI_BUDGET_DASHBOARD_TOKEN` env
+var (sent as `Authorization: Bearer …` or `?token=`). With neither, every route
+returns 401. Everything the page shows is backed by the component's own
+functions, so there is nothing else to wire up.
 
 ---
 

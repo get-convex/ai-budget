@@ -1179,6 +1179,9 @@ export const getGlobalStatus = query({
     enforcement: v.union(v.literal("hard"), v.literal("soft")),
     spentTodayNanos: v.number(),
     spentTotalNanos: v.number(),
+    // deployment-wide config (surfaced for the admin dashboard)
+    retentionMs: v.union(v.number(), v.null()),
+    defaultWarnAtPct: v.union(v.number(), v.null()),
   }),
   handler: async (ctx) => {
     const s = await ctx.db
@@ -1191,6 +1194,8 @@ export const getGlobalStatus = query({
       enforcement: s?.globalEnforcement ?? "hard",
       spentTodayNanos: await globalSpend.count(ctx, globalDayKey(dayStamp())),
       spentTotalNanos: await globalSpend.count(ctx, GLOBAL_TOTAL),
+      retentionMs: s?.retentionMs ?? null,
+      defaultWarnAtPct: s?.defaultWarnAtPct ?? null,
     };
   },
 });

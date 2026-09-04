@@ -1,8 +1,14 @@
-import type { Expand, FunctionReference } from "convex/server";
+import {
+  httpActionGeneric,
+  type Expand,
+  type FunctionReference,
+  type HttpRouter,
+} from "convex/server";
 import { ConvexError, type GenericId } from "convex/values";
 import { generateText, wrapLanguageModel, type LanguageModel } from "ai";
 import { convexGateway } from "@convex-dev/ai-sdk-provider";
 import type { api } from "../component/_generated/api";
+import { DASHBOARD_HTML } from "./dashboard";
 
 // ---------- types ----------
 
@@ -706,6 +712,134 @@ export class AIBudget {
         }
       ) => ctx.runMutation(c.lib.setPrice, args),
     };
+  }
+
+  /**
+   * Mount the built-in admin dashboard on your app's HTTP router with one call.
+   * Serves a self-contained HTML dashboard (buckets, requests, usage history,
+   * settings) plus a small JSON API, all backed by the component — no extra
+   * queries to write.
+   *
+   *   // convex/http.ts
+   *   import { httpRouter } from "convex/server";
+   *   const http = httpRouter();
+   *   ai.registerRoutes(http, { authorize: async (ctx) =>
+   *     (await ctx.auth.getUserIdentity())?.role === "admin" });
+   *   export default http;
+   *
+   * It then lives at `https://<deployment>.convex.site/aibudget`.
+   *
+   * SECURITY: the endpoint is public on the internet. You MUST gate it — either
+   * pass `authorize` (recommended: check the caller is a deployment admin) or
+   * set the `AI_BUDGET_DASHBOARD_TOKEN` env var (a bearer token / `?token=`).
+   * With neither, every route returns 401.
+   */
+  registerRoutes(
+    http: HttpRouter,
+    opts: {
+      /** Mount path (default "/aibudget"). */
+      path?: string;
+      /** Return true to allow the request. Runs on the HTML page and every API call. */
+      authorize?: (ctx: any, request: Request) => boolean | Promise<boolean>;
+    } = {}
+  ) {
+    const prefix = (opts.path ?? "/aibudget").replace(/\/+$/, "");
+    const c = this.component.lib;
+    const authorize = opts.authorize;
+
+    const guard = async (
+      ctx: any,
+      request: Request
+    ): Promise<{ ok: boolean; token: string }> => {
+      if (authorize) return { ok: await authorize(ctx, request), token: "" };
+      const token = (globalThis as any).process?.env?.AI_BUDGET_DASHBOARD_TOKEN;
+      if (!token) return { ok: false, token: "" };
+      const url = new URL(request.url);
+      const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+      const provided = bearer || url.searchParams.get("token") || "";
+      return { ok: provided === token, token };
+    };
+    const json = (data: unknown, status = 200) =>
+      new Response(JSON.stringify(data ?? null), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+
+    const handle = async (ctx: any, request: Request): Promise<Response> => {
+      const url = new URL(request.url);
+      const sub = url.pathname.slice(prefix.length) || "/";
+      const { ok, token } = await guard(ctx, request);
+      if (!ok) {
+        return new Response(
+          "Unauthorized. Pass `authorize` to registerRoutes or set AI_BUDGET_DASHBOARD_TOKEN.",
+          { status: 401 }
+        );
+      }
+
+      if (sub.startsWith("/api/")) {
+        const route = request.method + " " + sub.slice(4); // strip "/api"
+        const p: Record<string, string> = {};
+        url.searchParams.forEach((v, k) => {
+          p[k] = v;
+        });
+        const body =
+          request.method === "POST"
+            ? await request.json().catch(() => ({}))
+            : {};
+        switch (route) {
+          case "GET /buckets":
+            return json(await ctx.runQuery(c.listBuckets, { dimension: p.dimension || undefined }));
+          case "GET /requests":
+            return json(await ctx.runQuery(c.listRequests, {
+              userId: p.userId || undefined,
+              dimension: p.dimension || undefined,
+              value: p.value || undefined,
+              limit: 100,
+            }));
+          case "GET /usage":
+            return json(await ctx.runQuery(c.usageHistory, {
+              dimension: p.dimension,
+              value: p.value,
+              period: p.period === "month" ? "month" : "day",
+            }));
+          case "GET /global":
+            return json(await ctx.runQuery(c.getGlobalStatus, {}));
+          case "GET /prices":
+            return json(await ctx.runQuery(c.listPrices, {}));
+          case "POST /setLimits":
+            return json(await ctx.runMutation(c.setBucketLimits, body));
+          case "POST /bump":
+            return json(await ctx.runMutation(c.bumpBucket, body));
+          case "POST /adjust":
+            return json(await ctx.runMutation(c.adjustBucket, body));
+          case "POST /delete":
+            return json(await ctx.runMutation(c.deleteBucket, body));
+          case "POST /global/setLimits":
+            return json(await ctx.runMutation(c.setGlobalLimits, body));
+          case "POST /global/setAlertDefaults":
+            return json(await ctx.runMutation(c.setAlertDefaults, body));
+          case "POST /global/setRetention":
+            return json(await ctx.runMutation(c.setRetention, body));
+          case "POST /setPrice":
+            return json(await ctx.runMutation(c.setPrice, body));
+          default:
+            return json({ error: "not found" }, 404);
+        }
+      }
+
+      const html = DASHBOARD_HTML.replace(/__API_BASE__/g, `${prefix}/api`).replace(
+        /__TOKEN__/g,
+        token
+      );
+      return new Response(html, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    };
+
+    const handler = httpActionGeneric(handle);
+    http.route({ path: prefix, method: "GET", handler });
+    http.route({ pathPrefix: `${prefix}/`, method: "GET", handler });
+    http.route({ pathPrefix: `${prefix}/`, method: "POST", handler });
   }
 }
 
