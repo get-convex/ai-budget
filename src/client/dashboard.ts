@@ -54,8 +54,16 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
 </nav>
 <main id="main"></main>
 <script>
-const API = "__API_BASE__";
-const TOKEN = "__TOKEN__";
+// Injected as JSON literals by registerRoutes (no surrounding quotes here).
+const API = __API_BASE__;
+const TOKEN = __TOKEN__;
+// If we were opened with ?token=… (needed for the initial navigation, which
+// can't set headers), drop it from the address bar so it doesn't linger in
+// history; API calls below use the Authorization header instead.
+try {
+  const u = new URL(location.href);
+  if (u.searchParams.has("token")) { u.searchParams.delete("token"); history.replaceState(null, "", u.toString()); }
+} catch (e) {}
 const H = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
 const NANOS = 1e9;
 const usd = (n) => n == null ? "—" : "$" + (n / NANOS).toFixed(n && n < NANOS/100 ? 6 : 2);

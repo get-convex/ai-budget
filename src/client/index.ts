@@ -221,6 +221,15 @@ function extractText(result: any): string {
 
 // ---------- client ----------
 
+// Length-independent-branch string compare, so the dashboard token check
+// doesn't leak the token via response timing. (Length itself is not secret.)
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
 /** Limits/controls settable on any budget bucket (user, action, or tag). */
 export type BucketLimits = {
   requestsPerMinute?: number;
@@ -756,8 +765,11 @@ export class AIBudget {
       if (!token) return { ok: false, token: "" };
       const url = new URL(request.url);
       const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+      // `?token=` is accepted only for the initial page navigation (a browser
+      // GET can't set headers); the page strips it from the URL on load and the
+      // JSON API is called with the bearer header. Compared in constant time.
       const provided = bearer || url.searchParams.get("token") || "";
-      return { ok: provided === token, token };
+      return { ok: timingSafeEqual(provided, token), token };
     };
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data ?? null), {
@@ -827,10 +839,13 @@ export class AIBudget {
         }
       }
 
-      const html = DASHBOARD_HTML.replace(/__API_BASE__/g, `${prefix}/api`).replace(
-        /__TOKEN__/g,
-        token
-      );
+      // Inject as JSON literals (function replacers so `$` in the value isn't
+      // treated as a replacement pattern). This keeps a token/prefix containing
+      // quotes, backslashes, or `</script>` from breaking out of the JS string.
+      const html = DASHBOARD_HTML.replace(
+        /__API_BASE__/g,
+        () => JSON.stringify(`${prefix}/api`)
+      ).replace(/__TOKEN__/g, () => JSON.stringify(token));
       return new Response(html, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
