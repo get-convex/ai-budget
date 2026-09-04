@@ -26,7 +26,11 @@ full audit log you can replay later.
 | **Usage & cost tracking** | Every request stored with messages, response, tokens, latency, and per-request cost. |
 | **Attribution** | Each call is attributed to a `userId` **and** to the Convex action that made it — auto-detected via `ctx.meta`, no manual tagging. Running totals per user and per action. |
 | **Tagged budgets** | `user` and `action` are just built-in *dimensions* — add your own (team, project, customer, env, feature…) by passing `tags`, and cap any of them with `ai.tag("customer").setLimits(...)`. One request can be billed to several buckets at once. |
-| **Spend & token limits** | Per-user daily / lifetime **spend** and **token** budgets, plus a requests-per-minute rate limit and a block switch. |
+| **Spend & token limits** | Per-bucket **daily / monthly / lifetime** spend and token budgets, plus a requests-per-minute rate limit, a max-concurrent cap, and a block switch. |
+| **Spend history** | Durable per-bucket **daily & monthly** rollups that survive request retention — real spend-over-time, "what did we spend last month," per user / action / tag. |
+| **Approaching-limit alerts** | Set `warnAtPct` (e.g. 0.8) and get an `onThreshold` callback before a cap is hit; `onLimitReached` fires when one blocks. |
+| **Manual credits/debits** | Comp a user or correct an overcharge with a signed adjustment; the change hits the live windows, the history, and an audit log. |
+| **Cache-aware cost** | Cached (prompt-cache-read) tokens are billed at a discount using the gateway's real cached-token count — not the full input rate. |
 | **Concurrency-safe caps** | A reserve-then-settle design makes admission a true atomic check — concurrent in-flight requests can't blow past the cap (a naive implementation overshoots ~40×). |
 | **Hard or soft** | Each limit either **blocks** (`hard`) or **allows-with-a-warning** (`soft`). |
 | **Per-feature budgets** | Cap or block a whole action (e.g. `summarize`) independently of any user. |
@@ -186,16 +190,21 @@ to the original. `lineage` walks the re-run chain in both directions.
 ai.users.setLimits(ctx, {
   userId,
   requestsPerMinute?,
+  maxConcurrent?,            // max in-flight requests at once
   dailySpendLimitNanos?,
+  monthlySpendLimitNanos?,   // calendar-month budget (UTC)
   lifetimeSpendLimitNanos?,
   dailyTokenLimit?,
+  monthlyTokenLimit?,
   lifetimeTokenLimit?,
-  enforcement?,       // "hard" (block, default) | "soft" (warn but allow)
-  blocked?,           // hard block on/off
+  warnAtPct?,                // e.g. 0.8 → fire onThreshold at 80% of a cap
+  enforcement?,             // "hard" (block, default) | "soft" (warn but allow)
+  blocked?,                 // hard block on/off
 })
 ai.users.delete(ctx, { userId })   // remove a user and all their request rows
 ```
 
+The same limit fields apply to `ai.actions.setLimits` and `ai.tag(d).setLimits`.
 Pass a field as `undefined` to clear that limit (unlimited).
 
 ### Per-action budgets
@@ -246,6 +255,48 @@ Uncapped buckets never serialize, so adding tags you don't cap is free at
 admission; their running totals still accrue for reporting. `ai.users.*` and
 `ai.actions.*` are simply sugar over `ai.tag("user")` / `ai.tag("action")`.
 
+Every dimension namespace (`users`, `actions`, `tag(d)`) shares the same methods:
+`list`, `get`, `setLimits`, `bump`, `adjust`, `history`, `adjustments`, `delete`.
+
+### Spend history (survives retention)
+
+Request rows are retained only briefly (see retention), but **durable per-bucket
+day/month rollups are not** — so charts and "what did we spend last month" keep
+working:
+
+```ts
+await ai.users.history(ctx, { userId, period: "month" });  // [{ stamp, spendNanos, tokens, requests }]
+await ai.tag("customer").history(ctx, { value: "acme", period: "day", limit: 30 });
+```
+
+### Approaching-limit alerts
+
+Set a threshold (per bucket via `warnAtPct`, or a deployment default) and get a
+callback before a cap is hit — plus one when a hard cap blocks:
+
+```ts
+await ai.global.setAlertDefaults(ctx, { warnAtPct: 0.8 });   // 80%, all buckets
+await ai.users.setLimits(ctx, { userId, warnAtPct: 0.9 });   // override per bucket
+
+new AIBudget(components.aiBudget, {
+  onThreshold:    ({ userId, messages }) => notify(userId, messages),  // approaching
+  onLimitReached: ({ userId, reason })   => notify(userId, reason),    // blocked
+  onSoftLimit:    ({ userId, messages }) => notify(userId, messages),  // soft-cap exceeded
+});
+```
+
+`chat()` also returns `notices` (approaching) alongside `warnings` (soft-exceeded).
+
+### Manual credits & debits
+
+Comp a user or correct an overcharge. Negative = credit, positive = extra charge;
+it adjusts the live day/month/lifetime windows, the history, and an audit log:
+
+```ts
+await ai.users.adjust(ctx, { userId, deltaNanos: -5 * 1_000_000_000, reason: "goodwill" });
+await ai.users.adjustments(ctx, { userId });   // the audit log
+```
+
 ### Global (deployment-wide) budget
 
 ```ts
@@ -283,9 +334,17 @@ common models (validated against OpenRouter's public pricing); override or add
 any model:
 
 ```ts
-ai.prices.set(ctx, { model, inputNanosPerMTok, outputNanosPerMTok })  // must be ≥ 0
+ai.prices.set(ctx, { model, inputNanosPerMTok, outputNanosPerMTok, cachedNanosPerMTok? })  // ≥ 0
 ai.prices.list(ctx)
 ```
+
+**Cached tokens & actual cost.** The gateway reports a real cached-token count
+(`usage.inputTokenDetails.cacheReadTokens`), so the cached slice of a prompt is
+billed at `cachedNanosPerMTok` (or a default 10%-of-input discount) instead of
+the full input rate. The gateway does **not** currently return a dollar cost, so
+cost is computed from tokens — but `finishRequest` accepts an authoritative
+`costNanos` and prefers it whenever present, so adopting a real gateway cost is a
+one-line change the day it's available.
 
 **Real prices from an API.** The gateway's `provider/model` ids match
 OpenRouter's, whose public models endpoint returns per-token pricing — so you can
@@ -311,10 +370,12 @@ flagged `unpricedModel: true` so you know to add a real price.
 ### Observability
 
 ```ts
-ai.users.list(ctx)                      // per-user spend today / total / tokens / limits
+ai.users.list(ctx)                      // per-user spend today / month / total / limits
 ai.actions.list(ctx)                    // per-action spend & totals
 ai.tag("customer").list(ctx)            // spend & caps for any custom dimension
-ai.requests.list(ctx, { userId?, limit? })  // the audit log (blocked attempts included)
+ai.users.history(ctx, { userId, period: "month" })   // durable spend-over-time
+ai.requests.list(ctx, { userId?, limit? })           // the audit log (blocked included)
+ai.requests.list(ctx, { dimension: "customer", value: "acme" })  // filter the log by any tag
 ```
 
 ---

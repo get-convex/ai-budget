@@ -70,6 +70,124 @@ describe("reserve / settle spend caps", () => {
   });
 });
 
+async function settleWith(t: any, requestId: any, fields: any) {
+  await t.mutation(api.lib.finishRequest, { requestId, ...fields });
+  vi.useFakeTimers();
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+  vi.useRealTimers();
+}
+
+describe("monthly budgets", () => {
+  test("a tiny monthly cap blocks up front", async () => {
+    const t = convexTest(schema, modules);
+    await setUserLimits(t, "u", { monthlySpendLimitNanos: 1_000 });
+    const r = await start(t, { userId: "u" });
+    expect(r.allowed).toBe(false);
+    expect(r.code).toBe("user_monthly_spend_limit");
+  });
+});
+
+describe("cache-aware pricing", () => {
+  test("cached prompt tokens are billed at the discount, not full input", async () => {
+    const t = convexTest(schema, modules);
+    const r = await start(t, { userId: "u" });
+    // 1M prompt, ALL cached, 0 completion. gpt-4o-mini input $0.15/Mtok; the
+    // cache default is 10% of input → 0.1 * 150_000_000 = 15_000_000 nano.
+    await settleWith(t, r.requestId, {
+      promptTokens: 1_000_000,
+      completionTokens: 0,
+      cachedTokens: 1_000_000,
+    });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.costNanos).toBe(15_000_000);
+    expect(req.cachedTokens).toBe(1_000_000);
+  });
+
+  test("an authoritative gateway cost overrides the token estimate", async () => {
+    const t = convexTest(schema, modules);
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, {
+      promptTokens: 1_000_000,
+      completionTokens: 1_000_000,
+      costNanos: 12_345,
+    });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.costNanos).toBe(12_345);
+  });
+});
+
+describe("durable usage history", () => {
+  test("settled spend lands in a per-day usage row", async () => {
+    const t = convexTest(schema, modules);
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, { promptTokens: 1_000_000, completionTokens: 1_000_000 });
+    const hist = await t.query(api.lib.usageHistory, {
+      dimension: "user",
+      value: "u",
+      period: "day",
+    });
+    expect(hist.length).toBe(1);
+    expect(hist[0].spendNanos).toBe(750_000_000); // $0.75
+    expect(hist[0].requests).toBe(1);
+  });
+});
+
+describe("manual adjustments", () => {
+  test("a credit reduces spend and is logged", async () => {
+    const t = convexTest(schema, modules);
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, { promptTokens: 1_000_000, completionTokens: 1_000_000 });
+    await t.mutation(api.lib.adjustBucket, {
+      dimension: "user",
+      value: "u",
+      deltaNanos: -250_000_000,
+      reason: "goodwill credit",
+    });
+    const u = await userOf(t, "u");
+    expect(u.totalSpendNanos).toBe(500_000_000); // 750M - 250M
+    const log = await t.query(api.lib.listAdjustments, { dimension: "user", value: "u" });
+    expect(log.length).toBe(1);
+    expect(log[0].deltaNanos).toBe(-250_000_000);
+  });
+});
+
+describe("threshold alerts", () => {
+  test("crossing warnAtPct returns a notice but still admits", async () => {
+    const t = convexTest(schema, modules);
+    // One "hi" estimate is ~480_150 nano. Cap 800_000, warn at 50% (400_000).
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 800_000, warnAtPct: 0.5 });
+    const r = await start(t, { userId: "u" });
+    expect(r.allowed).toBe(true);
+    expect(r.notices.length).toBeGreaterThan(0);
+  });
+});
+
+describe("concurrency cap", () => {
+  test("maxConcurrent blocks a second in-flight request", async () => {
+    const t = convexTest(schema, modules);
+    await setUserLimits(t, "u", { maxConcurrent: 1 });
+    const first = await start(t, { userId: "u" });
+    expect(first.allowed).toBe(true); // reserved, still pending
+    const second = await start(t, { userId: "u" });
+    expect(second.allowed).toBe(false);
+    expect(second.code).toBe("user_max_concurrent");
+  });
+});
+
+describe("tag-filtered request log", () => {
+  test("listRequests filters by a custom tag dimension", async () => {
+    const t = convexTest(schema, modules);
+    await start(t, { userId: "u", tags: [{ dimension: "customer", value: "acme" }] });
+    await start(t, { userId: "u", tags: [{ dimension: "customer", value: "globex" }] });
+    const acme = await t.query(api.lib.listRequests, {
+      dimension: "customer",
+      value: "acme",
+    });
+    expect(acme.length).toBe(1);
+    expect(acme[0].userId).toBe("u");
+  });
+});
+
 describe("tagged attribution buckets", () => {
   test("a cap on a custom tag blocks, and settlement accrues to every bucket", async () => {
     const t = convexTest(schema, modules);
