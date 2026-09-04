@@ -174,19 +174,26 @@ function extractUsage(usage: any): {
   };
 }
 
-// The gateway doesn't report a dollar cost today, but if a future response ever
-// carries an unambiguous nanodollar cost we pass it straight through as
-// authoritative (finishRequest prefers it over the token-based estimate). Only
-// an explicitly nano-denominated field is trusted — a bare `cost` could be in
-// dollars and silently mis-bill by 1e9×.
+// The AI Gateway reports the authoritative dollar cost of each request.
+// @convex-dev/ai-sdk-provider surfaces it at
+// `providerMetadata.convexGateway.cost` (USD); convert to nanodollars and pass
+// it through as authoritative (finishRequest prefers it over the token-based
+// estimate). No-op on older provider versions that don't surface it.
 function extractGatewayCostNanos(result: any): number | undefined {
   const meta = result?.providerMetadata?.convexGateway;
-  const candidates = [meta?.costNanos, result?.usage?.costNanos];
-  for (const c of candidates) {
-    if (typeof c === "number" && Number.isFinite(c) && c >= 0) return c;
+  const costUsd = meta?.cost;
+  if (typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd >= 0) {
+    return Math.round(costUsd * NANOS_PER_DOLLAR);
+  }
+  // Back-compat: honor an explicitly nano-denominated field if ever present.
+  const costNanos = meta?.costNanos ?? result?.usage?.costNanos;
+  if (typeof costNanos === "number" && Number.isFinite(costNanos) && costNanos >= 0) {
+    return Math.round(costNanos);
   }
   return undefined;
 }
+
+const NANOS_PER_DOLLAR = 1e9;
 
 // Flatten an AI SDK prompt (roles + content parts) into simple storable messages.
 function simplifyPrompt(prompt: any): Message[] {
@@ -483,6 +490,7 @@ export class AIBudget {
           const start = Date.now();
           let text = "";
           let usage: any = undefined;
+          let providerMetadata: any = undefined;
           try {
             const result = await doStream();
             // finishRequest is idempotent (terminal-guarded server-side), so
@@ -498,6 +506,7 @@ export class AIBudget {
                 responseText: text,
                 error,
                 ...extractUsage(usage),
+                costNanos: extractGatewayCostNanos({ providerMetadata }),
                 latencyMs: Date.now() - start,
               });
             };
@@ -507,7 +516,10 @@ export class AIBudget {
                   if (chunk?.type === "text-delta") {
                     text += chunk.delta ?? chunk.textDelta ?? "";
                   }
-                  if (chunk?.type === "finish") usage = chunk.usage;
+                  if (chunk?.type === "finish") {
+                    usage = chunk.usage;
+                    providerMetadata = chunk.providerMetadata ?? providerMetadata;
+                  }
                   if (chunk?.type === "error") void settle(String(chunk.error));
                   controller.enqueue(chunk);
                 },
