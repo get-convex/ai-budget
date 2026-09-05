@@ -575,6 +575,9 @@ export class AIBudget {
           limit?: number;
         } = {}
       ) => ctx.runQuery(c.lib.listRequests, args),
+      /** One request, including its stored prompt and response. */
+      get: (ctx: RunQueryCtx, args: { requestId: string }) =>
+        ctx.runQuery(c.lib.getRequest, { requestId: args.requestId as any }),
       /** Ancestors up to the original, plus direct re-runs. */
       lineage: (ctx: RunQueryCtx, args: { requestId: string }) =>
         ctx.runQuery(c.lib.lineage, { requestId: args.requestId as any }),

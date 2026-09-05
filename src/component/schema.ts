@@ -19,7 +19,7 @@ export default defineSchema({
     dimension: v.string(),
     value: v.string(),
     // limits (all optional — unlimited by default)
-    requestsPerMinute: v.optional(v.number()), // enforced on the "user" dimension
+    requestsPerMinute: v.optional(v.number()), // rolling limit for this bucket
     maxConcurrent: v.optional(v.number()), // max in-flight (pending) requests
     dailySpendLimitNanos: v.optional(v.number()),
     monthlySpendLimitNanos: v.optional(v.number()),
@@ -170,7 +170,7 @@ export default defineSchema({
     // touches it; only the limit config lives here. Enforced approximately —
     // the sharded total is read without a reservation, so under heavy
     // concurrency it can overshoot by a bounded amount. Right for a global
-    // killswitch; per-bucket caps stay exact via reserve/settle.
+    // killswitch; per-bucket concurrent admission is atomic via reserve/settle.
     globalDailySpendLimitNanos: v.optional(v.number()),
     globalLifetimeSpendLimitNanos: v.optional(v.number()),
     globalEnforcement: v.optional(

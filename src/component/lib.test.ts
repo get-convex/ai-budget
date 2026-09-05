@@ -174,6 +174,47 @@ describe("concurrency cap", () => {
   });
 });
 
+describe("per-bucket rate limits", () => {
+  test("the existing user rate limit remains compatible", async () => {
+    const t = convexTest(schema, modules);
+    await setUserLimits(t, "u", { requestsPerMinute: 1 });
+    const first = await start(t, { userId: "u" });
+    expect(first.allowed).toBe(true);
+    const second = await start(t, { userId: "u" });
+    expect(second.allowed).toBe(false);
+    expect(second.code).toBe("rate_limit");
+  });
+
+  test("an action rate limit blocks the next request for that action", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "action",
+      value: "ai:summarize",
+      requestsPerMinute: 1,
+    });
+    const first = await start(t, { userId: "u1", actionName: "ai:summarize" });
+    expect(first.allowed).toBe(true);
+    const second = await start(t, { userId: "u2", actionName: "ai:summarize" });
+    expect(second.allowed).toBe(false);
+    expect(second.code).toBe("action_rate_limit");
+  });
+
+  test("a custom-tag rate limit blocks the next request for that value", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "customer",
+      value: "acme",
+      requestsPerMinute: 1,
+    });
+    const tags = [{ dimension: "customer", value: "acme" }];
+    const first = await start(t, { userId: "u1", tags });
+    expect(first.allowed).toBe(true);
+    const second = await start(t, { userId: "u2", tags });
+    expect(second.allowed).toBe(false);
+    expect(second.code).toBe("customer_rate_limit");
+  });
+});
+
 describe("tag-filtered request log", () => {
   test("listRequests filters by a custom tag dimension", async () => {
     const t = convexTest(schema, modules);

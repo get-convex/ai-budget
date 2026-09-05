@@ -3,7 +3,7 @@
 **Add this component and get worry-free AI.** A metered, budget-governed layer
 over the [Convex AI Gateway](https://docs.convex.dev/ai-gateway/overview). Point
 your LLM calls through it and every request is tracked, priced, attributed, and
-held to a budget — with spend caps that actually hold under concurrent load.
+held to a budget — with atomic admission that accounts for concurrent load.
 
 ```ts
 // userId defaults to the signed-in user — this is the whole integration:
@@ -43,12 +43,12 @@ full audit log you can replay later.
 | **Attribution** | Each call is attributed to a `userId` **and** the Convex action that made it — auto-detected via `ctx.meta`, no manual tagging. |
 | **Tagged budgets** | `user` and `action` are just built-in *dimensions* — add your own (team, project, customer, env…) via `tags`, and cap any of them. One request can be billed to several buckets at once. |
 | **Spend & token limits** | Per-bucket **daily / monthly / lifetime** spend and token budgets, plus requests-per-minute, a max-concurrent cap, and a block switch. |
-| **Concurrency-safe caps** | A reserve-then-settle design makes admission a true atomic check — concurrent in-flight requests can't blow past the cap (a naive tracker overshoots ~40×). |
+| **Concurrency-safe admission** | A reserve-then-settle design makes admission atomic against estimated usage, so concurrent requests can't all spend the same remaining budget. Final usage can exceed its reservation; the actual amount is recorded at settlement. |
 | **Hard or soft** | Each limit either **blocks** (`hard`) or **allows-with-a-warning** (`soft`). |
 | **Approaching-limit alerts** | Set `warnAtPct` (e.g. 0.8) and get an `onThreshold` callback before a cap is hit; `onLimitReached` fires when one blocks. |
 | **Spend history** | Durable per-bucket **daily & monthly** rollups that survive request retention — real spend-over-time, per user / action / tag. |
 | **Manual credits/debits** | Comp a user or correct an overcharge with a signed adjustment, recorded to the live windows, the history, and an audit log. |
-| **One-time bumps** | "Approve another $X" at any level without changing the standing cap — daily/monthly bumps reset with the window, lifetime bumps persist. |
+| **One-time bumps** | "Approve another $X" without changing the standing cap — bucket daily/monthly bumps and global daily bumps reset with their windows; lifetime bumps persist. |
 | **Global killswitch** | A deployment-wide spend cap across everything (sharded for throughput; enforced approximately). |
 | **Authoritative cost** | Records the gateway's **real** per-request dollar cost when available; otherwise cache-aware token pricing. Unknown models **fail closed** (charged a conservative max, never $0). |
 | **Model policy** | Allow/deny lists for models. |
@@ -153,8 +153,9 @@ costs, limits, prices. Integers avoid the rounding drift floating-point cents
 accumulate and keep cap comparisons exact (to ~$9M per value). `$1 = 1_000_000_000`.
 
 **Reserve → settle.** Each request is admitted by an atomic check-and-reserve
-against every capped bucket it touches, then settled to its real cost when it
-finishes. That's what makes caps hold under concurrency — see
+of estimated usage against every capped bucket it touches, then settled to its
+real cost when it finishes. That's what prevents concurrent requests from all
+spending the same remaining budget — see
 [How spend caps stay correct](#how-spend-caps-stay-correct).
 
 > All methods are called from a Convex **action** (they run the gateway call),
@@ -256,8 +257,8 @@ ai.users.setLimits(ctx, {
 ```
 
 Pass a field as `undefined` to clear that limit (unlimited). A request is
-admitted only if it fits **every** bucket it touches — the same exact
-reserve-then-settle check runs per bucket. Uncapped buckets never serialize, so
+admitted only if its estimate fits **every** bucket it touches — the same atomic
+reserve-then-settle admission check runs per bucket. Uncapped buckets never serialize, so
 adding tags you don't cap is free at admission; their totals still accrue for
 reporting.
 
@@ -276,7 +277,7 @@ await ai.chat(ctx, {
 // Cap the customer "acme" to $50/day — independent of any per-user cap.
 await ai.tag("customer").setLimits(ctx, {
   value: "acme",
-  monthlySpendLimitNanos: 50 * 1_000_000_000,
+  dailySpendLimitNanos: 50 * 1_000_000_000,
 });
 ```
 
@@ -360,8 +361,8 @@ ai.global.bump(ctx, { dailyNanos?, lifetimeNanos? })
 ```
 
 A killswitch across everything. Backed by a sharded counter for throughput, so
-it's enforced **approximately** (bounded overshoot under burst) — per-bucket caps
-remain exact.
+it's enforced **approximately** (bounded concurrency overshoot under burst).
+Per-bucket admission is atomic against each request's estimate.
 
 ### Model policy
 
@@ -467,15 +468,18 @@ Reservations are taken only on buckets that actually have a cap, so uncapped
 traffic never serializes — this is what makes arbitrary `tags` cheap: a request
 reserves on one row per *capped* dimension it carries, and nothing else.
 
-**One guarantee, all scopes.** Every per-bucket cap — user, action, or any tag —
-runs through the *same* admission check: a request is admitted only when
+**One admission rule, all scopes.** Every per-bucket cap — user, action, or any
+tag — runs through the *same* admission check: a request is admitted only when
 `committed + reserved + estimate ≤ cap` (bumps included) for **every** bucket it
-touches. The only difference is the holder: each per-bucket cap reserves on a
-single document (exact); the **global** killswitch is backed by a sharded counter
-for throughput, read as an eventually-consistent sum with no cross-request
-reservation — so it's **approximate** (bounded overshoot under a burst), the
-deliberate exactness-for-throughput trade for a deployment-wide cap, and the only
-scope that isn't exact.
+touches. Each per-bucket cap reserves on a single document, making concurrent
+admission atomic. The **global** killswitch is backed by a sharded counter for
+throughput, read as an eventually-consistent sum with no cross-request
+reservation, so concurrent global admissions can overshoot under a burst.
+
+Reservations are estimates, not provider-side maximum charges. If a response uses
+more tokens or costs more than estimated, settlement records the real amount and
+the final total can exceed a hard cap by that request's estimation delta. The next
+admission sees the settled total and blocks until there is headroom again.
 
 The `error.md` file documents the adversarial audits this design survived, with
 live repros.

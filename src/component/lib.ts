@@ -43,9 +43,9 @@ const DEFAULT_PRICES: Record<string, { input: number; output: number }> = {
   "openai/gpt-5-mini": { input: 250_000_000, output: 2_000_000_000 },
 };
 
-// Pessimistic assumed output length when reserving budget up front. Reservations
-// only need to be an upper bound often enough to keep a hard cap honest; the
-// actual cost replaces the estimate the moment the request settles.
+// Pessimistic assumed output length when reserving budget up front. This makes
+// concurrent admission atomic against the estimate; a response that exceeds the
+// estimate can still settle above the cap by the estimation delta.
 const ESTIMATED_OUTPUT_TOKENS = 800;
 // A request still "pending" after this long is presumed dead (its action
 // crashed before settling); the reconciler releases its reservation. Set well
@@ -479,28 +479,51 @@ export const startRequest = mutation({
       }
     }
 
-    // Rate limit is enforced on the `user` dimension (the requests table is
-    // indexed by userId, so the 60s window is a bounded index read).
-    const userBucket = buckets.find((b) => b.dimension === USER_DIM)!;
-    if (userBucket.requestsPerMinute !== undefined) {
-      // Bounded read: we only need to know whether non-blocked requests in the
-      // window have reached the limit. Reading limit+50 non-blocked rows is
-      // enough, and .take caps the scan even if the window is flooded. Blocked
-      // rows aren't persisted for rate-limit/blocked rejections (see reject),
-      // so the window stays small.
-      const recent = await ctx.db
-        .query("requests")
-        .withIndex("userId", (q) =>
-          q.eq("userId", args.userId).gt("_creationTime", Date.now() - 60_000)
-        )
-        .take(userBucket.requestsPerMinute + 50);
-      if (
-        recent.filter((r) => r.status !== "blocked").length >=
-        userBucket.requestsPerMinute
-      ) {
+    // Enforce the rolling 60-second rate limit on every configured dimension.
+    // User/action requests use their first-class indexes; custom dimensions use
+    // the requestTags reverse index. All reads are bounded by the configured
+    // limit (plus a small allowance for persisted blocked attempts).
+    const rateCutoff = Date.now() - 60_000;
+    for (const b of buckets) {
+      const limit = b.requestsPerMinute;
+      if (limit === undefined) continue;
+
+      let recentCount: number;
+      if (b.dimension === USER_DIM) {
+        const recent = await ctx.db
+          .query("requests")
+          .withIndex("userId", (q) =>
+            q.eq("userId", b.value).gt("_creationTime", rateCutoff)
+          )
+          .take(limit + 50);
+        recentCount = recent.filter((r) => r.status !== "blocked").length;
+      } else if (b.dimension === ACTION_DIM) {
+        const recent = await ctx.db
+          .query("requests")
+          .withIndex("actionName", (q) =>
+            q.eq("actionName", b.value).gt("_creationTime", rateCutoff)
+          )
+          .take(limit + 50);
+        recentCount = recent.filter((r) => r.status !== "blocked").length;
+      } else {
+        recentCount = (
+          await ctx.db
+            .query("requestTags")
+            .withIndex("dim_value", (q) =>
+              q
+                .eq("dimension", b.dimension)
+                .eq("value", b.value)
+                .gt("_creationTime", rateCutoff)
+            )
+            .take(limit)
+        ).length;
+      }
+
+      if (recentCount >= limit) {
+        const code = b.dimension === USER_DIM ? "rate_limit" : `${b.dimension}_rate_limit`;
         return reject(
-          "rate_limit",
-          `Rate limit exceeded for "${args.userId}" (${userBucket.requestsPerMinute}/min)`,
+          code,
+          `Rate limit exceeded for ${b.dimension} "${b.value}" (${limit}/min)`,
           false
         );
       }
@@ -508,8 +531,9 @@ export const startRequest = mutation({
 
     // Committed + already-reserved in-flight usage + this estimate must fit
     // under EACH bucket's cap. Decided and reserved in one transaction, so
-    // Convex's serializable isolation makes it a true atomic check-and-reserve
-    // across every capped bucket. Soft enforcement turns a violation into a
+    // Convex's serializable isolation makes concurrent admission atomic across
+    // every capped bucket. Final usage can exceed the estimate; settlement then
+    // records the actual amount. Soft enforcement turns a violation into a
     // warning instead of a block.
     for (const b of buckets) {
       const sameDay = b.dayStamp === today;
@@ -554,15 +578,14 @@ export const startRequest = mutation({
       notices.push(...ev.notices);
     }
 
-    // Deployment-wide ("global") spend cap — same reserve-then-settle model and
-    // the SAME evaluateCaps logic as the per-bucket caps above, so the guarantee
-    // statement is uniform: a request is admitted only if
+    // Deployment-wide ("global") spend cap — the same estimated-usage admission
+    // rule as the per-bucket caps above: a request is admitted only if
     // committed + reserved + estimate <= cap. The ONE difference is the holder:
-    // per-bucket caps reserve on a single row (an exact atomic
-    // check-and-reserve), while the global holder is a sharded counter for
+    // per-bucket caps reserve on a single row (an atomic check-and-reserve),
+    // while the global holder is a sharded counter for
     // throughput — its committed total is read as an eventually-consistent sum
     // with no cross-request reservation, so a hard global cap can overshoot by a
-    // bounded amount under burst. That's the deliberate exactness/throughput
+    // bounded amount under burst. That's the deliberate consistency/throughput
     // trade for a deployment-wide killswitch; it's the only approximate scope.
     if (
       settings &&
