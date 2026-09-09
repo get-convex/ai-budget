@@ -43,6 +43,15 @@ const DEFAULT_PRICES: Record<string, { input: number; output: number }> = {
   "openai/gpt-5-mini": { input: 250_000_000, output: 2_000_000_000 },
 };
 
+// Per-call price (nanodollars) for provider server-side tools that bill a fee on
+// top of tokens — e.g. Anthropic web search at ~$0.01/call. Keyed by the tool
+// name the caller reports in `serverToolUses` (e.g. { web_search: 3 }). Used
+// only when a request settles WITHOUT an authoritative gateway cost; if you pass
+// `costNanos`, that already includes tool fees. Override via setServerToolPrice.
+const DEFAULT_SERVER_TOOL_PRICES: Record<string, number> = {
+  web_search: 10_000_000, // $0.01 per search
+};
+
 // Pessimistic assumed output length when reserving budget up front. This makes
 // concurrent admission atomic against the estimate; a response that exceeds the
 // estimate can still settle above the cap by the estimation delta.
@@ -134,6 +143,22 @@ const settleCost = (
       (cached / 1e6) * cachedRate(price) +
       (completionTokens / 1e6) * price.output
   );
+};
+
+// Per-call fees for provider server tools (web search, etc.), merging the
+// defaults with any deployment overrides. Unknown tools price at 0 (recorded
+// but not charged) rather than guessing.
+const serverToolCost = (
+  uses: Record<string, number> | undefined,
+  overrides: Record<string, number> | undefined
+) => {
+  if (!uses) return 0;
+  const prices = { ...DEFAULT_SERVER_TOOL_PRICES, ...(overrides ?? {}) };
+  let total = 0;
+  for (const [tool, count] of Object.entries(uses)) {
+    if (count > 0 && prices[tool] > 0) total += Math.round(count * prices[tool]);
+  }
+  return total;
 };
 
 // Upsert-add a settled amount into the durable per-(bucket, period) usage row.
@@ -684,9 +709,13 @@ export const finishRequest = mutation({
     promptTokens: v.optional(v.number()),
     completionTokens: v.optional(v.number()),
     cachedTokens: v.optional(v.number()),
-    // Authoritative cost from the gateway, if it ever reports one. When present
-    // it's recorded verbatim (no token-based estimate); when absent we price
-    // from tokens (cache-aware). Wired now so adopting a real cost is one line.
+    // Provider server-tool invocations that bill a per-call fee (e.g.
+    // { web_search: 3 }). Added to the token cost when no authoritative cost is
+    // supplied; recorded either way.
+    serverToolUses: v.optional(v.record(v.string(), v.number())),
+    // Authoritative cost from the gateway/provider, if reported. When present
+    // it's recorded verbatim (already includes any tool fees); when absent we
+    // price from tokens (cache-aware) plus server-tool fees.
     costNanos: v.optional(v.number()),
     latencyMs: v.optional(v.number()),
   },
@@ -711,17 +740,22 @@ export const finishRequest = mutation({
     const promptTokens = Math.max(0, args.promptTokens ?? 0);
     const completionTokens = Math.max(0, args.completionTokens ?? 0);
     const cachedTokens = Math.min(promptTokens, Math.max(0, args.cachedTokens ?? 0));
-    // Prefer an authoritative gateway cost when supplied; otherwise price from
-    // tokens, discounting the cached (prompt-cache-read) slice of the prompt.
-    const costNanos =
-      args.costNanos !== undefined && args.costNanos >= 0
-        ? Math.round(args.costNanos)
-        : settleCost(
-            promptTokens,
-            cachedTokens,
-            completionTokens,
-            await getPrice(ctx, request.model)
-          );
+    // Prefer an authoritative gateway cost when supplied (it already includes
+    // tool fees); otherwise price from tokens — discounting the cached
+    // (prompt-cache-read) slice — plus any server-tool per-call fees.
+    let costNanos: number;
+    if (args.costNanos !== undefined && args.costNanos >= 0) {
+      costNanos = Math.round(args.costNanos);
+    } else {
+      const settings = await getSettings(ctx);
+      costNanos =
+        settleCost(
+          promptTokens,
+          cachedTokens,
+          completionTokens,
+          await getPrice(ctx, request.model)
+        ) + serverToolCost(args.serverToolUses, settings?.serverToolPrices);
+    }
 
     // Durable write to the request's OWN row only — uncontended, so it always
     // lands. `settled: false` hands it to the fold step; the row is never left
@@ -733,6 +767,7 @@ export const finishRequest = mutation({
       promptTokens,
       completionTokens,
       ...(cachedTokens > 0 ? { cachedTokens } : {}),
+      ...(args.serverToolUses ? { serverToolUses: args.serverToolUses } : {}),
       costNanos,
       latencyMs: args.latencyMs,
       settled: false,
@@ -1345,5 +1380,28 @@ export const listPrices = query({
       };
     }
     return merged;
+  },
+});
+
+// Per-call fees for provider server tools (web search, etc.), defaults merged
+// with any deployment overrides.
+export const listServerToolPrices = query({
+  args: {},
+  handler: async (ctx) => {
+    const s = await getSettings(ctx as any);
+    return { ...DEFAULT_SERVER_TOOL_PRICES, ...(s?.serverToolPrices ?? {}) };
+  },
+});
+
+export const setServerToolPrice = mutation({
+  args: { tool: v.string(), nanosPerCall: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { tool, nanosPerCall }) => {
+    if (nanosPerCall < 0) throw new Error("Prices must be non-negative");
+    const s = await getSettings(ctx);
+    const serverToolPrices = { ...(s?.serverToolPrices ?? {}), [tool]: nanosPerCall };
+    if (s) await ctx.db.patch(s._id, { serverToolPrices });
+    else await ctx.db.insert("settings", { key: "singleton", serverToolPrices });
+    return null;
   },
 });

@@ -306,8 +306,107 @@ export class AIBudget {
   }
 
   /**
-   * One-shot chat through the AI Gateway with tracking + limits.
-   * Call from an action. `userId` defaults to the authenticated caller.
+   * Meter ANY LLM call — gateway, a provider SDK, a raw fetch — with the same
+   * budgets, audit log, and cost tracking. Reserves before your `run` (throwing
+   * a ConvexError over a hard cap), runs it, then records the actual usage/cost.
+   * This is the provider-agnostic core; `chat` is sugar over it for the gateway.
+   *
+   * `run` returns what happened. Pass a raw provider `usage` object (auto-
+   * normalized) OR explicit `promptTokens`/`completionTokens`/`cachedTokens`,
+   * plus optional `serverToolUses` (e.g. `{ web_search: 3 }`, priced on top of
+   * tokens) and an authoritative `costNanos` (used verbatim if present).
+   */
+  async meter(
+    ctx: RunMutationCtx,
+    opts: {
+      model: string;
+      messages: Message[];
+      userId?: string;
+      action?: string;
+      tags?: Tag[];
+      rerunOf?: string;
+    },
+    run: () => Promise<{
+      text?: string;
+      usage?: any;
+      promptTokens?: number;
+      completionTokens?: number;
+      cachedTokens?: number;
+      serverToolUses?: Record<string, number>;
+      costNanos?: number;
+    }>
+  ): Promise<ChatResult> {
+    const userId = await resolveUserId(ctx, opts.userId);
+    const actionName = await resolveActionName(ctx, opts.action);
+    const started = await ctx.runMutation(this.component.lib.startRequest, {
+      userId,
+      actionName,
+      tags: opts.tags,
+      model: opts.model,
+      messages: opts.messages,
+      rerunOf: opts.rerunOf as any,
+    });
+    if (!started.allowed) {
+      await this.fireLimitReached({
+        userId,
+        action: actionName,
+        tags: opts.tags,
+        messages: [started.reason],
+        code: started.code,
+        reason: started.reason,
+      });
+      throw new ConvexError({
+        kind: "AIBudgetLimit",
+        code: started.code,
+        reason: started.reason,
+      });
+    }
+    const requestId = started.requestId;
+    const { warnings, notices } = started;
+    await this.fireBudgetEvents(
+      { userId, action: actionName, tags: opts.tags, requestId },
+      warnings,
+      notices
+    );
+    const start = Date.now();
+    try {
+      const out = await run();
+      // Explicit token fields win; otherwise normalize a raw provider usage.
+      const usage =
+        out.promptTokens !== undefined ||
+        out.completionTokens !== undefined ||
+        out.cachedTokens !== undefined
+          ? {
+              promptTokens: out.promptTokens ?? 0,
+              completionTokens: out.completionTokens ?? 0,
+              cachedTokens: out.cachedTokens ?? 0,
+            }
+          : extractUsage(out.usage);
+      const { costNanos } = await ctx.runMutation(
+        this.component.lib.finishRequest,
+        {
+          requestId,
+          responseText: out.text,
+          ...usage,
+          serverToolUses: out.serverToolUses,
+          costNanos: out.costNanos,
+          latencyMs: Date.now() - start,
+        }
+      );
+      return { text: out.text ?? "", requestId, costNanos, warnings, notices, ...usage };
+    } catch (e) {
+      await ctx.runMutation(this.component.lib.finishRequest, {
+        requestId,
+        error: String(e),
+        latencyMs: Date.now() - start,
+      });
+      throw e;
+    }
+  }
+
+  /**
+   * One-shot chat through the AI Gateway with tracking + limits — sugar over
+   * `meter`. Call from an action. `userId` defaults to the authenticated caller.
    */
   async chat(
     ctx: RunMutationCtx,
@@ -325,76 +424,39 @@ export class AIBudget {
     } = {}
   ): Promise<ChatResult> {
     const model = args.model ?? this.defaultModel;
-    const userId = await resolveUserId(ctx, args.userId);
-    const actionName = await resolveActionName(ctx, args.action);
     const messages: Message[] =
       args.messages ?? [{ role: "user", content: args.prompt ?? "" }];
-    const started = await ctx.runMutation(this.component.lib.startRequest, {
-      userId,
-      actionName,
-      tags: args.tags,
-      model,
-      messages,
-      rerunOf: args.rerunOf as any,
-    });
-    if (!started.allowed) {
-      await this.fireLimitReached({
-        userId,
-        action: actionName,
+    return this.meter(
+      ctx,
+      {
+        model,
+        messages,
+        userId: args.userId,
+        action: args.action,
         tags: args.tags,
-        messages: [started.reason],
-        code: started.code,
-        reason: started.reason,
-      });
-      throw new ConvexError({
-        kind: "AIBudgetLimit",
-        code: started.code,
-        reason: started.reason,
-      });
-    }
-    const requestId = started.requestId;
-    const warnings = started.warnings;
-    const notices = started.notices;
-    await this.fireBudgetEvents(
-      { userId, action: actionName, tags: args.tags, requestId },
-      warnings,
-      notices
-    );
-    const start = Date.now();
-    try {
-      // The full chain (incl. system) is stored on the request for audit/replay,
-      // but the AI SDK wants system prompts in the `system` option, not messages.
-      const system =
-        messages
-          .filter((m) => m.role === "system")
-          .map((m) => m.content)
-          .join("\n\n") || undefined;
-      const convo = messages.filter((m) => m.role !== "system");
-      const result = await generateText({
-        model: convexGateway(model),
-        ...(system ? { system } : {}),
-        messages: convo as any,
-      });
-      const usage = extractUsage(result.usage);
-      const { costNanos } = await ctx.runMutation(
-        this.component.lib.finishRequest,
-        {
-          requestId,
-          responseText: result.text,
-          ...usage,
+        rerunOf: args.rerunOf,
+      },
+      async () => {
+        // The full chain (incl. system) is stored for audit/replay, but the AI
+        // SDK wants system prompts in the `system` option, not messages.
+        const system =
+          messages
+            .filter((m) => m.role === "system")
+            .map((m) => m.content)
+            .join("\n\n") || undefined;
+        const convo = messages.filter((m) => m.role !== "system");
+        const result = await generateText({
+          model: convexGateway(model),
+          ...(system ? { system } : {}),
+          messages: convo as any,
+        });
+        return {
+          text: result.text,
+          usage: result.usage,
           costNanos: extractGatewayCostNanos(result),
-          latencyMs: Date.now() - start,
-        }
-      );
-      return { text: result.text, requestId, costNanos, warnings, notices, ...usage };
-    } catch (e) {
-      await ctx.runMutation(this.component.lib.finishRequest, {
-        requestId,
-        error: String(e),
-        latencyMs: Date.now() - start,
-      });
-      throw e;
-    }
+        };
+      }
+    );
   }
 
   /**
@@ -720,7 +782,7 @@ export class AIBudget {
     };
   }
 
-  /** Per-model prices (cents per million tokens). */
+  /** Per-model prices (nanodollars per million tokens) + server-tool fees. */
   get prices() {
     const c = this.component;
     return {
@@ -735,6 +797,14 @@ export class AIBudget {
           cachedNanosPerMTok?: number;
         }
       ) => ctx.runMutation(c.lib.setPrice, args),
+      /** Per-call fees for provider server tools (web search, etc.). */
+      listServerTools: (ctx: RunQueryCtx) =>
+        ctx.runQuery(c.lib.listServerToolPrices, {}),
+      /** Set a server-tool's per-call price, e.g. { tool: "web_search", nanosPerCall }. */
+      setServerTool: (
+        ctx: RunMutationCtx,
+        args: { tool: string; nanosPerCall: number }
+      ) => ctx.runMutation(c.lib.setServerToolPrice, args),
     };
   }
 

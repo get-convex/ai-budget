@@ -76,6 +76,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           promptTokens?: number;
           requestId: string;
           responseText?: string;
+          serverToolUses?: Record<string, number>;
         },
         { costNanos: number },
         Name
@@ -145,6 +146,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         any,
         Name
       >;
+      listServerToolPrices: FunctionReference<
+        "query",
+        "internal",
+        {},
+        any,
+        Name
+      >;
       setAlertDefaults: FunctionReference<
         "mutation",
         "internal",
@@ -207,6 +215,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         { retentionMs: number },
+        null,
+        Name
+      >;
+      setServerToolPrice: FunctionReference<
+        "mutation",
+        "internal",
+        { nanosPerCall: number; tool: string },
         null,
         Name
       >;

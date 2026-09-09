@@ -132,6 +132,9 @@ export default defineSchema({
     completionTokens: v.optional(v.number()),
     // subset of promptTokens served from the provider's prompt cache (cheaper).
     cachedTokens: v.optional(v.number()),
+    // server-side tool invocations that bill a per-call fee on top of tokens
+    // (e.g. { web_search: 3 }). Priced via serverToolPrices at settle.
+    serverToolUses: v.optional(v.record(v.string(), v.number())),
     costNanos: v.optional(v.number()),
     latencyMs: v.optional(v.number()),
     rerunOf: v.optional(v.id("requests")),
@@ -184,5 +187,8 @@ export default defineSchema({
     // default approaching-limit alert threshold (fraction of a cap) for buckets
     // that don't set their own warnAtPct. 0/unset disables threshold alerts.
     defaultWarnAtPct: v.optional(v.number()),
+    // per-call price (nanodollars) overrides for provider server tools, keyed by
+    // tool name (e.g. { web_search: 12_000_000 }). Merged over the defaults.
+    serverToolPrices: v.optional(v.record(v.string(), v.number())),
   }).index("key", ["key"]),
 });

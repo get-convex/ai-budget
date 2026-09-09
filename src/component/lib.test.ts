@@ -116,6 +116,51 @@ describe("cache-aware pricing", () => {
   });
 });
 
+describe("server-tool pricing", () => {
+  test("server-tool uses add a per-call fee on top of tokens", async () => {
+    const t = convexTest(schema, modules);
+    const r = await start(t, { userId: "u" });
+    // 0 tokens; 3 web searches at the $0.01 default = 30_000_000 nano.
+    await settleWith(t, r.requestId, {
+      promptTokens: 0,
+      completionTokens: 0,
+      serverToolUses: { web_search: 3 },
+    });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.costNanos).toBe(30_000_000);
+    expect(req.serverToolUses).toEqual({ web_search: 3 });
+  });
+
+  test("an override price is applied", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.lib.setServerToolPrice, {
+      tool: "web_search",
+      nanosPerCall: 12_000_000,
+    });
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, {
+      promptTokens: 0,
+      completionTokens: 0,
+      serverToolUses: { web_search: 2 },
+    });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.costNanos).toBe(24_000_000);
+  });
+
+  test("an authoritative cost already includes tool fees (not double-charged)", async () => {
+    const t = convexTest(schema, modules);
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, {
+      promptTokens: 1_000_000,
+      completionTokens: 0,
+      serverToolUses: { web_search: 5 },
+      costNanos: 999,
+    });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.costNanos).toBe(999);
+  });
+});
+
 describe("durable usage history", () => {
   test("settled spend lands in a per-day usage row", async () => {
     const t = convexTest(schema, modules);
