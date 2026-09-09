@@ -11,6 +11,11 @@ import { AIBudget } from "../../src/client";
 const ai = new AIBudget(components.aiBudget, {
   defaultModel: "openai/gpt-4o-mini",
 });
+const evalStore = components.evaluations.lib;
+const evalTags = (runId: string) => [
+  { dimension: "evalRun", value: runId },
+  { dimension: "workload", value: "evaluation" },
+];
 
 const SYSTEM_PROMPT = "You are a concise, friendly assistant. Keep replies short.";
 
@@ -69,19 +74,30 @@ export const experiment = action({
     const sys = systems?.length ? systems : [SYSTEM_PROMPT];
     const mods = models?.length ? models : ["openai/gpt-4o-mini"];
     const combos = sys.flatMap((system) => mods.map((model) => ({ system, model })));
-    return await Promise.all(
+    const runId = await ctx.runMutation(evalStore.createRun, {
+      kind: "matrix",
+      configJson: JSON.stringify({ prompt, systems: sys, models: mods }),
+      budgetTagDimension: "evalRun",
+    });
+    const caseId = await ctx.runMutation(evalStore.addCase, {
+      runId,
+      key: "prompt",
+      inputJson: JSON.stringify({ prompt }),
+    });
+    const results = await Promise.all(
       combos.map(async ({ system, model }) => {
         try {
           const r = await ai.chat(ctx, {
             userId,
             model,
             action: "ai:experiment",
+            tags: evalTags(runId),
             messages: [
               { role: "system", content: system },
               { role: "user", content: prompt },
             ],
           });
-          return {
+          const result = {
             system,
             model,
             requestId: r.requestId,
@@ -92,15 +108,39 @@ export const experiment = action({
             cachedTokens: r.cachedTokens,
             error: null as string | null,
           };
+          await ctx.runMutation(evalStore.recordResult, {
+            runId,
+            caseId,
+            candidate: system,
+            model,
+            outputJson: JSON.stringify({ text: r.text, requestId: r.requestId }),
+            costNanos: r.costNanos,
+          });
+          return result;
         } catch (e: any) {
-          return {
+          const result = {
             system,
             model,
             error: String(e?.data?.reason ?? e?.message ?? e),
           };
+          await ctx.runMutation(evalStore.recordResult, {
+            runId,
+            caseId,
+            candidate: system,
+            model,
+            costNanos: 0,
+            error: result.error,
+          });
+          return result;
         }
       })
     );
+    await ctx.runMutation(evalStore.completeRun, {
+      runId,
+      status: "completed",
+      summaryJson: JSON.stringify({ candidates: results.length }),
+    });
+    return results;
   },
 });
 
@@ -114,32 +154,68 @@ export const judge = action({
   },
   handler: async (ctx, { prompt, candidates, criteria, model }) => {
     const rubric = criteria?.trim() || "overall quality and helpfulness";
+    const judgeModel = model ?? "openai/gpt-4o";
+    const runId = await ctx.runMutation(evalStore.createRun, {
+      kind: "judge",
+      configJson: JSON.stringify({ prompt, candidates, criteria: rubric, model: judgeModel }),
+      budgetTagDimension: "evalRun",
+    });
+    const caseId = await ctx.runMutation(evalStore.addCase, {
+      runId,
+      key: "candidates",
+      inputJson: JSON.stringify({ prompt, candidates }),
+    });
     const list = candidates
       .map((c) => `### Candidate ${c.label}\n${c.text}`)
       .join("\n\n");
-    const res = await ai.chat(ctx, {
-      userId: "judge",
-      model: model ?? "openai/gpt-4o",
-      action: "ai:judge",
-      messages: [
-        {
-          role: "system",
-          content:
-            `You are an impartial evaluator. Rank the candidate responses by how well they meet these criteria: "${rubric}". Respond ONLY as JSON: {"winner":"<label>","rationale":"<one sentence>","ranking":["<label>", ...]}.`,
-        },
-        {
-          role: "user",
-          content: `User prompt:\n${prompt}\n\nCandidates:\n${list}\n\nReturn only the JSON.`,
-        },
-      ],
-    });
-    let parsed: any;
     try {
-      parsed = JSON.parse(res.text.match(/\{[\s\S]*\}/)?.[0] ?? res.text);
-    } catch {
-      parsed = { winner: null, rationale: res.text, ranking: [] };
+      const res = await ai.chat(ctx, {
+        userId: "judge",
+        model: judgeModel,
+        action: "ai:judge",
+        tags: evalTags(runId),
+        messages: [
+          {
+            role: "system",
+            content:
+              `You are an impartial evaluator. Rank the candidate responses by how well they meet these criteria: "${rubric}". Respond ONLY as JSON: {"winner":"<label>","rationale":"<one sentence>","ranking":["<label>", ...]}.`,
+          },
+          {
+            role: "user",
+            content: `User prompt:\n${prompt}\n\nCandidates:\n${list}\n\nReturn only the JSON.`,
+          },
+        ],
+      });
+      let parsed: any;
+      try {
+        parsed = JSON.parse(res.text.match(/\{[\s\S]*\}/)?.[0] ?? res.text);
+      } catch {
+        parsed = { winner: null, rationale: res.text, ranking: [] };
+      }
+      await ctx.runMutation(evalStore.recordResult, {
+        runId,
+        caseId,
+        candidate: "judge",
+        model: judgeModel,
+        outputJson: JSON.stringify(parsed),
+        verdict: parsed.winner ?? undefined,
+        rationale: parsed.rationale ?? undefined,
+        costNanos: res.costNanos,
+      });
+      await ctx.runMutation(evalStore.completeRun, {
+        runId,
+        status: "completed",
+        summaryJson: JSON.stringify(parsed),
+      });
+      return { ...parsed, costNanos: res.costNanos };
+    } catch (error) {
+      await ctx.runMutation(evalStore.completeRun, {
+        runId,
+        status: (error as any)?.data?.kind === "AIBudgetLimit" ? "budget_exhausted" : "failed",
+        error: String(error),
+      });
+      throw error;
     }
-    return { ...parsed, costNanos: res.costNanos };
   },
 });
 
@@ -169,20 +245,50 @@ export const backtest = action({
       )
       .slice(0, N);
 
+    const runId = await ctx.runMutation(evalStore.createRun, {
+      kind: "backtest",
+      configJson: JSON.stringify({
+        action: targetAction,
+        newSystem,
+        criteria: rubric,
+        model,
+        sampleSize: sample.length,
+      }),
+      budgetTagDimension: "evalRun",
+    });
+    const caseIds: string[] = [];
+    for (const [index, request] of sample.entries()) {
+      caseIds.push(
+        await ctx.runMutation(evalStore.addCase, {
+          runId,
+          key: `request-${index + 1}`,
+          inputJson: JSON.stringify({
+            messages: request.messages,
+            userId: request.userId,
+            model: request.model,
+          }),
+          expectedJson: JSON.stringify({ responseText: request.responseText }),
+          sourceId: String(request._id),
+        })
+      );
+    }
+
     const results = await Promise.all(
-      sample.map(async (r: any) => {
+      sample.map(async (r: any, index: number) => {
         const convo = r.messages.filter((m: any) => m.role !== "system");
         try {
           const rr = await ai.chat(ctx, {
             userId: r.userId,
             model: model ?? r.model,
             action: "ai:backtest",
+            tags: evalTags(runId),
             messages: [{ role: "system", content: newSystem }, ...convo],
           });
           const j = await ai.chat(ctx, {
             userId: "judge",
             model: "openai/gpt-4o",
             action: "ai:judge",
+            tags: evalTags(runId),
             messages: [
               {
                 role: "system",
@@ -201,7 +307,7 @@ export const backtest = action({
           } catch {
             v2 = { better: "tie", why: j.text };
           }
-          return {
+          const result = {
             prompt: convo.map((m: any) => m.content).join(" / "),
             original: r.responseText,
             updated: rr.text,
@@ -209,20 +315,50 @@ export const backtest = action({
             why: v2.why,
             costNanos: (rr.costNanos ?? 0) + (j.costNanos ?? 0),
           };
+          await ctx.runMutation(evalStore.recordResult, {
+            runId,
+            caseId: caseIds[index],
+            candidate: newSystem,
+            model: model ?? r.model,
+            outputJson: JSON.stringify({ original: r.responseText, updated: rr.text }),
+            verdict: v2.better,
+            rationale: v2.why,
+            costNanos: result.costNanos,
+          });
+          return result;
         } catch (e: any) {
-          return {
+          const result = {
             prompt: convo.map((m: any) => m.content).join(" / "),
             error: String(e?.data?.reason ?? e?.message ?? e),
           };
+          await ctx.runMutation(evalStore.recordResult, {
+            runId,
+            caseId: caseIds[index],
+            candidate: newSystem,
+            model: model ?? r.model,
+            costNanos: 0,
+            error: result.error,
+          });
+          return result;
         }
       })
     );
-    return {
+    const summary = {
       results,
       total: results.length,
-      improved: results.filter((r) => r.better === "new").length,
-      regressed: results.filter((r) => r.better === "original").length,
+      improved: results.filter((r) => "better" in r && r.better === "new").length,
+      regressed: results.filter((r) => "better" in r && r.better === "original").length,
     };
+    await ctx.runMutation(evalStore.completeRun, {
+      runId,
+      status: "completed",
+      summaryJson: JSON.stringify({
+        total: summary.total,
+        improved: summary.improved,
+        regressed: summary.regressed,
+      }),
+    });
+    return summary;
   },
 });
 
@@ -264,9 +400,47 @@ export const evolve = action({
     if (!sample.length)
       return { error: "No real chat requests to evolve against. Chat first." };
 
+    const runId = await ctx.runMutation(evalStore.createRun, {
+      kind: "evolve",
+      configJson: JSON.stringify({
+        action: targetAction,
+        goal,
+        criteria: rubric,
+        seedSystem,
+        rounds: maxRounds,
+        sampleSize: sample.length,
+        budgetNanos,
+      }),
+      budgetTagDimension: "evalRun",
+    });
+    const caseIds: string[] = [];
+    for (const [index, item] of sample.entries()) {
+      caseIds.push(
+        await ctx.runMutation(evalStore.addCase, {
+          runId,
+          key: `request-${index + 1}`,
+          inputJson: JSON.stringify({
+            messages: item.convo,
+            userId: item.userId,
+            model: item.model,
+          }),
+        })
+      );
+    }
+    if (budgetNanos !== undefined) {
+      await ai.tag("evalRun").setLimits(ctx, {
+        value: runId,
+        lifetimeSpendLimitNanos: budgetNanos,
+      });
+    }
+
     let spent = 0;
     const chat = async (args: any) => {
-      const r = await ai.chat(ctx, { action: "ai:evolve", ...args });
+      const r = await ai.chat(ctx, {
+        action: "ai:evolve",
+        tags: evalTags(runId),
+        ...args,
+      });
       spent += r.costNanos ?? 0;
       return r;
     };
@@ -303,8 +477,16 @@ export const evolve = action({
     try {
       for (let round = 0; round < maxRounds; round++) {
         if (spent >= budget) { stopped = "budget"; break; }
+        const spentBeforeRound = spent;
         const { avg, outs } = await scoreSystem(current);
         history.push({ round: round + 1, system: current, score: avg, spentNanos: spent });
+        await ctx.runMutation(evalStore.recordResult, {
+          runId,
+          candidate: current,
+          outputJson: JSON.stringify({ outputs: outs, caseIds }),
+          score: avg,
+          costNanos: spent - spentBeforeRound,
+        });
         if (avg > best.score) best = { system: current, score: avg };
         if (spent >= budget) { stopped = "budget"; break; }
         const prop = await chat({
@@ -322,9 +504,22 @@ export const evolve = action({
       }
     } catch (e: any) {
       if (e?.data?.kind === "AIBudgetLimit") stopped = "budget";
-      else throw e;
+      else {
+        await ctx.runMutation(evalStore.completeRun, {
+          runId,
+          status: "failed",
+          error: String(e?.message ?? e),
+        });
+        throw e;
+      }
     }
-    return { history, best, spentNanos: spent, stopped, corpusSize: sample.length };
+    const summary = { history, best, spentNanos: spent, stopped, corpusSize: sample.length };
+    await ctx.runMutation(evalStore.completeRun, {
+      runId,
+      status: stopped === "budget" ? "budget_exhausted" : "completed",
+      summaryJson: JSON.stringify(summary),
+    });
+    return summary;
   },
 });
 
@@ -349,6 +544,25 @@ export const listRequests = query({
   },
   handler: async (ctx, args) => {
     return await ai.requests.list(ctx, { ...args, limit: 100 });
+  },
+});
+
+// Reactive, app-owned views over the isolated Evaluation component. Production
+// apps should add their normal admin authorization here before re-exporting them.
+export const listEvaluationRuns = query({
+  args: {},
+  handler: async (ctx) => ctx.runQuery(evalStore.listRuns, { limit: 50 }),
+});
+
+export const getEvaluationRun = query({
+  args: { runId: v.string() },
+  handler: async (ctx, { runId }) => {
+    const [run, cases, results] = await Promise.all([
+      ctx.runQuery(evalStore.getRun, { runId }),
+      ctx.runQuery(evalStore.listCases, { runId, limit: 500 }),
+      ctx.runQuery(evalStore.listResults, { runId, limit: 500 }),
+    ]);
+    return { run, cases, results };
   },
 });
 

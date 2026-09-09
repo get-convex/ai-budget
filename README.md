@@ -205,6 +205,35 @@ const result = await agent.generateText(ctx, { threadId }, { prompt });
 Every generation is now tracked and budgeted, attributed to `userId` and the
 calling action. See `example/convex/agentDemo.ts`.
 
+### `ai.meter` — budget *any* provider call
+
+`chat`/`languageModel` go through the gateway. When you need something the
+gateway can't serve (Anthropic web search, computer-use, a different provider,
+a raw `fetch`), `meter` brings that call under the *same* caps, audit log, and
+cost tracking. It reserves before your `run` (throwing over a hard cap), runs
+it, and records the actual usage:
+
+```ts
+await ai.meter(ctx, { userId, model: "anthropic/claude-…", messages }, async () => {
+  const res = await anthropic.messages.create({
+    messages,
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
+  });
+  return {
+    text: extractText(res),
+    promptTokens: res.usage.input_tokens,
+    completionTokens: res.usage.output_tokens,
+    cachedTokens: res.usage.cache_read_input_tokens ?? 0,
+    serverToolUses: { web_search: res.usage.server_tool_use?.web_search_requests ?? 0 },
+    // costNanos? — pass an authoritative total to skip token/tool pricing
+  };
+});
+```
+
+`chat` is sugar over `meter`. Return either a raw provider `usage` (auto-
+normalized) or explicit `promptTokens`/`completionTokens`/`cachedTokens`, plus
+optional `serverToolUses` (see [pricing](#pricing--cost)) and `costNanos`.
+
 ### Replay
 
 ```ts
@@ -390,6 +419,17 @@ ai.prices.set(ctx, { model, inputNanosPerMTok, outputNanosPerMTok, cachedNanosPe
 ai.prices.list(ctx)
 ```
 
+**Server tools.** Provider server-side tools bill a per-call fee on top of
+tokens (e.g. Anthropic web search). Report them from `meter` as
+`serverToolUses: { web_search: 3 }` and they're priced per call (default
+$0.01/`web_search`) — unless you pass an authoritative `costNanos`, which already
+includes them. Override the rate:
+
+```ts
+ai.prices.setServerTool(ctx, { tool: "web_search", nanosPerCall: 12_000_000 })
+ai.prices.listServerTools(ctx)
+```
+
 The gateway's `provider/model` ids match OpenRouter's, whose public models
 endpoint returns per-token pricing — so you can keep prices current from your own
 action (see `example/convex/ai.ts` → `syncPrices`):
@@ -529,22 +569,31 @@ npm run dev         # terminal 2 — Vite app
 
 ### What's in the component vs. the demo
 
-The component (`src/`) is **only** the metering/budget primitive — it knows
-nothing about chat or evaluation. Everything below lives in `example/` as
-**application code that uses the component**, not part of the published API:
+The published AI Budget component (`src/`) is **only** the metering/budget
+primitive — it knows nothing about agents or evaluation. The example composes
+three isolated pieces:
 
-- The real features being metered — `sendMessage`, `summarize`, the agent.
-- An **eval playground** (🧪 Experiment tab): **Matrix** (one prompt across a
+- The **Agent component** owns agent threads, messages, tools, and generation.
+- The local **Evaluation component** (`example/convex/evaluations/`) owns immutable
+  case snapshots, run lifecycle, and results. It does not call Agent or AI Budget.
+- App-level adapters in `example/convex/ai.ts` compose the siblings: they obtain
+  source traffic, run candidate/judge model calls through AI Budget, attach an
+  `evalRun` budget tag, and persist outcomes into Evaluation.
+- The **eval playground** (🧪 Experiment tab) exposes **Matrix** (one prompt across a
   system-prompt × model grid, ranked by an LLM judge on *your* criteria),
   **Backtest** (replay a candidate prompt against an action's real historical
   requests and judge each), and **Evolve** (an LLM iteratively improves a prompt
   toward a goal on real traffic, **stopping when it hits a spend budget**).
 
-These are built on two primitives — `ai.chat(...)` (every eval call is budgeted)
-and `ai.requests.list(...)` (the audit log *is* the eval dataset) — a "how to
-build on it" reference, not the component's surface. If you productize this it
-belongs in your app or a component that *composes* `@convex-dev/ai-budget`, never
-folded back into it.
+The demo currently snapshots AI Budget audit traffic as its corpus. An Agent-based
+product should instead make the app adapter snapshot cases through Agent's public
+API; Evaluation must never inspect Agent's private tables. The same Evaluation
+component works with either source because its inputs are explicit snapshots.
+
+This local component is a proof of the reusable boundary, not part of the
+`@convex-dev/ai-budget` package. If productized, it should ship independently
+(for example, `@convex-dev/evals`) and accept application adapters/function
+handles rather than taking a dependency on either sibling component.
 
 ---
 
@@ -566,7 +615,9 @@ npm run build       # emit dist/ (client + component) for publishing
 - `src/client/` — **the client** (published): the `AIBudget` class — `chat`,
   `languageModel`, `registerRoutes`, and the namespaced admin API.
 - `example/` — **the demo app** (not published): real features, the eval
-  playground, and the UI, all built on the two directories above.
+  playground, and the UI. `example/convex/evaluations/` is a separate local
+  component for datasets, runs, and results; `example/convex/ai.ts` is the
+  composition layer.
 
 ## License
 
