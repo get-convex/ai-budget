@@ -161,6 +161,37 @@ describe("server-tool pricing", () => {
   });
 });
 
+describe("cost known up front (image gen, per-call APIs)", () => {
+  test("estimatedCostNanos drives the reservation for a hard cap", async () => {
+    const t = convexTest(schema, modules);
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 100_000_000 }); // $0.10
+    // A $0.13 image is known before the call; reserving it exceeds the cap,
+    // even though the token estimate for the prompt alone would pass.
+    const r = await start(t, {
+      userId: "u",
+      model: "openai/gpt-image-1",
+      estimatedCostNanos: 130_000_000,
+    });
+    expect(r.allowed).toBe(false);
+    expect(r.code).toBe("user_daily_spend_limit");
+  });
+
+  test("admits when it fits, then settles to the real per-image cost", async () => {
+    const t = convexTest(schema, modules);
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 500_000_000 });
+    const r = await start(t, {
+      userId: "u",
+      model: "openai/gpt-image-1",
+      estimatedCostNanos: 130_000_000,
+    });
+    expect(r.allowed).toBe(true);
+    await settleWith(t, r.requestId, { costNanos: 130_000_000 });
+    const u = await userOf(t, "u");
+    expect(u.totalSpendNanos).toBe(130_000_000);
+    expect(u.reservedTotalNanos ?? 0).toBe(0);
+  });
+});
+
 describe("durable usage history", () => {
   test("settled spend lands in a per-day usage row", async () => {
     const t = convexTest(schema, modules);

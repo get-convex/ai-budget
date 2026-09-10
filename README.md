@@ -234,6 +234,23 @@ await ai.meter(ctx, { userId, model: "anthropic/claude-…", messages }, async (
 normalized) or explicit `promptTokens`/`completionTokens`/`cachedTokens`, plus
 optional `serverToolUses` (see [pricing](#pricing--cost)) and `costNanos`.
 
+**Cost known up front (image gen, per-call APIs).** When you know the price
+before the call — image generation (`n` × per-image), audio, anything per-call —
+pass `estimatedCostNanos` so the *reservation* holds the real amount and a hard
+cap is exact (the token estimate is meaningless for these). Price the units with
+`serverToolUses` + [`setServerTool`](#pricing--cost):
+
+```ts
+const IMG = 130_000_000; // $0.13/image
+await ai.meter(ctx,
+  { userId, model: "openai/gpt-image-1", messages: [{ role: "user", content: prompt }],
+    estimatedCostNanos: IMG * n },
+  async () => {
+    const res = await openrouter.images.generate({ model: "openai/gpt-image-1", prompt, n });
+    return { serverToolUses: { image: n } };   // priced via setServerTool({ tool: "image", … })
+  });
+```
+
 ### Replay
 
 ```ts

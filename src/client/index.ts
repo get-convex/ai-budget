@@ -325,6 +325,9 @@ export class AIBudget {
       action?: string;
       tags?: Tag[];
       rerunOf?: string;
+      /** Reserve this exact amount (nanodollars) instead of the token estimate.
+       *  Use when cost is known up front — image gen (n × per-image), etc. */
+      estimatedCostNanos?: number;
     },
     run: () => Promise<{
       text?: string;
@@ -344,6 +347,7 @@ export class AIBudget {
       tags: opts.tags,
       model: opts.model,
       messages: opts.messages,
+      estimatedCostNanos: opts.estimatedCostNanos,
       rerunOf: opts.rerunOf as any,
     });
     if (!started.allowed) {

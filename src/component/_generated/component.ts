@@ -230,6 +230,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         {
           actionName?: string;
+          estimatedCostNanos?: number;
           messages: Array<{ content: string; role: string }>;
           model: string;
           rerunOf?: string;

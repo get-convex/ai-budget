@@ -419,6 +419,11 @@ export const startRequest = mutation({
     tags: v.optional(v.array(vTag)),
     model: v.string(),
     messages: v.array(vMessage),
+    // Reserve this exact amount (nanodollars) instead of the token-based
+    // estimate. Use it whenever the cost is known up front — image generation
+    // (n × per-image), audio, per-call APIs — so a hard cap reserves the real
+    // amount rather than a meaningless token guess.
+    estimatedCostNanos: v.optional(v.number()),
     rerunOf: v.optional(v.id("requests")),
   },
   returns: vStartResult,
@@ -449,6 +454,11 @@ export const startRequest = mutation({
     const month = monthStamp();
     const priceInfo = await getPrice(ctx, args.model);
     const est = estimateUsage(args.messages, priceInfo);
+    // A caller-supplied known cost (image gen, audio, per-call APIs) reserves
+    // the real amount up front; the token estimate stays as the token reserve.
+    if (args.estimatedCostNanos !== undefined && args.estimatedCostNanos >= 0) {
+      est.cost = Math.round(args.estimatedCostNanos);
+    }
     const warnings: string[] = [];
     const notices: string[] = [];
 
