@@ -192,6 +192,33 @@ describe("cost known up front (image gen, per-call APIs)", () => {
   });
 });
 
+describe("async lifecycle (video jobs): begin now, settle later", () => {
+  test("reserveTtlMs is stored, and settle records the real cost", async () => {
+    const t = convexTest(schema, modules);
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 5_000_000_000 });
+    // Reserve $2 for a long job that will settle minutes later.
+    const r = await start(t, {
+      userId: "u",
+      model: "openai/sora",
+      estimatedCostNanos: 2_000_000_000,
+      reserveTtlMs: 30 * 60 * 1000,
+    });
+    expect(r.allowed).toBe(true);
+    const pending = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(pending.status).toBe("pending");
+    expect(pending.reserveTtlMs).toBe(30 * 60 * 1000);
+    // held reservation
+    let u = await userOf(t, "u");
+    expect(u.reservedTotalNanos).toBe(2_000_000_000);
+
+    // …later: the webhook fires and settles the actual cost.
+    await settleWith(t, r.requestId, { costNanos: 1_800_000_000 });
+    u = await userOf(t, "u");
+    expect(u.totalSpendNanos).toBe(1_800_000_000);
+    expect(u.reservedTotalNanos ?? 0).toBe(0);
+  });
+});
+
 describe("durable usage history", () => {
   test("settled spend lands in a per-day usage row", async () => {
     const t = convexTest(schema, modules);

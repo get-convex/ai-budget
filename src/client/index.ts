@@ -306,15 +306,114 @@ export class AIBudget {
   }
 
   /**
-   * Meter ANY LLM call — gateway, a provider SDK, a raw fetch — with the same
-   * budgets, audit log, and cost tracking. Reserves before your `run` (throwing
-   * a ConvexError over a hard cap), runs it, then records the actual usage/cost.
-   * This is the provider-agnostic core; `chat` is sugar over it for the gateway.
+   * Reserve budget for a call WITHOUT running it — the async half of the
+   * lifecycle. Use for long-running jobs (video generation) where the result
+   * arrives minutes later via a poll or webhook: `begin` here, then `settle`
+   * from that later context with the request's `requestId`. Returns the
+   * admission result (does NOT throw over a cap — check `allowed`). Set
+   * `reserveTtlMs` to the job's max duration so the hold isn't reaped mid-flight.
+   */
+  async begin(
+    ctx: RunMutationCtx,
+    opts: {
+      model: string;
+      messages?: Message[];
+      userId?: string;
+      action?: string;
+      tags?: Tag[];
+      /** Reserve this exact amount (nanodollars) when the cost is known up front. */
+      estimatedCostNanos?: number;
+      /** Hold the reservation up to this long (ms) for long async jobs. */
+      reserveTtlMs?: number;
+      rerunOf?: string;
+    }
+  ): Promise<
+    | { allowed: true; requestId: string; warnings: string[]; notices: string[] }
+    | { allowed: false; code: string; reason: string }
+  > {
+    const userId = await resolveUserId(ctx, opts.userId);
+    const actionName = await resolveActionName(ctx, opts.action);
+    const started = await ctx.runMutation(this.component.lib.startRequest, {
+      userId,
+      actionName,
+      tags: opts.tags,
+      model: opts.model,
+      messages: opts.messages ?? [],
+      estimatedCostNanos: opts.estimatedCostNanos,
+      reserveTtlMs: opts.reserveTtlMs,
+      rerunOf: opts.rerunOf as any,
+    });
+    if (started.allowed) {
+      await this.fireBudgetEvents(
+        { userId, action: actionName, tags: opts.tags, requestId: started.requestId },
+        started.warnings,
+        started.notices
+      );
+    } else {
+      await this.fireLimitReached({
+        userId,
+        action: actionName,
+        tags: opts.tags,
+        messages: [started.reason],
+        code: started.code,
+        reason: started.reason,
+      });
+    }
+    return started;
+  }
+
+  /**
+   * Record the actual usage/cost of a `begin`-reserved request and release its
+   * reservation. Idempotent (exactly-once server-side). Pass a raw provider
+   * `usage` (auto-normalized) or explicit token counts, plus optional
+   * `serverToolUses` and an authoritative `costNanos`.
+   */
+  async settle(
+    ctx: RunMutationCtx,
+    args: {
+      requestId: string;
+      responseText?: string;
+      error?: string;
+      usage?: any;
+      promptTokens?: number;
+      completionTokens?: number;
+      cachedTokens?: number;
+      serverToolUses?: Record<string, number>;
+      costNanos?: number;
+      latencyMs?: number;
+    }
+  ): Promise<{ costNanos: number }> {
+    const { requestId, usage, promptTokens, completionTokens, cachedTokens, ...rest } = args;
+    const tokens =
+      promptTokens !== undefined ||
+      completionTokens !== undefined ||
+      cachedTokens !== undefined
+        ? {
+            promptTokens: promptTokens ?? 0,
+            completionTokens: completionTokens ?? 0,
+            cachedTokens: cachedTokens ?? 0,
+          }
+        : usage !== undefined
+          ? extractUsage(usage)
+          : {};
+    return ctx.runMutation(this.component.lib.finishRequest, {
+      requestId: requestId as any,
+      ...tokens,
+      ...rest,
+    });
+  }
+
+  /**
+   * Meter ANY synchronous LLM call — gateway, a provider SDK, a raw fetch — with
+   * the same budgets, audit log, and cost tracking. Reserves before your `run`
+   * (throwing a ConvexError over a hard cap), runs it, then records the actual
+   * usage/cost. The provider-agnostic core; `chat` is sugar over it. (For async
+   * jobs that settle later, use `begin`/`settle` instead.)
    *
    * `run` returns what happened. Pass a raw provider `usage` object (auto-
    * normalized) OR explicit `promptTokens`/`completionTokens`/`cachedTokens`,
-   * plus optional `serverToolUses` (e.g. `{ web_search: 3 }`, priced on top of
-   * tokens) and an authoritative `costNanos` (used verbatim if present).
+   * plus optional `serverToolUses` (e.g. `{ web_search: 3 }`) and an
+   * authoritative `costNanos` (used verbatim if present).
    */
   async meter(
     ctx: RunMutationCtx,
@@ -325,8 +424,7 @@ export class AIBudget {
       action?: string;
       tags?: Tag[];
       rerunOf?: string;
-      /** Reserve this exact amount (nanodollars) instead of the token estimate.
-       *  Use when cost is known up front — image gen (n × per-image), etc. */
+      /** Reserve this exact amount (nanodollars) instead of the token estimate. */
       estimatedCostNanos?: number;
     },
     run: () => Promise<{
@@ -339,43 +437,30 @@ export class AIBudget {
       costNanos?: number;
     }>
   ): Promise<ChatResult> {
-    const userId = await resolveUserId(ctx, opts.userId);
-    const actionName = await resolveActionName(ctx, opts.action);
-    const started = await ctx.runMutation(this.component.lib.startRequest, {
-      userId,
-      actionName,
-      tags: opts.tags,
-      model: opts.model,
-      messages: opts.messages,
-      estimatedCostNanos: opts.estimatedCostNanos,
-      rerunOf: opts.rerunOf as any,
-    });
+    const started = await this.begin(ctx, opts);
     if (!started.allowed) {
-      await this.fireLimitReached({
-        userId,
-        action: actionName,
-        tags: opts.tags,
-        messages: [started.reason],
-        code: started.code,
-        reason: started.reason,
-      });
       throw new ConvexError({
         kind: "AIBudgetLimit",
         code: started.code,
         reason: started.reason,
       });
     }
-    const requestId = started.requestId;
-    const { warnings, notices } = started;
-    await this.fireBudgetEvents(
-      { userId, action: actionName, tags: opts.tags, requestId },
-      warnings,
-      notices
-    );
+    const { requestId, warnings, notices } = started;
     const start = Date.now();
     try {
       const out = await run();
-      // Explicit token fields win; otherwise normalize a raw provider usage.
+      const { costNanos } = await this.settle(ctx, {
+        requestId,
+        responseText: out.text,
+        usage: out.usage,
+        promptTokens: out.promptTokens,
+        completionTokens: out.completionTokens,
+        cachedTokens: out.cachedTokens,
+        serverToolUses: out.serverToolUses,
+        costNanos: out.costNanos,
+        latencyMs: Date.now() - start,
+      });
+      // Re-derive the recorded usage for the return value.
       const usage =
         out.promptTokens !== undefined ||
         out.completionTokens !== undefined ||
@@ -386,24 +471,9 @@ export class AIBudget {
               cachedTokens: out.cachedTokens ?? 0,
             }
           : extractUsage(out.usage);
-      const { costNanos } = await ctx.runMutation(
-        this.component.lib.finishRequest,
-        {
-          requestId,
-          responseText: out.text,
-          ...usage,
-          serverToolUses: out.serverToolUses,
-          costNanos: out.costNanos,
-          latencyMs: Date.now() - start,
-        }
-      );
       return { text: out.text ?? "", requestId, costNanos, warnings, notices, ...usage };
     } catch (e) {
-      await ctx.runMutation(this.component.lib.finishRequest, {
-        requestId,
-        error: String(e),
-        latencyMs: Date.now() - start,
-      });
+      await this.settle(ctx, { requestId, error: String(e), latencyMs: Date.now() - start });
       throw e;
     }
   }
@@ -944,6 +1014,60 @@ export class AIBudget {
     http.route({ path: prefix, method: "GET", handler });
     http.route({ pathPrefix: `${prefix}/`, method: "GET", handler });
     http.route({ pathPrefix: `${prefix}/`, method: "POST", handler });
+  }
+
+  /**
+   * Mount a POST webhook that settles a `begin`-reserved request from a
+   * provider's completion callback (async image/video jobs). You supply
+   * `resolve` — verify the payload's signature and map the provider's job id to
+   * your stored `requestId` + final usage/cost; the helper calls `settle`.
+   * Return `null` to ignore an unrecognized/duplicate callback (HTTP 202).
+   *
+   *   ai.registerWebhook(http, {
+   *     path: "/aibudget/video-done",
+   *     resolve: async (ctx, request, body) => {
+   *       if (!verifySignature(request, body)) return null;
+   *       const job = await lookupJob(ctx, body.id);   // your table: { requestId }
+   *       return { requestId: job.requestId, serverToolUses: { video_seconds: body.seconds } };
+   *     },
+   *   });
+   */
+  registerWebhook(
+    http: HttpRouter,
+    opts: {
+      path?: string;
+      resolve: (
+        ctx: any,
+        request: Request,
+        body: any
+      ) => Promise<
+        | ({ requestId: string } & {
+            responseText?: string;
+            error?: string;
+            usage?: any;
+            promptTokens?: number;
+            completionTokens?: number;
+            cachedTokens?: number;
+            serverToolUses?: Record<string, number>;
+            costNanos?: number;
+          })
+        | null
+      >;
+    }
+  ) {
+    const path = opts.path ?? "/aibudget/webhook";
+    const self = this;
+    http.route({
+      path,
+      method: "POST",
+      handler: httpActionGeneric(async (ctx: any, request: Request) => {
+        const body = await request.json().catch(() => ({}));
+        const settle = await opts.resolve(ctx, request, body);
+        if (!settle) return new Response("ignored", { status: 202 });
+        await self.settle(ctx, settle);
+        return new Response("ok");
+      }),
+    });
   }
 }
 

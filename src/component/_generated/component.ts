@@ -234,6 +234,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           messages: Array<{ content: string; role: string }>;
           model: string;
           rerunOf?: string;
+          reserveTtlMs?: number;
           tags?: Array<{ dimension: string; value: string }>;
           userId: string;
         },

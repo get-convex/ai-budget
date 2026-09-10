@@ -424,6 +424,10 @@ export const startRequest = mutation({
     // (n × per-image), audio, per-call APIs — so a hard cap reserves the real
     // amount rather than a meaningless token guess.
     estimatedCostNanos: v.optional(v.number()),
+    // Hold the reservation this long (ms) before the reconciler may reap it —
+    // for long async jobs (video) that settle minutes later. Extends the 30-min
+    // default floor.
+    reserveTtlMs: v.optional(v.number()),
     rerunOf: v.optional(v.id("requests")),
   },
   returns: vStartResult,
@@ -692,6 +696,7 @@ export const startRequest = mutation({
       model: args.model,
       messages: args.messages,
       rerunOf: args.rerunOf,
+      ...(args.reserveTtlMs !== undefined ? { reserveTtlMs: args.reserveTtlMs } : {}),
       status: "pending",
       estimatedNanos: est.cost,
       estimatedTokens: est.tokens,
@@ -878,14 +883,20 @@ export const reconcile = internalMutation({
       .take(200);
     for (const req of toFold) await foldOne(ctx, req);
 
+    // Reap dead reservations: pending rows older than the default floor, but a
+    // per-request reserveTtlMs (set for long async jobs like video) holds the
+    // reservation until *its* deadline so a still-running job isn't reaped.
     const cutoff = Date.now() - STALE_PENDING_MS;
-    const stale = await ctx.db
+    const candidates = await ctx.db
       .query("requests")
       .withIndex("status", (q) =>
         q.eq("status", "pending").lt("_creationTime", cutoff)
       )
       .take(200);
-    for (const req of stale) {
+    let expired = 0;
+    for (const req of candidates) {
+      const ttl = req.reserveTtlMs ?? STALE_PENDING_MS;
+      if (Date.now() - req._creationTime <= ttl) continue; // still within its window
       await ctx.db.patch(req._id, {
         status: "error",
         error: "Timed out before settling; reservation released",
@@ -893,6 +904,7 @@ export const reconcile = internalMutation({
         settled: false,
       });
       await foldOne(ctx, await ctx.db.get(req._id));
+      expired++;
     }
 
     // Retention: delete terminal, fully-accounted request rows past the window.
@@ -917,7 +929,7 @@ export const reconcile = internalMutation({
         }
       }
     }
-    return { folded: toFold.length, expired: stale.length, purged };
+    return { folded: toFold.length, expired, purged };
   },
 });
 

@@ -135,6 +135,11 @@ export default defineSchema({
     // server-side tool invocations that bill a per-call fee on top of tokens
     // (e.g. { web_search: 3 }). Priced via serverToolPrices at settle.
     serverToolUses: v.optional(v.record(v.string(), v.number())),
+    // How long the reservation may stay held before the reconciler reaps it as
+    // dead (ms). For long async jobs (video generation) set this to the job's
+    // max duration so the hold isn't released mid-flight. Extends the default
+    // 30-min floor; only stored while pending.
+    reserveTtlMs: v.optional(v.number()),
     costNanos: v.optional(v.number()),
     latencyMs: v.optional(v.number()),
     rerunOf: v.optional(v.id("requests")),

@@ -251,6 +251,38 @@ await ai.meter(ctx,
   });
 ```
 
+### `ai.begin` / `ai.settle` — long async jobs (video)
+
+A video job is submit → wait minutes → poll/webhook → done, spanning multiple
+Convex functions, so the synchronous `meter` bracket doesn't fit. Reserve with
+`begin` at submit, `settle` from the later context. Set `reserveTtlMs` to the
+job's max duration so the reconciler doesn't reap the hold mid-flight:
+
+```ts
+// submit (action): reserve, then kick off the job
+const started = await ai.begin(ctx, {
+  userId, model: "openai/sora",
+  estimatedCostNanos: perSecond * seconds,
+  reserveTtlMs: 20 * 60 * 1000,          // hold up to 20 min
+});
+if (!started.allowed) throw new ConvexError(started.reason);
+const job = await sora.videos.create({ … });
+await ctx.db.insert("videoJobs", { requestId: started.requestId, jobId: job.id });
+
+// later — settle from a poll, or a provider webhook:
+ai.registerWebhook(http, {
+  path: "/aibudget/video-done",
+  resolve: async (ctx, request, body) => {
+    if (!verifySignature(request, body)) return null;             // 202, ignored
+    const job = await lookupJob(ctx, body.id);                    // → { requestId }
+    return { requestId: job.requestId, serverToolUses: { video_seconds: body.seconds } };
+  },
+});
+```
+
+`begin` returns the admission result (it doesn't throw — check `allowed`).
+`settle` is idempotent (exactly-once server-side), so a retried webhook is safe.
+
 ### Replay
 
 ```ts
