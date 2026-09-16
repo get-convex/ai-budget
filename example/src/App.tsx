@@ -29,7 +29,7 @@ export default function App() {
   const [userId, setUserId] = useState(PERSONAS[0]);
   const [model, setModel] = useState(MODELS[0]);
   const [tab, setTab] = useState<
-    "requests" | "users" | "actions" | "experiment"
+    "requests" | "users" | "actions" | "experiment" | "burst"
   >("requests");
 
   return (
@@ -105,6 +105,12 @@ export default function App() {
           >
             🧪 Experiment
           </button>
+          <button
+            className={tab === "burst" ? "" : "ghost"}
+            onClick={() => setTab("burst")}
+          >
+            ⚡ Burst
+          </button>
           <Totals />
         </div>
         <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
@@ -114,6 +120,8 @@ export default function App() {
             <Users />
           ) : tab === "actions" ? (
             <Actions />
+          ) : tab === "burst" ? (
+            <Burst userId={userId} model={model} />
           ) : (
             <Experiment userId={userId} />
           )}
@@ -738,6 +746,182 @@ function DiffText({ a, b }: { a: string; b: string }) {
         )
       )}
     </>
+  );
+}
+
+// ---------- burst: concurrent requests vs. one budget ----------
+
+function Burst({ userId, model }: { userId: string; model: string }) {
+  const fire = useAction(api.ai.burst);
+  const [count, setCount] = useState(12);
+  const [budget, setBudget] = useState(0.002); // dollars
+  const [runId, setRunId] = useState<string | null>(null);
+  const [summary, setSummary] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const budgetNanos = Math.round(budget * NANOS);
+
+  // Live, reactive view of this run's requests — pending reservations appear
+  // immediately, then flip to success (real cost) or blocked (reason).
+  const requests =
+    useQuery(
+      api.ai.listRequests,
+      runId ? { dimension: "burst", value: runId } : "skip"
+    ) ?? [];
+  const byIndex = [...requests].sort(
+    (a: any, b: any) => a._creationTime - b._creationTime
+  );
+  const spentNanos = byIndex.reduce(
+    (s: number, r: any) => s + (r.status === "success" ? r.costNanos ?? 0 : 0),
+    0
+  );
+  const reservedNanos = byIndex.reduce(
+    (s: number, r: any) => s + (r.status === "pending" ? r.estimatedNanos ?? 0 : 0),
+    0
+  );
+  const admitted = byIndex.filter((r: any) => r.status !== "blocked").length;
+  const blocked = byIndex.filter((r: any) => r.status === "blocked").length;
+
+  const run = async () => {
+    const id = crypto.randomUUID().slice(0, 8);
+    setRunId(id);
+    setSummary(null);
+    setBusy(true);
+    try {
+      setSummary(
+        await fire({ userId, runId: id, count, budgetNanos, model })
+      );
+    } catch (e: any) {
+      setSummary({ error: String(e?.data?.reason ?? e?.message ?? e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ maxWidth: 1000 }}>
+      <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
+        Fire <b>real concurrent AI requests</b> against one tightly-capped budget.
+        Admission is <b>reserve-then-settle</b> and atomic: each request reserves a
+        pessimistic estimate against the cap in one transaction, so concurrent
+        requests can't all spend the same remaining budget — the ones that fit are
+        admitted, the rest are <b style={{ color: "var(--red)" }}>rejected up front</b>.
+        (A short gpt-4o-mini request reserves ≈$0.0005.)
+      </p>
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 14 }}>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>concurrent requests</label>
+        <input
+          type="number"
+          style={{ width: 56 }}
+          value={count}
+          onChange={(e) => setCount(Number(e.target.value))}
+        />
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>budget $</label>
+        <input
+          type="number"
+          step="0.001"
+          style={{ width: 80 }}
+          value={budget}
+          onChange={(e) => setBudget(Number(e.target.value))}
+        />
+        <button onClick={run} disabled={busy}>
+          {busy ? "⚡ Bursting…" : `⚡ Fire ${count} as ${userId}`}
+        </button>
+        {runId && (
+          <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>
+            run {runId}
+          </span>
+        )}
+      </div>
+
+      {runId && (
+        <>
+          <div style={{ marginBottom: 6, fontSize: 13 }}>
+            <b style={{ color: "var(--green)" }}>{admitted} admitted</b>
+            {" · "}
+            <b style={{ color: "var(--red)" }}>{blocked} rejected</b>
+            {" · settled "}
+            <b>{usd(spentNanos)}</b>
+            {reservedNanos > 0 && <> · reserved {usd(reservedNanos)}</>}
+            {" of "}
+            <b>{usd(budgetNanos)}</b> budget
+          </div>
+          <div
+            title="reserved (holds placed at admission) + settled, vs the cap"
+            style={{
+              background: "var(--panel2)", borderRadius: 6, height: 12,
+              overflow: "hidden", marginBottom: 14, display: "flex",
+            }}
+          >
+            <div style={{
+              width: `${Math.min(100, (spentNanos / budgetNanos) * 100)}%`,
+              background: "var(--green)",
+            }} />
+            <div style={{
+              width: `${Math.min(100, (reservedNanos / budgetNanos) * 100)}%`,
+              background: "var(--accent)",
+            }} />
+          </div>
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+            gap: 10,
+          }}>
+            {byIndex.map((r: any) => (
+              <div
+                key={r._id}
+                style={{
+                  border: `1px solid ${
+                    r.status === "blocked"
+                      ? "var(--red)"
+                      : r.status === "success"
+                        ? "var(--green)"
+                        : "var(--border)"
+                  }`,
+                  borderRadius: 8, padding: 10, fontSize: 12,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span className={`pill ${r.status}`}>{r.status}</span>
+                  <span className="mono" style={{ color: "var(--muted)" }}>
+                    {r.status === "pending"
+                      ? `hold ${usd(r.estimatedNanos)}`
+                      : r.status === "success"
+                        ? usd(r.costNanos)
+                        : ""}
+                  </span>
+                </div>
+                <div style={{ color: "var(--muted)", marginBottom: 4 }}>
+                  {r.messages?.find((m: any) => m.role === "user")?.content}
+                </div>
+                {r.status === "blocked" ? (
+                  <div style={{ color: "var(--red)" }}>🚫 {r.error}</div>
+                ) : r.responseText ? (
+                  <div style={{ whiteSpace: "pre-wrap" }}>{r.responseText}</div>
+                ) : (
+                  <div style={{ color: "var(--muted)" }}>…</div>
+                )}
+              </div>
+            ))}
+          </div>
+          {summary?.error && (
+            <div style={{ color: "var(--red)", marginTop: 10 }}>{summary.error}</div>
+          )}
+          {summary && !summary.error && (
+            <div style={{
+              background: "var(--panel2)", borderRadius: 8, padding: 12,
+              marginTop: 12, fontSize: 13,
+            }}>
+              Done: <b style={{ color: "var(--green)" }}>{summary.admitted}</b> of{" "}
+              {summary.requested} admitted,{" "}
+              <b style={{ color: "var(--red)" }}>{summary.rejected} rejected by the budget</b>
+              {" — total real cost "}
+              <b>{usd(summary.totalCostNanos)}</b> (cap {usd(budgetNanos)} held as
+              reservations; actual spend settles lower).
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 

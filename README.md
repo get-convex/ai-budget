@@ -604,14 +604,19 @@ endpoints verbatim. In production:
 
 `example/` is a full working demo: chat as different personas on the left; a live
 admin panel on the right — the request audit log (inspect → edit → re-run, with
-lineage), a users table (limits, soft toggle, block, bump), and per-action budgets.
+lineage), a users table (limits, soft toggle, block, bump), per-action budgets,
+and a **⚡ Burst** tab that fires N real concurrent AI requests against one
+tightly-capped budget: watch reservations appear live, some requests get
+admitted (with real settled costs), and the rest get atomically rejected by the
+cap — the reserve-then-settle admission design, visible.
 
 ![Users & Limits admin table](docs/users.png)
 ![Actions & Budgets admin table](docs/actions.png)
 
 ```sh
 cd example
-npm install
+npm install         # also links the repo-root node_modules the demo's
+                    # ../../src component imports resolve through (postinstall)
 npx convex dev      # terminal 1 — provisions a dev deployment
 npm run dev         # terminal 2 — Vite app
 ```

@@ -60,6 +60,75 @@ export const summarize = action({
   },
 });
 
+// Fire N REAL concurrent AI requests against a fresh, tightly-capped budget
+// bucket (tag dimension "burst", one value per run). Reserve-then-settle
+// admission is atomic under concurrency: the requests that fit the cap are
+// admitted, the rest are rejected up front — they can't all spend the same
+// remaining budget. Watch it live via listRequests({dimension:"burst"}).
+const BURST_PROMPTS = [
+  "Name a surprising animal fact.",
+  "Give me a two-line haiku about databases.",
+  "What's an underrated pizza topping?",
+  "One-sentence pitch for a time-travel sitcom.",
+  "Best keyboard shortcut nobody knows?",
+  "Describe the color blue to someone who can't see.",
+  "A fortune-cookie fortune for a programmer.",
+  "Why do cats knock things off tables?",
+  "Invent a name for a rock band of accountants.",
+  "One weird tip for remembering names.",
+  "What would a robot order at a coffee shop?",
+  "Sum up the internet in five words.",
+];
+
+export const burst = action({
+  args: {
+    userId: v.string(),
+    runId: v.string(),
+    count: v.number(),
+    budgetNanos: v.number(),
+    model: v.optional(v.string()),
+  },
+  handler: async (ctx, { userId, runId, count, budgetNanos, model }) => {
+    const n = Math.min(Math.max(1, Math.floor(count)), 20);
+    // Cap this run's bucket, then race n real requests against it.
+    await ai.tag("burst").setLimits(ctx, {
+      value: runId,
+      lifetimeSpendLimitNanos: budgetNanos,
+    });
+    const results = await Promise.all(
+      Array.from({ length: n }, (_, i) =>
+        ai
+          .chat(ctx, {
+            userId,
+            model,
+            tags: [{ dimension: "burst", value: runId }],
+            messages: [
+              { role: "system", content: SYSTEM_PROMPT },
+              { role: "user", content: BURST_PROMPTS[i % BURST_PROMPTS.length] },
+            ],
+          })
+          .then(
+            (r) => ({ index: i, ok: true as const, costNanos: r.costNanos, text: r.text }),
+            (e: any) => ({
+              index: i,
+              ok: false as const,
+              reason: String(e?.data?.reason ?? e?.message ?? e),
+            })
+          )
+      )
+    );
+    const admitted = results.filter((r) => r.ok);
+    return {
+      runId,
+      requested: n,
+      admitted: admitted.length,
+      rejected: n - admitted.length,
+      totalCostNanos: admitted.reduce((s, r) => s + (r.ok ? r.costNanos ?? 0 : 0), 0),
+      results,
+    };
+  },
+});
+
 // Run one prompt across a matrix of system-prompt variants × models. Every run
 // is a tracked request (attributed to "ai:experiment"), so cost/tokens are
 // captured per variant for side-by-side comparison and A/B testing.

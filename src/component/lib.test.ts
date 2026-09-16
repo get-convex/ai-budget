@@ -330,6 +330,51 @@ describe("tag-filtered request log", () => {
     expect(acme.length).toBe(1);
     expect(acme[0].userId).toBe("u");
   });
+
+  test("blocked attempts appear in the tag-filtered log", async () => {
+    const t = convexTest(schema, modules);
+    const tags = [{ dimension: "burst", value: "run-1" }];
+    // Cap the tag bucket below one request's reservation so the attempt is
+    // budget-blocked (a persisted rejection).
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "burst",
+      value: "run-1",
+      lifetimeSpendLimitNanos: 1_000,
+    });
+    const r = await start(t, { userId: "u", tags });
+    expect(r.allowed).toBe(false);
+    const log = await t.query(api.lib.listRequests, {
+      dimension: "burst",
+      value: "run-1",
+    });
+    expect(log.length).toBe(1);
+    expect(log[0].status).toBe("blocked");
+  });
+
+  test("persisted blocked attempts don't consume a custom-tag rate limit", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "customer",
+      value: "acme",
+      requestsPerMinute: 1,
+      // also cap spend so attempts get budget-blocked (persisted) first
+      lifetimeSpendLimitNanos: 1_000,
+    });
+    const tags = [{ dimension: "customer", value: "acme" }];
+    // A budget-blocked (persisted) attempt writes a requestTags row…
+    const blocked = await start(t, { userId: "u1", tags });
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.code).toBe("customer_lifetime_spend_limit");
+    // …which must NOT count toward the 1/min rate limit. Lift the spend cap:
+    // with no admitted requests in the window, the next request goes through.
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "customer",
+      value: "acme",
+      lifetimeSpendLimitNanos: 1_000_000_000,
+    });
+    const next = await start(t, { userId: "u2", tags });
+    expect(next.allowed).toBe(true);
+  });
 });
 
 describe("tagged attribution buckets", () => {

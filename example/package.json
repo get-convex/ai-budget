@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:backend": "convex dev"
+    "dev:backend": "convex dev",
+    "postinstall": "node -e \"const fs=require('fs');try{fs.symlinkSync('example/node_modules','../node_modules','junction')}catch(e){if(e.code!=='EEXIST')throw e}\""
   },
   "dependencies": {
     "@convex-dev/agent": "^0.7.1",

@@ -440,7 +440,7 @@ export const startRequest = mutation({
     // bloat the 60s rate-limit window read below.
     const reject = async (code: string, reason: string, persist = true) => {
       if (persist) {
-        await ctx.db.insert("requests", {
+        const requestId = await ctx.db.insert("requests", {
           userId: args.userId,
           actionName: args.actionName,
           ...(extraTags.length ? { tags: extraTags } : {}),
@@ -450,6 +450,15 @@ export const startRequest = mutation({
           status: "blocked" as const,
           error: reason,
         });
+        // Reverse-index the blocked attempt too, so tag-filtered request logs
+        // show rejections alongside admitted traffic.
+        for (const t of extraTags) {
+          await ctx.db.insert("requestTags", {
+            dimension: t.dimension,
+            value: t.value,
+            requestId,
+          });
+        }
       }
       return { allowed: false as const, code, reason };
     };
@@ -545,17 +554,19 @@ export const startRequest = mutation({
           .take(limit + 50);
         recentCount = recent.filter((r) => r.status !== "blocked").length;
       } else {
-        recentCount = (
-          await ctx.db
-            .query("requestTags")
-            .withIndex("dim_value", (q) =>
-              q
-                .eq("dimension", b.dimension)
-                .eq("value", b.value)
-                .gt("_creationTime", rateCutoff)
-            )
-            .take(limit)
-        ).length;
+        // Tag rows also cover persisted blocked attempts; fetch each request
+        // to exclude them, matching the user/action paths above.
+        const tagRows = await ctx.db
+          .query("requestTags")
+          .withIndex("dim_value", (q) =>
+            q
+              .eq("dimension", b.dimension)
+              .eq("value", b.value)
+              .gt("_creationTime", rateCutoff)
+          )
+          .take(limit + 50);
+        const recent = await Promise.all(tagRows.map((t) => ctx.db.get(t.requestId)));
+        recentCount = recent.filter((r) => r !== null && r.status !== "blocked").length;
       }
 
       if (recentCount >= limit) {
