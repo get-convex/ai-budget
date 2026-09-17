@@ -282,6 +282,8 @@ ai.registerWebhook(http, {
 
 `begin` returns the admission result (it doesn't throw — check `allowed`).
 `settle` is idempotent (exactly-once server-side), so a retried webhook is safe.
+The webhook resolver receives the original, unread `Request`, allowing signature
+verification over the exact raw body; the parsed JSON comes from a clone.
 
 ### Replay
 
@@ -314,6 +316,25 @@ different dimensions. Each exposes:
 
 The identifier field is `userId` for `ai.users`, `name` for `ai.actions`, and
 `value` for `ai.tag(d)`. For example: `ai.tag("customer").setLimits(ctx, { value: "acme", … })`.
+
+### Request rate limits
+
+`requestsPerMinute` uses `@convex-dev/rate-limiter` 0.4.0 with a transactional
+**token bucket** for each user, action, or custom tag. A limit of 60 allows an
+initial burst of 60 requests and then refills at one request per second, up to
+60. Zero blocks all requests. Only admitted requests consume capacity: a budget,
+concurrency, or another bucket's rate rejection consumes none.
+
+This replaces the previous rolling 60-second request-log count. On upgrading,
+rate balances start full; historical requests are not imported. Budget balances,
+reservations, and spend history are preserved. Deploy the component update to
+mount its nested Rate Limiter component; applications do not register it separately.
+Changing a rate keeps its existing balance (clamped to the new capacity when
+checked); deleting and recreating a bucket starts a fresh balance.
+
+Rate limits remain transactional. Rate Limiter's asynchronous mode is not enabled
+here because simultaneous admissions must respect every configured bucket.
+Global spend accounting continues to use the existing sharded counter.
 
 ### Setting caps
 
@@ -549,21 +570,26 @@ this design). `ai-budget` instead **reserves then settles**:
    schedules a fold of the real cost into the totals, releasing the reservation —
    so a request is never orphaned mid-flight.
 3. **Reconcile.** A once-a-minute cron folds any stragglers and releases
-   reservations for requests that died before settling. Settlement is
-   **exactly-once** (a terminal request is never re-folded), so a slow request the
-   reconciler already swept can't double-count when it finally returns.
+   expired reservations using indexed deadlines. Expiry releases the hold but
+   leaves billing open: a late completion records its final charge once without
+   releasing the hold again. After content retention, unresolved requests retain
+   a small billing record with prompts and responses removed.
 
-Reservations are taken only on buckets that actually have a cap, so uncapped
-traffic never serializes — this is what makes arbitrary `tags` cheap: a request
-reserves on one row per *capped* dimension it carries, and nothing else.
+Requests record the exact bucket IDs and calendar windows they reserve.
+Settlement cannot release another request's hold, including across midnight or
+month boundaries. Admission reads separate policy documents; only capped buckets
+require reads of accounting state. Reporting updates still share bucket totals,
+but do not write the policy documents used by uncapped admission.
 
 **One admission rule, all scopes.** Every per-bucket cap — user, action, or any
 tag — runs through the *same* admission check: a request is admitted only when
 `committed + reserved + estimate ≤ cap` (bumps included) for **every** bucket it
 touches. Each per-bucket cap reserves on a single document, making concurrent
 admission atomic. The **global** killswitch is backed by a sharded counter for
-throughput, read as an eventually-consistent sum with no cross-request
-reservation, so concurrent global admissions can overshoot under a burst.
+throughput. Its sum is transactional but excludes unfinished and not-yet-folded
+requests and has no cross-request reservation, so global admissions can overshoot.
+Global usage is recorded even when limits are disabled. Historical usage omitted
+by older versions is not automatically reconstructed by this upgrade.
 
 Reservations are estimates, not provider-side maximum charges. If a response uses
 more tokens or costs more than estimated, settlement records the real amount and
@@ -650,6 +676,16 @@ This local component is a proof of the reusable boundary, not part of the
 handles rather than taking a dependency on either sibling component.
 
 ---
+
+
+## Accounting upgrade notes
+
+New request fields are optional for existing deployments. Policy documents are
+created on first admission or limit update; pending requests without deadlines
+are migrated in batches by reconciliation. Existing reservations without ownership
+metadata use their creation period and current capped buckets as a compatibility
+fallback. Exact historical hold ownership cannot be reconstructed if those caps
+changed before the upgrade. New requests always store explicit ownership.
 
 ## Development
 

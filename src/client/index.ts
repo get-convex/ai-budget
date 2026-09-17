@@ -239,6 +239,7 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 /** Limits/controls settable on any budget bucket (user, action, or tag). */
 export type BucketLimits = {
+  /** Token-bucket refill per minute and burst capacity; 0 blocks all requests. */
   requestsPerMinute?: number;
   maxConcurrent?: number;
   dailySpendLimitNanos?: number;
@@ -1061,7 +1062,7 @@ export class AIBudget {
       path,
       method: "POST",
       handler: httpActionGeneric(async (ctx: any, request: Request) => {
-        const body = await request.json().catch(() => ({}));
+        const body = await request.clone().json().catch(() => ({}));
         const settle = await opts.resolve(ctx, request, body);
         if (!settle) return new Response("ignored", { status: 202 });
         await self.settle(ctx, settle);

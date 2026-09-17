@@ -51,4 +51,5 @@ export const internal: FilterApi<
 
 export const components = componentsGeneric() as unknown as {
   shardedCounter: import("@convex-dev/sharded-counter/_generated/component.js").ComponentApi<"shardedCounter">;
+  rateLimiter: import("@convex-dev/rate-limiter/_generated/component.js").ComponentApi<"rateLimiter">;
 };

@@ -7,7 +7,7 @@
     "email": "support@convex.dev",
     "url": "https://github.com/get-convex/ai-budget/issues"
   },
-  "version": "0.0.2-alpha.14",
+  "version": "0.0.2-alpha.15",
   "license": "Apache-2.0",
   "type": "module",
   "keywords": [
@@ -56,7 +56,8 @@
   "types": "./dist/client/index.d.ts",
   "module": "./dist/client/index.js",
   "dependencies": {
-    "@convex-dev/sharded-counter": "^0.2.1"
+    "@convex-dev/sharded-counter": "^0.2.1",
+    "@convex-dev/rate-limiter": "0.4.0"
   },
   "peerDependencies": {
     "@convex-dev/ai-sdk-provider": "*",

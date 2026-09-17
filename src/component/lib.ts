@@ -8,6 +8,7 @@ import {
 import { api, internal, components } from "./_generated/api";
 import { vMessage, vTag } from "./schema";
 import type { Doc } from "./_generated/dataModel";
+import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
 import { ShardedCounter } from "@convex-dev/sharded-counter";
 
 // All money is integer **nanodollars** (1 USD = 1e9 nano). Integers avoid the
@@ -25,6 +26,17 @@ const fmtUsd = (nanos: number) => `$${(nanos / NANOS_PER_DOLLAR).toFixed(4)}`;
 // tags carrying them are ignored in favor of the first-class fields.
 const USER_DIM = "user";
 const ACTION_DIM = "action";
+
+const requestRateLimiter = new RateLimiter(components.rateLimiter);
+const requestRateOptions = (bucket: Doc<"buckets">) => ({
+  key: bucket._id,
+  config: {
+    kind: "token bucket" as const,
+    rate: bucket.requestsPerMinute!,
+    capacity: bucket.requestsPerMinute!,
+    period: MINUTE,
+  },
+});
 
 // Deployment-wide spend totals (nanodollars), sharded for high write throughput.
 // Keyed "total" (lifetime) and "day:<UTC date>" (natural daily reset).
@@ -56,12 +68,8 @@ const DEFAULT_SERVER_TOOL_PRICES: Record<string, number> = {
 // concurrent admission atomic against the estimate; a response that exceeds the
 // estimate can still settle above the cap by the estimation delta.
 const ESTIMATED_OUTPUT_TOKENS = 800;
-// A request still "pending" after this long is presumed dead (its action
-// crashed before settling); the reconciler releases its reservation. Set well
-// above any real call duration — a long reasoning/agent generation that is
-// still billing must not be swept and mis-recorded as free. A late
-// finishRequest is a no-op once swept (see finishRequest's terminal guard), so
-// the only cost of a generous timeout is a briefly-held reservation.
+// Expiry releases a hold without declaring final usage. A late provider
+// completion can still record its authoritative charge exactly once.
 const STALE_PENDING_MS = 30 * 60 * 1000;
 // Default retention for request rows (full prompts + responses). Terminal,
 // fully-accounted rows older than this are swept by the reconciler. Keeps the
@@ -379,6 +387,36 @@ async function getOrCreateBucket(
   return (await ctx.db.get(id))!;
 }
 
+// Policy is read on every admission; reporting writes never touch it.
+async function syncPolicy(ctx: MutationCtx, b: Doc<"buckets">) {
+  const existing = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
+    q.eq("dimension", b.dimension).eq("value", b.value)).unique();
+  const policy = {
+    bucketId: b._id, dimension: b.dimension, value: b.value,
+    requestsPerMinute: b.requestsPerMinute, maxConcurrent: b.maxConcurrent,
+    dailySpendLimitNanos: b.dailySpendLimitNanos, monthlySpendLimitNanos: b.monthlySpendLimitNanos,
+    lifetimeSpendLimitNanos: b.lifetimeSpendLimitNanos, dailyTokenLimit: b.dailyTokenLimit,
+    monthlyTokenLimit: b.monthlyTokenLimit, lifetimeTokenLimit: b.lifetimeTokenLimit,
+    blocked: b.blocked, warnAtPct: b.warnAtPct, enforcement: b.enforcement,
+  };
+  if (existing) await ctx.db.replace(existing._id, policy);
+  else await ctx.db.insert("bucketPolicies", policy);
+}
+
+async function admissionBucket(ctx: MutationCtx, dimension: string, value: string): Promise<Doc<"buckets">> {
+  const policy = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
+    q.eq("dimension", dimension).eq("value", value)).unique();
+  if (!policy) {
+    const bucket = await getOrCreateBucket(ctx, dimension, value);
+    await syncPolicy(ctx, bucket);
+    return bucket;
+  }
+  // Only capped buckets need an atomic read of their accounting state.
+  if (needsReserve(policy)) return (await ctx.db.get(policy.bucketId))!;
+  return { ...policy, _id: policy.bucketId, totalSpendNanos: 0, totalRequests: 0,
+    totalTokens: 0, dayStamp: "", spendTodayNanos: 0 };
+}
+
 async function getSettings(ctx: MutationCtx) {
   return await ctx.db
     .query("settings")
@@ -432,12 +470,15 @@ export const startRequest = mutation({
   },
   returns: vStartResult,
   handler: async (ctx, args) => {
+    if (args.reserveTtlMs !== undefined && (!Number.isFinite(args.reserveTtlMs) || args.reserveTtlMs < 0)) {
+      throw new Error("reserveTtlMs must be finite and nonnegative");
+    }
     const extraTags = sanitizeExtraTags(args.tags);
     // Record the blocked attempt and return a rejection (throwing would roll
     // back the record). `persist` is false for the high-frequency-by-design
     // rejections (rate limit, blocked user) that a client retries in a tight
     // loop — persisting those would grow the requests table without bound and
-    // bloat the 60s rate-limit window read below.
+    // add audit-log writes to every transient rejection.
     const reject = async (code: string, reason: string, persist = true) => {
       if (persist) {
         const requestId = await ctx.db.insert("requests", {
@@ -497,7 +538,7 @@ export const startRequest = mutation({
     const bucketTags = requestBuckets(args.userId, args.actionName, extraTags);
     const buckets: Doc<"buckets">[] = [];
     for (const t of bucketTags) {
-      buckets.push(await getOrCreateBucket(ctx, t.dimension, t.value));
+      buckets.push(await admissionBucket(ctx, t.dimension, t.value));
     }
 
     // A hard block on ANY bucket rejects the request. The user dimension's block
@@ -527,49 +568,16 @@ export const startRequest = mutation({
       }
     }
 
-    // Enforce the rolling 60-second rate limit on every configured dimension.
-    // User/action requests use their first-class indexes; custom dimensions use
-    // the requestTags reverse index. All reads are bounded by the configured
-    // limit (plus a small allowance for persisted blocked attempts).
-    const rateCutoff = Date.now() - 60_000;
+    // Check all rates before consuming any. These transactional reads remain
+    // in admission's read set, so concurrent requests cannot spend the same
+    // capacity. Budget rejections below leave every rate balance untouched.
     for (const b of buckets) {
       const limit = b.requestsPerMinute;
       if (limit === undefined) continue;
-
-      let recentCount: number;
-      if (b.dimension === USER_DIM) {
-        const recent = await ctx.db
-          .query("requests")
-          .withIndex("userId", (q) =>
-            q.eq("userId", b.value).gt("_creationTime", rateCutoff)
-          )
-          .take(limit + 50);
-        recentCount = recent.filter((r) => r.status !== "blocked").length;
-      } else if (b.dimension === ACTION_DIM) {
-        const recent = await ctx.db
-          .query("requests")
-          .withIndex("actionName", (q) =>
-            q.eq("actionName", b.value).gt("_creationTime", rateCutoff)
-          )
-          .take(limit + 50);
-        recentCount = recent.filter((r) => r.status !== "blocked").length;
-      } else {
-        // Tag rows also cover persisted blocked attempts; fetch each request
-        // to exclude them, matching the user/action paths above.
-        const tagRows = await ctx.db
-          .query("requestTags")
-          .withIndex("dim_value", (q) =>
-            q
-              .eq("dimension", b.dimension)
-              .eq("value", b.value)
-              .gt("_creationTime", rateCutoff)
-          )
-          .take(limit + 50);
-        const recent = await Promise.all(tagRows.map((t) => ctx.db.get(t.requestId)));
-        recentCount = recent.filter((r) => r !== null && r.status !== "blocked").length;
-      }
-
-      if (recentCount >= limit) {
+      const ok = limit > 0 && (await requestRateLimiter.check(
+        ctx, "requests", requestRateOptions(b)
+      )).ok;
+      if (!ok) {
         const code = b.dimension === USER_DIM ? "rate_limit" : `${b.dimension}_rate_limit`;
         return reject(
           code,
@@ -633,9 +641,8 @@ export const startRequest = mutation({
     // committed + reserved + estimate <= cap. The ONE difference is the holder:
     // per-bucket caps reserve on a single row (an atomic check-and-reserve),
     // while the global holder is a sharded counter for
-    // throughput — its committed total is read as an eventually-consistent sum
-    // with no cross-request reservation, so a hard global cap can overshoot by a
-    // bounded amount under burst. That's the deliberate consistency/throughput
+    // throughput. The sum is transactional, but excludes unsettled usage and
+    // has no cross-request reservation, so a hard global cap can overshoot. That's the deliberate consistency/throughput
     // trade for a deployment-wide killswitch; it's the only approximate scope.
     if (
       settings &&
@@ -675,6 +682,18 @@ export const startRequest = mutation({
       notices.push(...globalEval.notices);
     }
 
+    // Consume only after every admission check succeeds, in the same
+    // transaction as the reservations and request insert. An unexpected
+    // rejection throws to roll back all previously consumed dimensions.
+    for (const b of buckets) {
+      if (b.requestsPerMinute !== undefined) {
+        await requestRateLimiter.limit(ctx, "requests", {
+          ...requestRateOptions(b),
+          throws: true,
+        });
+      }
+    }
+
     // Passed — reserve, but ONLY on buckets that actually have a cap. Writing an
     // uncapped bucket's row here would serialize every request that shares it
     // (e.g. all callers of one action, or every request in one env); with no cap
@@ -709,6 +728,10 @@ export const startRequest = mutation({
       rerunOf: args.rerunOf,
       ...(args.reserveTtlMs !== undefined ? { reserveTtlMs: args.reserveTtlMs } : {}),
       status: "pending",
+      expiresAt: Date.now() + Math.max(STALE_PENDING_MS, args.reserveTtlMs ?? 0),
+      heldBucketIds: buckets.filter(needsReserve).map(b => b._id),
+      reservationDay: today,
+      reservationMonth: month,
       estimatedNanos: est.cost,
       estimatedTokens: est.tokens,
       ...(priceInfo.known ? {} : { unpricedModel: true }),
@@ -750,14 +773,9 @@ export const finishRequest = mutation({
     const request = await ctx.db.get(args.requestId);
     if (!request) throw new Error("Unknown request");
 
-    // Exactly-once settlement. A request that already reached a terminal state
-    // — finished normally, or expired by the reconciler's stale sweep — must
-    // not be settled again. Without this, a merely-slow request that the sweep
-    // already folded would be re-opened and folded a SECOND time when it
-    // finally completes: totals double-count and the reservation is released
-    // twice, dropping the reserved pool below reality and letting the atomic
-    // check-and-reserve admit requests it should block.
-    if (request.status !== "pending") {
+    // Expiry releases capacity, but is not evidence that the provider charged
+    // nothing. Accept one final result even after expiry; duplicates stay no-ops.
+    if (request.status !== "pending" && !request.reservationExpired) {
       return { costNanos: request.costNanos ?? 0 };
     }
 
@@ -788,6 +806,9 @@ export const finishRequest = mutation({
     // orphaned in "pending" even if the totals update below fails and retries.
     await ctx.db.patch(args.requestId, {
       status: args.error ? "error" : "success",
+      reservationExpired: false,
+      expiresAt: undefined,
+      finishedAt: Date.now(),
       responseText: args.responseText,
       error: args.error,
       promptTokens,
@@ -808,62 +829,66 @@ export const finishRequest = mutation({
   },
 });
 
-// Fold one finished request into every attributed bucket's running totals,
-// releasing its reservation. Idempotent: guarded by `settled` so the scheduler
-// and the cron reconciler can never double-count.
+// Release only holds owned by this request, and only from their original
+// calendar windows. A previous day's completion must not debit today's holds.
+async function releaseReservation(ctx: MutationCtx, req: Doc<"requests">) {
+  if (req.reservationReleased) return;
+  const day = req.reservationDay ?? new Date(req._creationTime).toISOString().slice(0, 10);
+  const month = req.reservationMonth ?? day.slice(0, 7);
+  const cost = req.estimatedNanos ?? 0;
+  const tokens = req.estimatedTokens ?? 0;
+  for (const t of requestBuckets(req.userId, req.actionName, req.tags)) {
+    const b = await getBucketDoc(ctx, t.dimension, t.value);
+    if (!b || (req.heldBucketIds ? !req.heldBucketIds.includes(b._id) : !needsReserve(b))) continue;
+    await ctx.db.patch(b._id, {
+      reservedTodayNanos: Math.max(0, (b.reservedTodayNanos ?? 0) - (b.dayStamp === day ? cost : 0)),
+      reservedMonthNanos: Math.max(0, (b.reservedMonthNanos ?? 0) - (b.monthStamp === month ? cost : 0)),
+      reservedTotalNanos: Math.max(0, (b.reservedTotalNanos ?? 0) - cost),
+      reservedTodayTokens: Math.max(0, (b.reservedTodayTokens ?? 0) - (b.dayStamp === day ? tokens : 0)),
+      reservedMonthTokens: Math.max(0, (b.reservedMonthTokens ?? 0) - (b.monthStamp === month ? tokens : 0)),
+      reservedTotalTokens: Math.max(0, (b.reservedTotalTokens ?? 0) - tokens),
+      pendingCount: Math.max(0, (b.pendingCount ?? 0) - 1),
+    });
+  }
+  await ctx.db.patch(req._id, { reservationReleased: true });
+}
+
+// Final billing is folded once. Reservation release has its own guard because
+// expiry can precede the final charge by hours or days.
 async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   if (!req || req.settled !== false) return;
+  await releaseReservation(ctx, req);
   const actual = req.costNanos ?? 0;
-  const estCost = req.estimatedNanos ?? 0;
   const tokens = (req.promptTokens ?? 0) + (req.completionTokens ?? 0);
-  const estTokens = req.estimatedTokens ?? 0;
-  const today = dayStamp();
-  const month = monthStamp();
-
-  // Accrue into every attributed bucket (user, action, and each tag) — capped
-  // or not. Buckets that never held a reservation have their reserved fields
-  // clamped at 0 by Math.max, so subtracting an estimate is a harmless no-op.
-  // Also write the durable per-(bucket, day/month) usage rows that survive
-  // request retention, so spend history outlives the raw request log.
+  const timestamp = new Date(req.finishedAt ?? Date.now()).toISOString();
+  const day = timestamp.slice(0, 10);
+  const month = timestamp.slice(0, 7);
   for (const t of requestBuckets(req.userId, req.actionName, req.tags)) {
     const b = await getOrCreateBucket(ctx, t.dimension, t.value);
-    const sameDay = b.dayStamp === today;
-    const sameMonth = b.monthStamp === month;
+    // Keep the newest reporting window and clear obsolete window holds when
+    // advancing it. Lifetime holds persist until their owner releases them.
+    const targetDay = b.dayStamp > day ? b.dayStamp : day;
+    const targetMonth = (b.monthStamp ?? "") > month ? b.monthStamp! : month;
     await ctx.db.patch(b._id, {
       totalSpendNanos: b.totalSpendNanos + actual,
       totalRequests: b.totalRequests + 1,
       totalTokens: b.totalTokens + tokens,
-      dayStamp: today,
-      monthStamp: month,
-      spendTodayNanos: (sameDay ? b.spendTodayNanos : 0) + actual,
-      tokensToday: (sameDay ? b.tokensToday ?? 0 : 0) + tokens,
-      spendThisMonthNanos: (sameMonth ? b.spendThisMonthNanos ?? 0 : 0) + actual,
-      tokensThisMonth: (sameMonth ? b.tokensThisMonth ?? 0 : 0) + tokens,
-      reservedTodayNanos: Math.max(0, (sameDay ? b.reservedTodayNanos ?? 0 : 0) - estCost),
-      reservedMonthNanos: Math.max(0, (sameMonth ? b.reservedMonthNanos ?? 0 : 0) - estCost),
-      reservedTotalNanos: Math.max(0, (b.reservedTotalNanos ?? 0) - estCost),
-      reservedTodayTokens: Math.max(0, (sameDay ? b.reservedTodayTokens ?? 0 : 0) - estTokens),
-      reservedMonthTokens: Math.max(0, (sameMonth ? b.reservedMonthTokens ?? 0 : 0) - estTokens),
-      reservedTotalTokens: Math.max(0, (b.reservedTotalTokens ?? 0) - estTokens),
-      pendingCount: Math.max(0, (b.pendingCount ?? 0) - 1),
+      dayStamp: targetDay,
+      monthStamp: targetMonth,
+      spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0) + (day === targetDay ? actual : 0),
+      tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0) + (day === targetDay ? tokens : 0),
+      spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0) + (month === targetMonth ? actual : 0),
+      tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0) + (month === targetMonth ? tokens : 0),
+      ...(b.dayStamp !== targetDay ? { reservedTodayNanos: 0, reservedTodayTokens: 0 } : {}),
+      ...(b.monthStamp !== targetMonth ? { reservedMonthNanos: 0, reservedMonthTokens: 0 } : {}),
     });
-    await addUsage(ctx, t.dimension, t.value, "day", today, actual, tokens, 1);
+    await addUsage(ctx, t.dimension, t.value, "day", day, actual, tokens, 1);
     await addUsage(ctx, t.dimension, t.value, "month", month, actual, tokens, 1);
   }
-
-  // Deployment-wide totals via the sharded counter (only when a global cap is
-  // configured — otherwise skip the writes entirely). Distributed across shards,
-  // so this does not serialize on a single row.
+  // Reporting is independent of whether enforcement is configured.
   if (actual > 0) {
-    const settings = await getSettings(ctx);
-    if (
-      settings &&
-      (settings.globalDailySpendLimitNanos !== undefined ||
-        settings.globalLifetimeSpendLimitNanos !== undefined)
-    ) {
-      await globalSpend.add(ctx, GLOBAL_TOTAL, actual);
-      await globalSpend.add(ctx, globalDayKey(today), actual);
-    }
+    await globalSpend.add(ctx, GLOBAL_TOTAL, actual);
+    await globalSpend.add(ctx, globalDayKey(day), actual);
   }
   await ctx.db.patch(req._id, { settled: true });
 }
@@ -894,29 +919,23 @@ export const reconcile = internalMutation({
       .take(200);
     for (const req of toFold) await foldOne(ctx, req);
 
-    // Reap dead reservations: pending rows older than the default floor, but a
-    // per-request reserveTtlMs (set for long async jobs like video) holds the
-    // reservation until *its* deadline so a still-running job isn't reaped.
-    const cutoff = Date.now() - STALE_PENDING_MS;
-    const candidates = await ctx.db
-      .query("requests")
-      .withIndex("status", (q) =>
-        q.eq("status", "pending").lt("_creationTime", cutoff)
-      )
-      .take(200);
-    let expired = 0;
-    for (const req of candidates) {
-      const ttl = req.reserveTtlMs ?? STALE_PENDING_MS;
-      if (Date.now() - req._creationTime <= ttl) continue; // still within its window
-      await ctx.db.patch(req._id, {
-        status: "error",
-        error: "Timed out before settling; reservation released",
-        costNanos: 0,
-        settled: false,
-      });
-      await foldOne(ctx, await ctx.db.get(req._id));
-      expired++;
+    // Lazily migrate old pending rows in bounded batches. Once indexed, long
+    // TTL jobs cannot hide expired jobs behind them in creation-time order.
+    const legacy = await ctx.db.query("requests").withIndex("status_expires", q =>
+      q.eq("status", "pending").eq("expiresAt", undefined)).take(200);
+    for (const req of legacy) {
+      await ctx.db.patch(req._id, { expiresAt: req._creationTime + Math.max(STALE_PENDING_MS, req.reserveTtlMs ?? 0) });
     }
+    const candidates = await ctx.db.query("requests").withIndex("status_expires", q =>
+      q.eq("status", "pending").gt("expiresAt", 0).lte("expiresAt", Date.now())).take(200);
+    for (const req of candidates) {
+      await releaseReservation(ctx, req);
+      await ctx.db.patch(req._id, {
+        status: "error", error: "Reservation expired; awaiting final usage",
+        reservationExpired: true, expiresAt: undefined, settled: true,
+      });
+    }
+    const expired = candidates.length;
 
     // Retention: delete terminal, fully-accounted request rows past the window.
     const settings = await getSettings(ctx);
@@ -924,20 +943,26 @@ export const reconcile = internalMutation({
     let purged = 0;
     if (retentionMs > 0) {
       const retentionCutoff = Date.now() - retentionMs;
-      const old = await ctx.db
-        .query("requests")
-        .withIndex("by_creation_time", (q) =>
-          q.lt("_creationTime", retentionCutoff)
-        )
-        .take(500);
+      // Query eligible states directly. Long-lived pending jobs and expired
+      // billing tombstones must not repeatedly occupy the front of a scan.
+      const old = [];
+      for (const expiredFlag of [undefined, false]) {
+        old.push(...await ctx.db.query("requests").withIndex("retention", q =>
+          q.eq("reservationExpired", expiredFlag).eq("settled", true)
+            .lt("_creationTime", retentionCutoff)).take(200));
+      }
+      old.push(...await ctx.db.query("requests").withIndex("status", q =>
+        q.eq("status", "blocked").lt("_creationTime", retentionCutoff)).take(100));
       for (const req of old) {
-        // Only rows that are done and accounted: folded (settled === true) or a
-        // blocked attempt (never needs folding). Never a pending/unfolded row.
-        if (req.settled === true || req.status === "blocked") {
-          await deleteRequestTags(ctx, req._id);
-          await ctx.db.delete(req._id);
-          purged++;
-        }
+        await deleteRequestTags(ctx, req._id);
+        await ctx.db.delete(req._id);
+        purged++;
+      }
+      const expiredContent = await ctx.db.query("requests").withIndex("expired_content", q =>
+        q.eq("reservationExpired", true).eq("contentPurged", undefined)
+          .lt("_creationTime", retentionCutoff)).take(200);
+      for (const req of expiredContent) {
+        await ctx.db.patch(req._id, { messages: [], responseText: undefined, contentPurged: true });
       }
     }
     return { folded: toFold.length, expired, purged };
@@ -1090,9 +1115,14 @@ export const setBucketLimits = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    if (args.requestsPerMinute !== undefined &&
+        (!Number.isSafeInteger(args.requestsPerMinute) || args.requestsPerMinute < 0)) {
+      throw new Error("requestsPerMinute must be a nonnegative safe integer");
+    }
     const bucket = await getOrCreateBucket(ctx, args.dimension, args.value);
     const { dimension: _d, value: _v, ...limits } = args;
     await ctx.db.patch(bucket._id, limits);
+    await syncPolicy(ctx, (await ctx.db.get(bucket._id))!);
     return null;
   },
 });
@@ -1234,11 +1264,23 @@ export const deleteBucket = mutation({
         return { deletedThisBatch: rows.length, done: false };
       }
       const bucket = await getBucketDoc(ctx, dimension, value);
-      if (bucket) await ctx.db.delete(bucket._id);
+      if (bucket) {
+        const policy = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
+          q.eq("dimension", dimension).eq("value", value)).unique();
+        if (policy) await ctx.db.delete(policy._id);
+        await requestRateLimiter.reset(ctx, "requests", { key: bucket._id });
+        await ctx.db.delete(bucket._id);
+      }
       return { deletedThisBatch: rows.length + (bucket ? 1 : 0), done: true };
     }
     const bucket = await getBucketDoc(ctx, dimension, value);
-    if (bucket) await ctx.db.delete(bucket._id);
+    if (bucket) {
+      const policy = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
+          q.eq("dimension", dimension).eq("value", value)).unique();
+        if (policy) await ctx.db.delete(policy._id);
+        await requestRateLimiter.reset(ctx, "requests", { key: bucket._id });
+      await ctx.db.delete(bucket._id);
+    }
     return { deletedThisBatch: bucket ? 1 : 0, done: true };
   },
 });

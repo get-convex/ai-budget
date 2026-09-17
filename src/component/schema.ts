@@ -12,6 +12,25 @@ export const vMessage = v.object({
 export const vTag = v.object({ dimension: v.string(), value: v.string() });
 
 export default defineSchema({
+  bucketPolicies: defineTable({
+    bucketId: v.id("buckets"),
+    dimension: v.string(),
+    value: v.string(),
+    requestsPerMinute: v.optional(v.number()), // token-bucket refill per minute and burst capacity
+    maxConcurrent: v.optional(v.number()), // max in-flight (pending) requests
+    dailySpendLimitNanos: v.optional(v.number()),
+    monthlySpendLimitNanos: v.optional(v.number()),
+    lifetimeSpendLimitNanos: v.optional(v.number()),
+    dailyTokenLimit: v.optional(v.number()),
+    monthlyTokenLimit: v.optional(v.number()),
+    lifetimeTokenLimit: v.optional(v.number()),
+    blocked: v.optional(v.boolean()), // hard block (was `blocked`/`disabled`)
+    // Fire an approaching-limit alert once usage crosses this fraction of a cap
+    // (e.g. 0.8 = warn at 80%). Falls back to the deployment default.
+    warnAtPct: v.optional(v.number()),
+    // "hard" (default): exceeding a budget blocks. "soft": warn but allow.
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
+  }).index("dim_value", ["dimension", "value"]),
   // A budget holder, keyed by (dimension, value). Unifies what used to be the
   // `users` and `actions` tables — those are just the "user" and "action"
   // dimensions now. Any tag a request carries can have its own budget here.
@@ -19,7 +38,7 @@ export default defineSchema({
     dimension: v.string(),
     value: v.string(),
     // limits (all optional — unlimited by default)
-    requestsPerMinute: v.optional(v.number()), // rolling limit for this bucket
+    requestsPerMinute: v.optional(v.number()), // token-bucket refill per minute and burst capacity
     maxConcurrent: v.optional(v.number()), // max in-flight (pending) requests
     dailySpendLimitNanos: v.optional(v.number()),
     monthlySpendLimitNanos: v.optional(v.number()),
@@ -109,6 +128,14 @@ export default defineSchema({
     tags: v.optional(v.array(vTag)),
     model: v.string(),
     // pessimistic holds placed at start; reconciled to actual on settle
+    heldBucketIds: v.optional(v.array(v.id("buckets"))),
+    reservationDay: v.optional(v.string()),
+    reservationMonth: v.optional(v.string()),
+    reservationReleased: v.optional(v.boolean()),
+    reservationExpired: v.optional(v.boolean()),
+    contentPurged: v.optional(v.boolean()),
+    expiresAt: v.optional(v.number()),
+    finishedAt: v.optional(v.number()),
     estimatedNanos: v.optional(v.number()),
     estimatedTokens: v.optional(v.number()),
     // true when the model had no known/override price and was charged the
@@ -146,6 +173,9 @@ export default defineSchema({
   })
     .index("userId", ["userId"])
     .index("status", ["status"])
+    .index("status_expires", ["status", "expiresAt"])
+    .index("retention", ["reservationExpired", "settled"])
+    .index("expired_content", ["reservationExpired", "contentPurged"])
     .index("rerunOf", ["rerunOf"])
     .index("actionName", ["actionName"])
     .index("settled", ["settled"]),
