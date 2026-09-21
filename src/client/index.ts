@@ -71,6 +71,8 @@ export type BudgetEventInfo = {
 export type SoftLimitInfo = BudgetEventInfo & { warnings: string[] };
 export type AIBudgetOptions = {
   defaultModel?: string;
+  /** Default model for `decisions()` (the Decisions/"Jev" endpoint). */
+  defaultEvalModel?: string;
   /**
    * A *soft* limit was exceeded (request still allowed). Lets you surface budget
    * warnings even on the languageModel/Agent path where they can't be returned.
@@ -141,6 +143,17 @@ export type ChatResult = {
   warnings: string[];
   /** Approaching-cap notices (empty unless a warnAtPct threshold was crossed). */
   notices: string[];
+};
+
+/** The tracked result of a `decisions()` call: budgeting metadata plus the
+ * structured answers from the Decisions ("Jev") endpoint. */
+export type DecisionResult = Omit<ChatResult, "text"> & {
+  /** Structured answers keyed by your question names (shape depends on each
+   * question type: `choice`, `score`, or `boolean`). */
+  answers: Record<string, any>;
+  /** The raw gateway response, including provider-specific fields (e.g.
+   * `confidence`) under `response.body`. */
+  response?: any;
 };
 
 // ---------- helpers ----------
@@ -262,6 +275,7 @@ export type BumpArgs = {
 
 export class AIBudget {
   public defaultModel: string;
+  public defaultEvalModel: string;
   private onSoftLimit?: AIBudgetOptions["onSoftLimit"];
   private onThreshold?: AIBudgetOptions["onThreshold"];
   private onLimitReached?: AIBudgetOptions["onLimitReached"];
@@ -270,6 +284,7 @@ export class AIBudget {
     options?: AIBudgetOptions
   ) {
     this.defaultModel = options?.defaultModel ?? "openai/gpt-4o-mini";
+    this.defaultEvalModel = options?.defaultEvalModel ?? "typesafe/jev-1.13";
     this.onSoftLimit = options?.onSoftLimit;
     this.onThreshold = options?.onThreshold;
     this.onLimitReached = options?.onLimitReached;
@@ -532,6 +547,103 @@ export class AIBudget {
         };
       }
     );
+  }
+
+  /**
+   * Budget a structured decision through the AI Gateway's Decisions ("Jev")
+   * endpoint — sugar over `meter`. Evaluates typed `questions` (choice / score /
+   * boolean) about the `state` you provide, with the same reserve→settle
+   * limits, audit log, cost tracking, and per-tag attribution as `chat`. Call
+   * from an action. `userId` defaults to the authenticated caller.
+   *
+   * Requires `@convex-dev/ai-sdk-provider` >= 0.2.1 and an `ai` version that
+   * exposes `experimental_evaluate` (AI SDK 7's evaluation interface); both are
+   * imported lazily, so consumers who never call `decisions()` are unaffected.
+   *
+   *   const { answers } = await ai.decisions(ctx, {
+   *     state: { ticket: "Customer cannot sign in" },
+   *     questions: {
+   *       priority: { type: "choice", instructions: "...", criteria: { urgent: "...", normal: "..." } },
+   *       needsReview: { type: "boolean", instructions: "..." },
+   *     },
+   *   });
+   *   answers.priority.choice; // "urgent" | "normal"
+   */
+  async decisions(
+    ctx: RunMutationCtx,
+    args: {
+      /** The evaluation model. Defaults to `defaultEvalModel` ("typesafe/jev-1.13"). */
+      model?: string;
+      /** Context the questions are evaluated against (a string or an object). */
+      state: unknown;
+      /** Typed questions (choice / score / boolean) keyed by name. */
+      questions: Record<string, unknown>;
+      /** Whom to bill. Defaults to the authenticated user (ctx.auth). */
+      userId?: string;
+      /** Attribute spend to this action name. Defaults to the calling action. */
+      action?: string;
+      /** Extra attribution dimensions to bill/limit (team, customer, env, …). */
+      tags?: Tag[];
+      /** Reserve this exact amount (nanodollars) up front — the decision cost
+       * isn't known before the call, so a hard cap is only exact with this. */
+      estimatedCostNanos?: number;
+      rerunOf?: string;
+      /** Cancel the underlying request. */
+      abortSignal?: AbortSignal;
+    }
+  ): Promise<DecisionResult> {
+    const model = args.model ?? this.defaultEvalModel;
+    // `evaluate` is an experimental, version-gated export; import it lazily and
+    // untyped so consumers on an older `ai` (who never call this) aren't broken.
+    const evaluate = ((await import("ai")) as any).experimental_evaluate;
+    if (typeof evaluate !== "function") {
+      throw new Error(
+        "ai-budget: decisions() needs `experimental_evaluate` from the `ai` " +
+          "package (AI SDK 7's evaluation interface). Upgrade `ai` to a " +
+          "version that exports it."
+      );
+    }
+    // Likewise, `evaluationModel` exists on @convex-dev/ai-sdk-provider >= 0.2.1.
+    const evaluationModel = (convexGateway as any).evaluationModel;
+    if (typeof evaluationModel !== "function") {
+      throw new Error(
+        "ai-budget: decisions() needs `convexGateway.evaluationModel` from " +
+          "@convex-dev/ai-sdk-provider >= 0.2.1. Upgrade the provider."
+      );
+    }
+    let decision: any;
+    const result = await this.meter(
+      ctx,
+      {
+        model,
+        // Store the structured request for audit/replay.
+        messages: [
+          {
+            role: "user",
+            content: JSON.stringify({ state: args.state, questions: args.questions }),
+          },
+        ],
+        userId: args.userId,
+        action: args.action,
+        tags: args.tags,
+        estimatedCostNanos: args.estimatedCostNanos,
+        rerunOf: args.rerunOf,
+      },
+      async () => {
+        decision = await evaluate({
+          model: evaluationModel(model),
+          state: args.state,
+          questions: args.questions,
+          ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+        });
+        return {
+          usage: decision?.usage,
+          costNanos: extractGatewayCostNanos(decision),
+        };
+      }
+    );
+    const { text: _text, ...tracking } = result;
+    return { ...tracking, answers: decision?.answers ?? {}, response: decision?.response };
   }
 
   /**

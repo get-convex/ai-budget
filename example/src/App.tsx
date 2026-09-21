@@ -29,7 +29,7 @@ export default function App() {
   const [userId, setUserId] = useState(PERSONAS[0]);
   const [model, setModel] = useState(MODELS[0]);
   const [tab, setTab] = useState<
-    "requests" | "users" | "actions" | "experiment" | "burst"
+    "requests" | "users" | "actions" | "experiment" | "burst" | "jev"
   >("requests");
 
   return (
@@ -111,6 +111,7 @@ export default function App() {
           >
             ⚡ Burst
           </button>
+          <button className={tab === "jev" ? "" : "ghost"} onClick={() => setTab("jev")}>Jev</button>
           <Totals />
         </div>
         <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
@@ -120,6 +121,8 @@ export default function App() {
             <Users />
           ) : tab === "actions" ? (
             <Actions />
+          ) : tab === "jev" ? (
+            <Jev userId={userId} />
           ) : tab === "burst" ? (
             <Burst userId={userId} model={model} />
           ) : (
@@ -1249,4 +1252,24 @@ function Matrix({ userId }: { userId: string }) {
       </div>
     </div>
   );
+}
+
+function Jev({ userId }: { userId: string }) {
+  const classify = useAction(api.jev.classify);
+  const [text, setText] = useState("I was charged twice for my subscription. Please refund the duplicate payment.");
+  const [result, setResult] = useState("");
+  const [busy, setBusy] = useState(false);
+  return <section>
+    <h2>Jev · structured decisions</h2>
+    <p>Classify a support request as billing, technical, or other. Usage is recorded against {userId}'s budget and appears in Requests.</p>
+    <textarea aria-label="Support request" value={text} maxLength={4000} onChange={e => setText(e.target.value)} style={{ width: "100%", minHeight: 100 }} />
+    <button disabled={busy || !text.trim()} onClick={async () => {
+      setBusy(true);
+      setResult("");
+      try { setResult(JSON.stringify(await classify({ userId, text }), null, 2)); }
+      catch (e) { setResult(String(e)); }
+      finally { setBusy(false); }
+    }}>{busy ? "Classifying…" : "Test Jev"}</button>
+    <pre style={{ whiteSpace: "pre-wrap" }} aria-live="polite">{result}</pre>
+  </section>;
 }

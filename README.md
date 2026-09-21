@@ -23,7 +23,7 @@ full audit log you can replay later.
 - [Setup](#setup)
 - [Quickstart](#quickstart)
 - [Concepts](#concepts) — dimensions, nanodollars, reserve→settle
-- [Generating text](#generating-text) — `chat`, `languageModel`, replay
+- [Generating text](#generating-text) — `chat`, `languageModel`, `meter`, `decisions`, replay
 - [Budgets & limits](#budgets--limits) — set caps, bumps, credits, alerts
 - [Monitoring](#monitoring) — totals, spend history, the request log
 - [Deployment-wide controls](#deployment-wide-controls) — global cap, model policy, pricing, retention
@@ -250,6 +250,35 @@ await ai.meter(ctx,
     return { serverToolUses: { image: n } };   // priced via setServerTool({ tool: "image", … })
   });
 ```
+
+### `ai.decisions` — structured decisions (Jev)
+
+Budget the gateway's Decisions endpoint ([Jev](https://docs.typesafe.ai)) — typed
+`choice` / `score` / `boolean` questions evaluated against a `state` — with the
+same limits, audit log, cost tracking, and tags as `ai.chat`:
+
+```ts
+const { answers, costNanos } = await ai.decisions(ctx, {
+  state: { ticket: "Customer cannot sign in" },
+  questions: {
+    priority: {
+      type: "choice",
+      instructions: "Choose the response priority",
+      criteria: { urgent: "Respond now", normal: "Respond today" },
+    },
+    needsReview: { type: "boolean", instructions: "Does a human need to review this?" },
+  },
+  tags: [{ dimension: "team", value: "support" }],
+});
+answers.priority.choice;        // "urgent" | "normal"
+answers.needsReview.probability;
+```
+
+Sugar over `ai.meter`, so cost is the gateway's authoritative amount. Model
+defaults to `defaultEvalModel` (`"typesafe/jev-1.13"`). Requires
+`@convex-dev/ai-sdk-provider` ≥ 0.2.1 and an `ai` version with
+`experimental_evaluate` — both imported lazily, so callers who don't use
+`decisions` are unaffected.
 
 ### `ai.begin` / `ai.settle` — long async jobs (video)
 
