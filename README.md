@@ -584,19 +584,29 @@ import { AIBudget } from "@convex-dev/ai-budget";
 const ai = new AIBudget(components.aiBudget);
 const http = httpRouter();
 
-ai.registerRoutes(http, {
-  // Gate it — the endpoint is public. Recommended: check the caller is an admin.
-  authorize: async (ctx) => (await ctx.auth.getUserIdentity())?.role === "admin",
-});
+// Recommended: token mode. Set AI_BUDGET_DASHBOARD_TOKEN in the deployment env;
+// open the dashboard with ?token=<it> once and the page keeps using it.
+ai.registerRoutes(http);
 
 export default http;
 ```
 
 It lives at `https://<deployment>.convex.site/aibudget` (override with `path`).
-**It is a public internet endpoint, so you must gate it**: pass `authorize`
-(return `true` to allow) or set `AI_BUDGET_DASHBOARD_TOKEN` (sent as
-`Authorization: Bearer …`). With neither, every route returns 401. Everything the
-page shows is backed by the component's own functions — nothing else to wire up.
+**It is a public internet endpoint, so you must gate it**, one of two ways:
+
+- **Token (recommended, works end-to-end):** set the `AI_BUDGET_DASHBOARD_TOKEN`
+  env var. Open `…/aibudget?token=<token>` once; the page strips it from the URL
+  and sends it as a bearer on every API call. `?token=` is accepted only on the
+  page navigation, and the compare is constant-time.
+- **`authorize(ctx, request)` callback:** must authenticate from something the
+  **browser sends on a top-level navigation** — a cookie or a header *you*
+  control — because a page load carries no `Authorization` bearer. `ctx.auth`
+  (deployment JWT) is `null` for the HTML page, so `authorize: (ctx) => (await
+  ctx.auth.getUserIdentity())?.role === "admin"` will 401 the page. Use it only
+  when you have your own session cookie to check.
+
+With neither configured, every route returns 401. Everything the page shows is
+backed by the component's own functions — nothing else to wire up.
 
 ---
 
@@ -640,6 +650,19 @@ Reservations are estimates, not provider-side maximum charges. If a response use
 more tokens or costs more than estimated, settlement records the real amount and
 the final total can exceed a hard cap by that request's estimation delta. The next
 admission sees the settled total and blocks until there is headroom again.
+
+**Throughput characteristics (know these before you turn on a global cap).**
+Reconciliation runs as small, independently-rescheduling phases, so folding,
+expiry, and retention can't stall each other and each drains its own backlog.
+Two shared-write hot spots remain, by design:
+- The **global cap** reads a sharded counter *inside* admission, which contends
+  with every fold that writes it — so a configured global cap adds contention on
+  the hot path. It's a deployment-wide killswitch, not a high-throughput per-call
+  limit; prefer per-bucket caps for the common case.
+- **Settlement writes every attributed bucket**, including the per-request
+  `action` bucket that every call shares. That single row is written by every
+  settle, so an extremely high single-action settle rate can lag totals. Spread
+  load across naturally-sharded dimensions (per user/customer) where you can.
 
 The `error.md` file documents the adversarial audits this design survived, with
 live repros.

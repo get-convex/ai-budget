@@ -172,13 +172,20 @@ function extractUsage(usage: any): {
   cachedTokens: number;
 } {
   return {
-    // Cover AI SDK camelCase (v5/v7) AND raw OpenAI-compatible snake_case, so a
-    // `meter` caller passing a raw provider `usage` object still gets counts.
+    // Cover AI SDK camelCase (v5/v7), raw OpenAI-compatible snake_case, AND raw
+    // Anthropic (`input_tokens`/`output_tokens`), so a `meter` caller passing any
+    // provider's raw `usage` object still gets counts.
     promptTokens: toTokenCount(
-      usage?.inputTokens ?? usage?.promptTokens ?? usage?.prompt_tokens
+      usage?.inputTokens ??
+        usage?.promptTokens ??
+        usage?.prompt_tokens ??
+        usage?.input_tokens
     ),
     completionTokens: toTokenCount(
-      usage?.outputTokens ?? usage?.completionTokens ?? usage?.completion_tokens
+      usage?.outputTokens ??
+        usage?.completionTokens ??
+        usage?.completion_tokens ??
+        usage?.output_tokens
     ),
     // cached prompt tokens. The Convex gateway reports these at
     // `usage.inputTokenDetails.cacheReadTokens`; the other paths cover AI SDK v5
@@ -188,7 +195,8 @@ function extractUsage(usage: any): {
         usage?.cachedInputTokens ??
         usage?.promptTokensDetails?.cachedTokens ??
         usage?.prompt_tokens_details?.cached_tokens ??
-        usage?.cached_tokens
+        usage?.cached_tokens ??
+        usage?.cache_read_input_tokens
     ),
   };
 }
@@ -214,6 +222,12 @@ function extractGatewayCostNanos(result: any): number | undefined {
 
 const NANOS_PER_DOLLAR = 1e9;
 
+// Cap stored prompt/response content so one row can't approach Convex's 1 MiB
+// document limit (which would fail the call) or bloat the reconciler's scans.
+const MAX_STORED_CONTENT = 32 * 1024;
+const capContent = (s: string) =>
+  s.length > MAX_STORED_CONTENT ? s.slice(0, MAX_STORED_CONTENT) + "…[truncated]" : s;
+
 // Flatten an AI SDK prompt (roles + content parts) into simple storable messages.
 function simplifyPrompt(prompt: any): Message[] {
   if (!Array.isArray(prompt)) return [];
@@ -223,14 +237,20 @@ function simplifyPrompt(prompt: any): Message[] {
       content = m.content;
     } else if (Array.isArray(m.content)) {
       content = m.content
-        .map((part: any) =>
-          part?.type === "text" ? part.text : JSON.stringify(part)
-        )
+        .map((part: any) => {
+          if (part?.type === "text") return part.text ?? "";
+          // NEVER inline a base64 image/file part — a data URL or Uint8Array here
+          // becomes megabytes, pushing the stored row past the 1 MiB doc limit
+          // (failing the call) and turning a 200 KB image into a ~50k-token
+          // estimate. Store a compact placeholder.
+          const bytes = part?.data?.length ?? part?.image?.length ?? part?.data?.byteLength;
+          return `[${part?.type ?? "part"}${typeof bytes === "number" ? ` ${bytes}b` : ""}]`;
+        })
         .join("");
     } else {
       content = JSON.stringify(m.content);
     }
-    return { role: String(m.role), content };
+    return { role: String(m.role), content: capContent(content) };
   });
 }
 
@@ -781,7 +801,7 @@ export class AIBudget {
               }));
             const tapped = result.stream.pipeThrough(
               new TransformStream({
-                async transform(chunk: any, controller) {
+                async transform(chunk: any, controller: any) {
                   if (chunk?.type === "text-delta") {
                     text += chunk.delta ?? chunk.textDelta ?? "";
                   }
@@ -797,7 +817,22 @@ export class AIBudget {
                 async flush() {
                   await settle();
                 },
-              })
+                // A cancelled/aborted stream (client disconnect, AbortSignal, or
+                // breaking out of `for await`) does NOT run `flush`. Without this
+                // the request would sit pending until the 30-min reservation
+                // expiry and be recorded as $0 though the provider charged for
+                // what streamed. Settle here with the text so far, estimating the
+                // completion tokens when the provider gave no usage.
+                // `cancel` is a newer Streams-spec transformer hook not yet in
+                // the TS DOM lib types; cast the literal so it compiles (runtimes
+                // without it simply won't call it, and the reconciler backstops).
+                async cancel(reason: any) {
+                  if (usage === undefined && text) {
+                    usage = { outputTokens: Math.ceil(text.length / 4) };
+                  }
+                  await settle(`cancelled: ${String(reason)}`);
+                },
+              } as any)
             );
             return { ...result, stream: tapped };
           } catch (e) {

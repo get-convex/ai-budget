@@ -46,6 +46,10 @@ function assertFraction(n: number | undefined, name: string) {
 // mapping NaN/Infinity/garbage to 0 rather than poisoning downstream totals.
 const safeCount = (n: number | undefined) =>
   Number.isFinite(n) ? Math.max(0, Math.floor(n as number)) : 0;
+// Treat a non-finite stored accounting field as 0, so a bucket that was poisoned
+// before validation existed self-heals on its next reserve/release instead of
+// staying NaN forever.
+const fin = (n: number | undefined) => (Number.isFinite(n) ? (n as number) : 0);
 
 // Built-in attribution dimensions. `user` and `action` are always populated
 // from a request's userId/actionName; apps can add any other dimensions
@@ -103,6 +107,16 @@ const STALE_PENDING_MS = 30 * 60 * 1000;
 // audit table — and the sensitive content in it — from growing without bound.
 // Override per-deployment via setRetention.
 const DEFAULT_RETENTION_MS = 60 * 60 * 1000; // 1 hour
+// Reconciliation runs as small, independently-rescheduling phases. Keeping the
+// batch small bounds the bytes read per transaction (each request row can carry
+// prompts/responses) so a burst can't push one phase past Convex's 8 MiB / 16k-
+// doc read limit and stall the whole reconciler. A phase that fills its batch
+// reschedules itself immediately, so throughput still scales with backlog.
+const RECONCILE_BATCH = 50;
+// Keep an expired billing tombstone (content already purged) this long so a very
+// late provider charge can still land against it, then delete it. A finish after
+// deletion is a graceful no-op.
+const LATE_SETTLE_HORIZON_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 const dayStamp = () => new Date().toISOString().slice(0, 10); // "2026-09-04"
 const monthStamp = () => new Date().toISOString().slice(0, 7); // "2026-09"
@@ -118,12 +132,17 @@ const CACHE_DISCOUNT = 0.1;
 // bills real money. Charging the conservative max instead keeps the caps honest
 // (over-counting is the safe direction); admins can pin an exact price via
 // setPrice, which also clears the `unpricedModel` flag on future requests.
+// Seed with a true frontier ceiling ($20/$100 per Mtok), not just the max of the
+// small built-in table — otherwise premium models (Opus-class $15/$75, etc.) not
+// in the table would be under-counted several-fold whenever the gateway's
+// authoritative cost isn't available. Over-counting an unpriced model is the safe
+// direction; admins pin the exact rate with setPrice.
 const CONSERVATIVE_PRICE = Object.values(DEFAULT_PRICES).reduce(
   (m, p) => ({
     input: Math.max(m.input, p.input),
     output: Math.max(m.output, p.output),
   }),
-  { input: 0, output: 0 }
+  { input: 20_000_000_000, output: 100_000_000_000 }
 );
 
 async function getPrice(ctx: MutationCtx, model: string) {
@@ -500,6 +519,11 @@ export const startRequest = mutation({
     if (args.reserveTtlMs !== undefined && (!Number.isFinite(args.reserveTtlMs) || args.reserveTtlMs < 0)) {
       throw new Error("reserveTtlMs must be finite and nonnegative");
     }
+    // Infinity/NaN here is catastrophic: it's reserved onto the bucket, and a
+    // later release computes `Infinity - Infinity = NaN`, leaving the reserved
+    // fields NaN forever — after which every `used > cap` check is `NaN > cap`
+    // (false) and the bucket admits unlimited spend. Reject it up front.
+    assertAmount(args.estimatedCostNanos, "estimatedCostNanos");
     const extraTags = sanitizeExtraTags(args.tags);
     // Record the blocked attempt and return a rejection (throwing would roll
     // back the record). `persist` is false for the high-frequency-by-design
@@ -830,13 +854,21 @@ export const finishRequest = mutation({
       costNanos = Math.round(args.costNanos);
     } else {
       const settings = await getSettings(ctx);
-      costNanos =
+      const priced =
         settleCost(
           promptTokens,
           cachedTokens,
           completionTokens,
           await getPrice(ctx, request.model)
         ) + serverToolCost(args.serverToolUses, settings?.serverToolPrices);
+      // Fail closed: if the settle carried NO usable cost signal — no tokens and
+      // no priced server-tool fee (an unpriced tool like `video_seconds`, or a
+      // bare settle()) — fall back to the reserved estimate rather than recording
+      // $0. Known-cost calls (image/video/audio) set estimatedCostNanos at
+      // reserve time precisely so this floor is their real cost. A caller that
+      // truly wants $0 passes an explicit authoritative costNanos: 0 above.
+      const noSignal = promptTokens === 0 && completionTokens === 0 && priced === 0;
+      costNanos = noSignal ? (request.estimatedNanos ?? 0) : priced;
     }
 
     // Durable write to the request's OWN row only — uncontended, so it always
@@ -879,13 +911,13 @@ async function releaseReservation(ctx: MutationCtx, req: Doc<"requests">) {
     const b = await getBucketDoc(ctx, t.dimension, t.value);
     if (!b || (req.heldBucketIds ? !req.heldBucketIds.includes(b._id) : !needsReserve(b))) continue;
     await ctx.db.patch(b._id, {
-      reservedTodayNanos: Math.max(0, (b.reservedTodayNanos ?? 0) - (b.dayStamp === day ? cost : 0)),
-      reservedMonthNanos: Math.max(0, (b.reservedMonthNanos ?? 0) - (b.monthStamp === month ? cost : 0)),
-      reservedTotalNanos: Math.max(0, (b.reservedTotalNanos ?? 0) - cost),
-      reservedTodayTokens: Math.max(0, (b.reservedTodayTokens ?? 0) - (b.dayStamp === day ? tokens : 0)),
-      reservedMonthTokens: Math.max(0, (b.reservedMonthTokens ?? 0) - (b.monthStamp === month ? tokens : 0)),
-      reservedTotalTokens: Math.max(0, (b.reservedTotalTokens ?? 0) - tokens),
-      pendingCount: Math.max(0, (b.pendingCount ?? 0) - 1),
+      reservedTodayNanos: Math.max(0, fin(b.reservedTodayNanos) - (b.dayStamp === day ? cost : 0)),
+      reservedMonthNanos: Math.max(0, fin(b.reservedMonthNanos) - (b.monthStamp === month ? cost : 0)),
+      reservedTotalNanos: Math.max(0, fin(b.reservedTotalNanos) - cost),
+      reservedTodayTokens: Math.max(0, fin(b.reservedTodayTokens) - (b.dayStamp === day ? tokens : 0)),
+      reservedMonthTokens: Math.max(0, fin(b.reservedMonthTokens) - (b.monthStamp === month ? tokens : 0)),
+      reservedTotalTokens: Math.max(0, fin(b.reservedTotalTokens) - tokens),
+      pendingCount: Math.max(0, fin(b.pendingCount) - 1),
     });
   }
   await ctx.db.patch(req._id, { reservationReleased: true });
@@ -943,29 +975,52 @@ export const foldTotals = internalMutation({
 // Backstop for both failure modes: folds finished requests whose scheduled fold
 // lost the retry race, and releases reservations for requests that never
 // settled (their action crashed). Runs on a cron.
+// Cron entry: kick off each reconciliation phase as its OWN transaction so a
+// failure in one (e.g. an oversized retention scan) can't stall the others, and
+// so the hot fold path doesn't share a transaction with retention. Each phase
+// self-reschedules while it has a full batch of backlog.
 export const reconcile = internalMutation({
   args: {},
-  returns: v.object({
-    folded: v.number(),
-    expired: v.number(),
-    purged: v.number(),
-  }),
+  returns: v.null(),
+  handler: async (ctx) => {
+    await ctx.scheduler.runAfter(0, internal.lib.foldPhase, {});
+    await ctx.scheduler.runAfter(0, internal.lib.expirePhase, {});
+    await ctx.scheduler.runAfter(0, internal.lib.retentionPhase, {});
+    return null;
+  },
+});
+
+// Fold finished-but-unfolded requests whose scheduled fold lost the OCC race.
+export const foldPhase = internalMutation({
+  args: {},
+  returns: v.object({ folded: v.number() }),
   handler: async (ctx) => {
     const toFold = await ctx.db
       .query("requests")
       .withIndex("settled", (q) => q.eq("settled", false))
-      .take(200);
+      .take(RECONCILE_BATCH);
     for (const req of toFold) await foldOne(ctx, req);
+    if (toFold.length === RECONCILE_BATCH)
+      await ctx.scheduler.runAfter(0, internal.lib.foldPhase, {});
+    return { folded: toFold.length };
+  },
+});
 
+// Release reservations for requests that never settled (their action crashed),
+// and lazily backfill deadlines on legacy pending rows.
+export const expirePhase = internalMutation({
+  args: {},
+  returns: v.object({ expired: v.number() }),
+  handler: async (ctx) => {
     // Lazily migrate old pending rows in bounded batches. Once indexed, long
     // TTL jobs cannot hide expired jobs behind them in creation-time order.
     const legacy = await ctx.db.query("requests").withIndex("status_expires", q =>
-      q.eq("status", "pending").eq("expiresAt", undefined)).take(200);
+      q.eq("status", "pending").eq("expiresAt", undefined)).take(RECONCILE_BATCH);
     for (const req of legacy) {
       await ctx.db.patch(req._id, { expiresAt: req._creationTime + Math.max(STALE_PENDING_MS, req.reserveTtlMs ?? 0) });
     }
     const candidates = await ctx.db.query("requests").withIndex("status_expires", q =>
-      q.eq("status", "pending").gt("expiresAt", 0).lte("expiresAt", Date.now())).take(200);
+      q.eq("status", "pending").gt("expiresAt", 0).lte("expiresAt", Date.now())).take(RECONCILE_BATCH);
     for (const req of candidates) {
       await releaseReservation(ctx, req);
       await ctx.db.patch(req._id, {
@@ -973,37 +1028,58 @@ export const reconcile = internalMutation({
         reservationExpired: true, expiresAt: undefined, settled: true,
       });
     }
-    const expired = candidates.length;
+    if (legacy.length === RECONCILE_BATCH || candidates.length === RECONCILE_BATCH)
+      await ctx.scheduler.runAfter(0, internal.lib.expirePhase, {});
+    return { expired: candidates.length };
+  },
+});
 
-    // Retention: delete terminal, fully-accounted request rows past the window.
+// Delete terminal, fully-accounted request rows past the retention window; purge
+// content from expired tombstones; and finally delete tombstones past the
+// late-settle horizon so they can't accumulate forever.
+export const retentionPhase = internalMutation({
+  args: {},
+  returns: v.object({ purged: v.number() }),
+  handler: async (ctx) => {
     const settings = await getSettings(ctx);
     const retentionMs = settings?.retentionMs ?? DEFAULT_RETENTION_MS;
+    if (retentionMs <= 0) return { purged: 0 };
+    const retentionCutoff = Date.now() - retentionMs;
     let purged = 0;
-    if (retentionMs > 0) {
-      const retentionCutoff = Date.now() - retentionMs;
-      // Query eligible states directly. Long-lived pending jobs and expired
-      // billing tombstones must not repeatedly occupy the front of a scan.
-      const old = [];
-      for (const expiredFlag of [undefined, false]) {
-        old.push(...await ctx.db.query("requests").withIndex("retention", q =>
-          q.eq("reservationExpired", expiredFlag).eq("settled", true)
-            .lt("_creationTime", retentionCutoff)).take(200));
-      }
-      old.push(...await ctx.db.query("requests").withIndex("status", q =>
-        q.eq("status", "blocked").lt("_creationTime", retentionCutoff)).take(100));
-      for (const req of old) {
+    let more = false;
+    const sweep = async (rows: Doc<"requests">[]) => {
+      for (const req of rows) {
         await deleteRequestTags(ctx, req._id);
         await ctx.db.delete(req._id);
         purged++;
       }
-      const expiredContent = await ctx.db.query("requests").withIndex("expired_content", q =>
-        q.eq("reservationExpired", true).eq("contentPurged", undefined)
-          .lt("_creationTime", retentionCutoff)).take(200);
-      for (const req of expiredContent) {
-        await ctx.db.patch(req._id, { messages: [], responseText: undefined, contentPurged: true });
-      }
+      if (rows.length === RECONCILE_BATCH) more = true;
+    };
+    // Settled, non-expired terminal rows past the window.
+    for (const expiredFlag of [undefined, false] as const) {
+      await sweep(await ctx.db.query("requests").withIndex("retention", q =>
+        q.eq("reservationExpired", expiredFlag).eq("settled", true)
+          .lt("_creationTime", retentionCutoff)).take(RECONCILE_BATCH));
     }
-    return { folded: toFold.length, expired, purged };
+    // Blocked attempts past the window.
+    await sweep(await ctx.db.query("requests").withIndex("status", q =>
+      q.eq("status", "blocked").lt("_creationTime", retentionCutoff)).take(RECONCILE_BATCH));
+    // Expired billing tombstones past the late-settle horizon (content already
+    // gone). Without this they'd live forever (one per crashed request).
+    const tombstoneCutoff = Date.now() - Math.max(retentionMs, LATE_SETTLE_HORIZON_MS);
+    await sweep(await ctx.db.query("requests").withIndex("retention", q =>
+      q.eq("reservationExpired", true).eq("settled", true)
+        .lt("_creationTime", tombstoneCutoff)).take(RECONCILE_BATCH));
+    // Strip PII from expired tombstones still inside the horizon.
+    const expiredContent = await ctx.db.query("requests").withIndex("expired_content", q =>
+      q.eq("reservationExpired", true).eq("contentPurged", undefined)
+        .lt("_creationTime", retentionCutoff)).take(RECONCILE_BATCH);
+    for (const req of expiredContent) {
+      await ctx.db.patch(req._id, { messages: [], responseText: undefined, contentPurged: true });
+    }
+    if (expiredContent.length === RECONCILE_BATCH) more = true;
+    if (more) await ctx.scheduler.runAfter(0, internal.lib.retentionPhase, {});
+    return { purged };
   },
 });
 

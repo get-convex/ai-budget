@@ -185,9 +185,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
-          dailySpendLimitNanos?: number;
-          enforcement?: "hard" | "soft";
-          lifetimeSpendLimitNanos?: number;
+          dailySpendLimitNanos?: number | null;
+          enforcement?: "hard" | "soft" | null;
+          lifetimeSpendLimitNanos?: number | null;
         },
         null,
         Name

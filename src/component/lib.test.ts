@@ -554,8 +554,9 @@ describe("F-04 fail-closed pricing", () => {
     expect(r.allowed).toBe(true);
     await settle(t, r.requestId, 1_000_000, 1_000_000);
     const u = await userOf(t, "u");
-    // conservative = max over table = {$3 in, $15 out}/Mtok => $18 = 18e9 nano.
-    expect(u.totalSpendNanos).toBe(18_000_000_000);
+    // Conservative fallback is a frontier ceiling of {$20 in, $100 out}/Mtok, so
+    // 1M in + 1M out => $120 = 120e9 nano (over-count is the safe direction).
+    expect(u.totalSpendNanos).toBe(120_000_000_000);
     const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
     expect(req.unpricedModel).toBe(true);
   });
@@ -598,7 +599,7 @@ describe("accounting lifecycle regressions", () => {
       await setUserLimits(t, "u", { dailySpendLimitNanos: 1000 });
       const job = await start(t, { userId: "u", estimatedCostNanos: 100 });
       vi.advanceTimersByTime(2 * 60 * 60_000);
-      await t.mutation(internal.lib.reconcile, {});
+      await t.mutation(internal.lib.expirePhase, {});
       expect((await userOf(t, "u")).reservedTotalNanos).toBe(0);
       await start(t, { userId: "u", estimatedCostNanos: 100 });
       await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 75 });
@@ -625,7 +626,7 @@ describe("accounting lifecycle regressions", () => {
       });
       const short = await start(t, { userId: "short" });
       vi.advanceTimersByTime(31 * 60_000);
-      const result = await t.mutation(internal.lib.reconcile, {});
+      const result = await t.mutation(internal.lib.expirePhase, {});
       expect(result.expired).toBe(1);
       expect((await t.run(ctx => ctx.db.get(short.requestId))).reservationExpired).toBe(true);
     } finally { vi.useRealTimers(); }
@@ -664,9 +665,11 @@ test("legacy pending rows acquire deadlines without starving newer expired work"
     });
     const job = await start(t, { userId: "new" });
     vi.advanceTimersByTime(31 * 60_000);
-    expect((await t.mutation(internal.lib.reconcile, {})).expired).toBe(1);
+    expect((await t.mutation(internal.lib.expirePhase, {})).expired).toBe(1);
     expect((await t.run(ctx => ctx.db.get(job.requestId))).reservationExpired).toBe(true);
-    await t.mutation(internal.lib.reconcile, {});
+    // The phase self-reschedules to backfill the remaining legacy rows in
+    // batches; drain those scheduled continuations.
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
     expect(await t.run(ctx => ctx.db.query("requests").withIndex("status_expires", q =>
       q.eq("status", "pending").eq("expiresAt", undefined)).take(1))).toHaveLength(0);
   } finally { vi.useRealTimers(); }
@@ -685,7 +688,7 @@ test("retention progresses past unresolved jobs", async () => {
     await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 0 });
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
     vi.advanceTimersByTime(2 * 60 * 60_000);
-    expect((await t.mutation(internal.lib.reconcile, {})).purged).toBe(1);
+    expect((await t.mutation(internal.lib.retentionPhase, {})).purged).toBe(1);
     expect(await t.run(ctx => ctx.db.get(job.requestId))).toBeNull();
   } finally { vi.useRealTimers(); }
 });
@@ -789,5 +792,55 @@ describe("v1 hardening", () => {
     await expect(
       setUserLimits(t, "u", { dailySpendLimitNanos: Infinity })
     ).rejects.toThrow(/dailySpendLimitNanos/);
+  });
+});
+
+describe("v1 hardening (round 2)", () => {
+  test("a non-finite estimatedCostNanos is rejected before it can poison a bucket", async () => {
+    const t = initTest();
+    for (const estimatedCostNanos of [Infinity, NaN, -1]) {
+      await expect(
+        start(t, { userId: "u", estimatedCostNanos })
+      ).rejects.toThrow(/estimatedCostNanos/);
+    }
+  });
+
+  test("a settle with no cost signal falls back to the reserved estimate, not $0", async () => {
+    const t = initTest();
+    // $2 reserved up front (e.g. a video job).
+    const r = await start(t, { userId: "u", estimatedCostNanos: 2_000_000_000 });
+    // Settle with an unpriced server tool and no tokens/authoritative cost.
+    const out = await t.mutation(api.lib.finishRequest, {
+      requestId: r.requestId,
+      serverToolUses: { video_seconds: 8 }, // no configured price
+    });
+    expect(out.costNanos).toBe(2_000_000_000); // NOT 0
+    vi.useFakeTimers();
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    vi.useRealTimers();
+    const u = await userOf(t, "u");
+    expect(u.totalSpendNanos).toBe(2_000_000_000);
+  });
+});
+
+describe("v1 hardening (round 3): reconcile phases", () => {
+  test("expired tombstones are deleted after the late-settle horizon", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = initTest();
+      const job = await start(t, { userId: "u", estimatedCostNanos: 100 });
+      vi.advanceTimersByTime(31 * 60_000);
+      // Expire it into a billing tombstone (reservationExpired + settled).
+      await t.mutation(internal.lib.expirePhase, {});
+      // Within the 7-day late-settle horizon: retention keeps the tombstone.
+      await t.mutation(internal.lib.retentionPhase, {});
+      expect(await t.run((ctx) => ctx.db.get(job.requestId))).not.toBeNull();
+      // Past the horizon: the tombstone is deleted so they can't accumulate.
+      vi.advanceTimersByTime(8 * 24 * 60 * 60_000);
+      await t.mutation(internal.lib.retentionPhase, {});
+      expect(await t.run((ctx) => ctx.db.get(job.requestId))).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
