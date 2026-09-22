@@ -332,8 +332,8 @@ describe("per-bucket rate limits", () => {
     const t = initTest();
     await setUserLimits(t, "u", { requestsPerMinute: 0 });
     expect((await start(t, { userId: "u" })).code).toBe("rate_limit");
-    for (const requestsPerMinute of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
-      await expect(setUserLimits(t, "u", { requestsPerMinute })).rejects.toThrow("nonnegative safe integer");
+    for (const requestsPerMinute of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity]) {
+      await expect(setUserLimits(t, "u", { requestsPerMinute })).rejects.toThrow(/requestsPerMinute/);
     }
   });
 
@@ -533,15 +533,17 @@ describe("model policy", () => {
 });
 
 describe("D-02 pricing validation", () => {
-  test("setPrice rejects negative rates", async () => {
+  test("setPrice rejects negative and non-finite rates", async () => {
     const t = initTest();
-    await expect(
-      t.mutation(api.lib.setPrice, {
-        model: "x/y",
-        inputNanosPerMTok: -1,
-        outputNanosPerMTok: 5,
-      })
-    ).rejects.toThrow(/non-negative/);
+    for (const inputNanosPerMTok of [-1, NaN, Infinity, 0.5]) {
+      await expect(
+        t.mutation(api.lib.setPrice, {
+          model: "x/y",
+          inputNanosPerMTok,
+          outputNanosPerMTok: 5,
+        })
+      ).rejects.toThrow(/inputNanosPerMTok/);
+    }
   });
 });
 
@@ -706,4 +708,86 @@ test("delayed folding attributes spend to completion day and leaves newer holds 
     expect(history[0].stamp).toBe("2026-09-30");
     expect(history[0].spendNanos).toBe(50);
   } finally { vi.useRealTimers(); }
+});
+
+describe("v1 hardening", () => {
+  test("setGlobalLimits: a one-field update preserves the other global limits", async () => {
+    const t = initTest();
+    await t.mutation(api.lib.setGlobalLimits, {
+      dailySpendLimitNanos: 100,
+      lifetimeSpendLimitNanos: 500,
+      enforcement: "soft",
+    });
+    // Update ONLY the daily cap — must not wipe lifetime/enforcement.
+    await t.mutation(api.lib.setGlobalLimits, { dailySpendLimitNanos: 200 });
+    const g = await t.query(api.lib.getGlobalStatus, {});
+    expect(g.dailySpendLimitNanos).toBe(200);
+    expect(g.lifetimeSpendLimitNanos).toBe(500);
+    expect(g.enforcement).toBe("soft");
+    // Explicit null clears just that field.
+    await t.mutation(api.lib.setGlobalLimits, { lifetimeSpendLimitNanos: null });
+    const after = await t.query(api.lib.getGlobalStatus, {});
+    expect(after.lifetimeSpendLimitNanos).toBe(null);
+    expect(after.dailySpendLimitNanos).toBe(200);
+  });
+
+  test("finishRequest on a missing/deleted request is a graceful no-op", async () => {
+    const t = initTest();
+    const r = await start(t, { userId: "u" });
+    await t.mutation(api.lib.deleteBucket, { dimension: "user", value: "u" });
+    // The request row is gone; a late/duplicate webhook must not throw.
+    const out = await t.mutation(api.lib.finishRequest, {
+      requestId: r.requestId,
+      costNanos: 1_000_000,
+    });
+    expect(out.costNanos).toBe(0);
+  });
+
+  test("deleting a user releases holds it placed on a shared bucket", async () => {
+    const t = initTest();
+    // A shared action bucket with a cap, so requests reserve against it.
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "action",
+      value: "shared",
+      lifetimeSpendLimitNanos: 1_000_000_000,
+    });
+    // A pending (unsettled) request from user "u" attributed to that action.
+    await start(t, { userId: "u", actionName: "shared" });
+    let action = await bucketOf(t, "action", "shared");
+    expect(action.reservedTotalNanos).toBeGreaterThan(0);
+    expect(action.pendingCount).toBe(1);
+    // Deleting the user must free the shared bucket's hold, not strand it.
+    await t.mutation(api.lib.deleteBucket, { dimension: "user", value: "u" });
+    action = await bucketOf(t, "action", "shared");
+    expect(action.reservedTotalNanos ?? 0).toBe(0);
+    expect(action.pendingCount ?? 0).toBe(0);
+  });
+
+  test("a NaN/Infinity cost or token count cannot poison bucket totals", async () => {
+    const t = initTest();
+    const r = await start(t, { userId: "u" });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: r.requestId,
+      costNanos: NaN,          // ignored (not finite) -> token pricing
+      promptTokens: NaN,       // coerced to 0
+      completionTokens: 5,
+    });
+    vi.useFakeTimers();
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    vi.useRealTimers();
+    const u = await userOf(t, "u");
+    expect(Number.isFinite(u.totalSpendNanos)).toBe(true);
+    expect(Number.isFinite(u.spendTodayNanos)).toBe(true);
+    expect(u.totalSpendNanos).toBeGreaterThanOrEqual(0);
+  });
+
+  test("a NaN limit is rejected rather than admitting unlimited spend", async () => {
+    const t = initTest();
+    await expect(
+      setUserLimits(t, "u", { dailySpendLimitNanos: NaN })
+    ).rejects.toThrow(/dailySpendLimitNanos/);
+    await expect(
+      setUserLimits(t, "u", { dailySpendLimitNanos: Infinity })
+    ).rejects.toThrow(/dailySpendLimitNanos/);
+  });
 });

@@ -20,6 +20,33 @@ import { ShardedCounter } from "@convex-dev/sharded-counter";
 const NANOS_PER_DOLLAR = 1e9;
 const fmtUsd = (nanos: number) => `$${(nanos / NANOS_PER_DOLLAR).toFixed(4)}`;
 
+// Convex's `v.number()` accepts NaN and ±Infinity. Those are poison here: a NaN
+// cap or count silently defeats every `used > cap` comparison (NaN > x is
+// false), so an unvalidated NaN would make admission fail OPEN and admit
+// unlimited spend; +Infinity in totals is just as corrupting. Validate every
+// externally-supplied accounting amount at the mutation boundary.
+function assertAmount(
+  n: number | undefined,
+  name: string,
+  { signed = false }: { signed?: boolean } = {}
+) {
+  if (n === undefined) return;
+  if (!Number.isFinite(n) || !Number.isSafeInteger(n)) {
+    throw new Error(`${name} must be a finite safe integer (got ${n})`);
+  }
+  if (!signed && n < 0) throw new Error(`${name} must be nonnegative (got ${n})`);
+}
+function assertFraction(n: number | undefined, name: string) {
+  if (n === undefined) return;
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    throw new Error(`${name} must be a number in [0, 1] (got ${n})`);
+  }
+}
+// Coerce a caller/provider-supplied count to a finite nonnegative integer,
+// mapping NaN/Infinity/garbage to 0 rather than poisoning downstream totals.
+const safeCount = (n: number | undefined) =>
+  Number.isFinite(n) ? Math.max(0, Math.floor(n as number)) : 0;
+
 // Built-in attribution dimensions. `user` and `action` are always populated
 // from a request's userId/actionName; apps can add any other dimensions
 // (team, project, customer, env, …) as tags. These two names are reserved —
@@ -683,8 +710,14 @@ export const startRequest = mutation({
     }
 
     // Consume only after every admission check succeeds, in the same
-    // transaction as the reservations and request insert. An unexpected
-    // rejection throws to roll back all previously consumed dimensions.
+    // transaction as the reservations and request insert. `throws: true` is
+    // deliberate, not a rough edge: we already `.check`ed every bucket above in
+    // this same serializable transaction, so a `.limit` here cannot fail on a
+    // bucket that passed check — and if it somehow did (or a later bucket did),
+    // throwing rolls back the WHOLE transaction, including the rate we already
+    // consumed on earlier buckets. Converting this to a graceful `{allowed:false}`
+    // return would COMMIT the partial consumption and leak rate capacity, so keep
+    // the throw.
     for (const b of buckets) {
       if (b.requestsPerMinute !== undefined) {
         await requestRateLimiter.limit(ctx, "requests", {
@@ -771,7 +804,10 @@ export const finishRequest = mutation({
   returns: v.object({ costNanos: v.number() }),
   handler: async (ctx, args) => {
     const request = await ctx.db.get(args.requestId);
-    if (!request) throw new Error("Unknown request");
+    // The request may be gone — retention purged it, or the owning bucket was
+    // deleted. A late/duplicate webhook must be an idempotent no-op, not a 500
+    // (the caller can't do anything useful with the error, and it triggers retries).
+    if (!request) return { costNanos: 0 };
 
     // Expiry releases capacity, but is not evidence that the provider charged
     // nothing. Accept one final result even after expiry; duplicates stay no-ops.
@@ -779,16 +815,18 @@ export const finishRequest = mutation({
       return { costNanos: request.costNanos ?? 0 };
     }
 
-    // Clamp caller-supplied token counts: negatives would produce negative cost
-    // and could refund a user below their cap.
-    const promptTokens = Math.max(0, args.promptTokens ?? 0);
-    const completionTokens = Math.max(0, args.completionTokens ?? 0);
-    const cachedTokens = Math.min(promptTokens, Math.max(0, args.cachedTokens ?? 0));
+    // Coerce caller/provider-supplied token counts to finite nonnegative
+    // integers: negatives would refund below a cap, and NaN/Infinity (which
+    // v.number() allows) would poison every downstream total and cap check.
+    const promptTokens = safeCount(args.promptTokens);
+    const completionTokens = safeCount(args.completionTokens);
+    const cachedTokens = Math.min(promptTokens, safeCount(args.cachedTokens));
     // Prefer an authoritative gateway cost when supplied (it already includes
     // tool fees); otherwise price from tokens — discounting the cached
-    // (prompt-cache-read) slice — plus any server-tool per-call fees.
+    // (prompt-cache-read) slice — plus any server-tool per-call fees. Require it
+    // finite: +Infinity passes a bare `>= 0` and would corrupt the totals.
     let costNanos: number;
-    if (args.costNanos !== undefined && args.costNanos >= 0) {
+    if (args.costNanos !== undefined && Number.isFinite(args.costNanos) && args.costNanos >= 0) {
       costNanos = Math.round(args.costNanos);
     } else {
       const settings = await getSettings(ctx);
@@ -1115,10 +1153,15 @@ export const setBucketLimits = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    if (args.requestsPerMinute !== undefined &&
-        (!Number.isSafeInteger(args.requestsPerMinute) || args.requestsPerMinute < 0)) {
-      throw new Error("requestsPerMinute must be a nonnegative safe integer");
-    }
+    assertAmount(args.requestsPerMinute, "requestsPerMinute");
+    assertAmount(args.maxConcurrent, "maxConcurrent");
+    assertAmount(args.dailySpendLimitNanos, "dailySpendLimitNanos");
+    assertAmount(args.monthlySpendLimitNanos, "monthlySpendLimitNanos");
+    assertAmount(args.lifetimeSpendLimitNanos, "lifetimeSpendLimitNanos");
+    assertAmount(args.dailyTokenLimit, "dailyTokenLimit");
+    assertAmount(args.monthlyTokenLimit, "monthlyTokenLimit");
+    assertAmount(args.lifetimeTokenLimit, "lifetimeTokenLimit");
+    assertFraction(args.warnAtPct, "warnAtPct");
     const bucket = await getOrCreateBucket(ctx, args.dimension, args.value);
     const { dimension: _d, value: _v, ...limits } = args;
     await ctx.db.patch(bucket._id, limits);
@@ -1140,6 +1183,9 @@ export const bumpBucket = mutation({
   args: { dimension: v.string(), value: v.string(), ...vBumpArgs },
   returns: v.null(),
   handler: async (ctx, { dimension, value, dailyNanos, monthlyNanos, lifetimeNanos }) => {
+    assertAmount(dailyNanos, "dailyNanos");
+    assertAmount(monthlyNanos, "monthlyNanos");
+    assertAmount(lifetimeNanos, "lifetimeNanos");
     const bucket = await getOrCreateBucket(ctx, dimension, value);
     const today = dayStamp();
     const month = monthStamp();
@@ -1172,6 +1218,8 @@ export const adjustBucket = mutation({
   },
   returns: v.null(),
   handler: async (ctx, { dimension, value, deltaNanos, tokens, reason }) => {
+    assertAmount(deltaNanos, "deltaNanos", { signed: true });
+    assertAmount(tokens, "tokens", { signed: true });
     const b = await getOrCreateBucket(ctx, dimension, value);
     const today = dayStamp();
     const month = monthStamp();
@@ -1187,6 +1235,12 @@ export const adjustBucket = mutation({
       tokensToday: Math.max(0, (dSame ? b.tokensToday ?? 0 : 0) + dt),
       spendThisMonthNanos: Math.max(0, (mSame ? b.spendThisMonthNanos ?? 0 : 0) + deltaNanos),
       tokensThisMonth: Math.max(0, (mSame ? b.tokensThisMonth ?? 0 : 0) + dt),
+      // Advancing the window here must also clear the OLD window's reserved
+      // holds, or an in-flight request from the previous day/month would be
+      // treated as reserving against the new window and its later release would
+      // no longer match — stranding those reserved nanos/tokens.
+      ...(dSame ? {} : { reservedTodayNanos: 0, reservedTodayTokens: 0 }),
+      ...(mSame ? {} : { reservedMonthNanos: 0, reservedMonthTokens: 0 }),
     });
     await ctx.db.insert("adjustments", { dimension, value, deltaNanos, tokens: dt, reason });
     await addUsage(ctx, dimension, value, "day", today, deltaNanos, dt, 0);
@@ -1253,6 +1307,15 @@ export const deleteBucket = mutation({
         .withIndex("userId", (q) => q.eq("userId", value))
         .take(DELETE_BATCH);
       for (const r of rows) {
+        // Before dropping the row, free or settle any hold it placed on OTHER
+        // (shared) buckets — an action/customer bucket this user's request
+        // reserved against. Otherwise deleting the only row that could release
+        // that hold strands the shared bucket's reservation + pendingCount
+        // forever, and a late finish would throw. A finished-but-unfolded row
+        // is folded (the charge lands on the shared buckets); a still-pending
+        // one just has its reservation released.
+        if (r.settled === false) await foldOne(ctx, r);
+        else if (r.status === "pending") await releaseReservation(ctx, r);
         await deleteRequestTags(ctx, r._id);
         await ctx.db.delete(r._id);
       }
@@ -1335,18 +1398,31 @@ export const getGlobalStatus = query({
 
 export const setGlobalLimits = mutation({
   args: {
-    dailySpendLimitNanos: v.optional(v.number()),
-    lifetimeSpendLimitNanos: v.optional(v.number()),
-    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
+    // Absent = leave unchanged; explicit null = clear that limit. (A bare
+    // v.optional(number) that always rebuilt the full patch would let a
+    // one-field edit — exactly what the dashboard sends — silently wipe the
+    // other global controls by patching them to undefined.)
+    dailySpendLimitNanos: v.optional(v.union(v.number(), v.null())),
+    lifetimeSpendLimitNanos: v.optional(v.union(v.number(), v.null())),
+    enforcement: v.optional(
+      v.union(v.literal("hard"), v.literal("soft"), v.null())
+    ),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    // The settings fields are "global"-prefixed; map the friendly arg names.
-    const patch = {
-      globalDailySpendLimitNanos: args.dailySpendLimitNanos,
-      globalLifetimeSpendLimitNanos: args.lifetimeSpendLimitNanos,
-      globalEnforcement: args.enforcement,
-    };
+    if (typeof args.dailySpendLimitNanos === "number")
+      assertAmount(args.dailySpendLimitNanos, "dailySpendLimitNanos");
+    if (typeof args.lifetimeSpendLimitNanos === "number")
+      assertAmount(args.lifetimeSpendLimitNanos, "lifetimeSpendLimitNanos");
+    // The settings fields are "global"-prefixed; map the friendly arg names,
+    // touching ONLY the keys the caller actually passed. null -> clear.
+    const patch: Record<string, unknown> = {};
+    if ("dailySpendLimitNanos" in args)
+      patch.globalDailySpendLimitNanos = args.dailySpendLimitNanos ?? undefined;
+    if ("lifetimeSpendLimitNanos" in args)
+      patch.globalLifetimeSpendLimitNanos = args.lifetimeSpendLimitNanos ?? undefined;
+    if ("enforcement" in args)
+      patch.globalEnforcement = args.enforcement ?? undefined;
     const existing = await getSettings(ctx);
     if (existing) {
       await ctx.db.patch(existing._id, patch);
@@ -1415,13 +1491,11 @@ export const setPrice = mutation({
   handler: async (ctx, args) => {
     // Negative prices would make costOf return a negative cost, which folds
     // into totals as a spend *refund* — pushing a user back under their cap.
-    if (
-      args.inputNanosPerMTok < 0 ||
-      args.outputNanosPerMTok < 0 ||
-      (args.cachedNanosPerMTok ?? 0) < 0
-    ) {
-      throw new Error("Prices must be non-negative");
-    }
+    // NaN/Infinity (allowed by v.number()) are just as corrupting — a NaN rate
+    // poisons every settled cost for the model — so require finite integers.
+    assertAmount(args.inputNanosPerMTok, "inputNanosPerMTok");
+    assertAmount(args.outputNanosPerMTok, "outputNanosPerMTok");
+    assertAmount(args.cachedNanosPerMTok, "cachedNanosPerMTok");
     const existing = await ctx.db
       .query("prices")
       .withIndex("model", (q) => q.eq("model", args.model))

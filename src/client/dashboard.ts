@@ -97,8 +97,18 @@ async function renderBuckets() {
   const dims = ["user", "action"];
   const state = { dimension: window.__dim ?? "" };
   const rows = await get("/buckets", state.dimension ? { dimension: state.dimension } : {});
-  const grand = rows.reduce((s, b) => s + b.totalSpendNanos, 0);
-  document.getElementById("total").textContent = rows.length + " buckets · " + usd(grand) + " total";
+  // Within ONE dimension each request bills exactly one bucket, so summing is a
+  // true total. Across dimensions a request bills several buckets (user + action
+  // + tags), so summing multi-counts — use the deployment-wide spend instead.
+  let totalText;
+  if (state.dimension) {
+    const grand = rows.reduce((s, b) => s + b.totalSpendNanos, 0);
+    totalText = rows.length + " buckets · " + usd(grand) + " total (" + state.dimension + ")";
+  } else {
+    const g = await get("/global", {});
+    totalText = rows.length + " buckets · " + usd(g.spentTotalNanos ?? 0) + " spent (deployment)";
+  }
+  document.getElementById("total").textContent = totalText;
   const dimSet = [...new Set(rows.map((b) => b.dimension).concat(dims))];
   const sel = el("select", { value: state.dimension, style: "width:140px",
     onchange: (e) => { window.__dim = e.target.value; render(); } },

@@ -172,8 +172,14 @@ function extractUsage(usage: any): {
   cachedTokens: number;
 } {
   return {
-    promptTokens: toTokenCount(usage?.inputTokens ?? usage?.promptTokens),
-    completionTokens: toTokenCount(usage?.outputTokens ?? usage?.completionTokens),
+    // Cover AI SDK camelCase (v5/v7) AND raw OpenAI-compatible snake_case, so a
+    // `meter` caller passing a raw provider `usage` object still gets counts.
+    promptTokens: toTokenCount(
+      usage?.inputTokens ?? usage?.promptTokens ?? usage?.prompt_tokens
+    ),
+    completionTokens: toTokenCount(
+      usage?.outputTokens ?? usage?.completionTokens ?? usage?.completion_tokens
+    ),
     // cached prompt tokens. The Convex gateway reports these at
     // `usage.inputTokenDetails.cacheReadTokens`; the other paths cover AI SDK v5
     // (`cachedInputTokens`) and raw OpenAI-compatible shapes.
@@ -463,35 +469,42 @@ export class AIBudget {
     }
     const { requestId, warnings, notices } = started;
     const start = Date.now();
+    // Run the provider call. ONLY a failure of the call itself settles as an
+    // error (no charge expected).
+    let out: Awaited<ReturnType<typeof run>>;
     try {
-      const out = await run();
-      const { costNanos } = await this.settle(ctx, {
-        requestId,
-        responseText: out.text,
-        usage: out.usage,
-        promptTokens: out.promptTokens,
-        completionTokens: out.completionTokens,
-        cachedTokens: out.cachedTokens,
-        serverToolUses: out.serverToolUses,
-        costNanos: out.costNanos,
-        latencyMs: Date.now() - start,
-      });
-      // Re-derive the recorded usage for the return value.
-      const usage =
-        out.promptTokens !== undefined ||
-        out.completionTokens !== undefined ||
-        out.cachedTokens !== undefined
-          ? {
-              promptTokens: out.promptTokens ?? 0,
-              completionTokens: out.completionTokens ?? 0,
-              cachedTokens: out.cachedTokens ?? 0,
-            }
-          : extractUsage(out.usage);
-      return { text: out.text ?? "", requestId, costNanos, warnings, notices, ...usage };
+      out = await run();
     } catch (e) {
       await this.settle(ctx, { requestId, error: String(e), latencyMs: Date.now() - start });
       throw e;
     }
+    // The call SUCCEEDED (the provider may have charged). Settle the real usage.
+    // If settlement itself fails here, do NOT fall into an error-settle that
+    // records zero — that would erase a real charge. Rethrow and leave the
+    // reservation for the reconciler; billing stays "unknown", never a false zero.
+    const { costNanos } = await this.settle(ctx, {
+      requestId,
+      responseText: out.text,
+      usage: out.usage,
+      promptTokens: out.promptTokens,
+      completionTokens: out.completionTokens,
+      cachedTokens: out.cachedTokens,
+      serverToolUses: out.serverToolUses,
+      costNanos: out.costNanos,
+      latencyMs: Date.now() - start,
+    });
+    // Re-derive the recorded usage for the return value.
+    const usage =
+      out.promptTokens !== undefined ||
+      out.completionTokens !== undefined ||
+      out.cachedTokens !== undefined
+        ? {
+            promptTokens: out.promptTokens ?? 0,
+            completionTokens: out.completionTokens ?? 0,
+            cachedTokens: out.cachedTokens ?? 0,
+          }
+        : extractUsage(out.usage);
+    return { text: out.text ?? "", requestId, costNanos, warnings, notices, ...usage };
   }
 
   /**
@@ -717,15 +730,10 @@ export class AIBudget {
         wrapGenerate: async ({ doGenerate, params }: any) => {
           const requestId = await begin(params);
           const start = Date.now();
+          // Only a failure of the generation itself settles as an error.
+          let result: any;
           try {
-            const result = await doGenerate();
-            await finish(requestId, {
-              responseText: extractText(result),
-              ...extractUsage(result.usage),
-              costNanos: extractGatewayCostNanos(result),
-              latencyMs: Date.now() - start,
-            });
-            return result;
+            result = await doGenerate();
           } catch (e) {
             await finish(requestId, {
               error: String(e),
@@ -733,6 +741,15 @@ export class AIBudget {
             });
             throw e;
           }
+          // Generation succeeded (provider may have charged). Settle the real
+          // usage; a failure here rethrows rather than recording a false zero.
+          await finish(requestId, {
+            responseText: extractText(result),
+            ...extractUsage(result.usage),
+            costNanos: extractGatewayCostNanos(result),
+            latencyMs: Date.now() - start,
+          });
+          return result;
         },
         wrapStream: async ({ doStream, params }: any) => {
           const requestId = await begin(params);
@@ -747,21 +764,24 @@ export class AIBudget {
             // chunk, or a cancel — is safe: the first wins, the rest no-op.
             // Without this an errored or abandoned stream would never settle and
             // its real usage would be lost (recorded as free by the reconciler).
-            let settled = false;
-            const settle = (error?: string) => {
-              if (settled) return;
-              settled = true;
-              return finish(requestId, {
+            // Settle at most once, memoizing the PROMISE so the finish chunk, an
+            // error chunk, and flush all await the same settlement instead of
+            // racing, dropping it (the old `void settle()`), or flipping a
+            // "settled" flag before the mutation actually committed. A stream
+            // that is cancelled/never fully consumed won't deliver finish or
+            // flush; the reconciler's reservation expiry is the backstop there.
+            let settlement: Promise<{ costNanos: number }> | undefined;
+            const settle = (error?: string) =>
+              (settlement ??= finish(requestId, {
                 responseText: text,
                 error,
                 ...extractUsage(usage),
                 costNanos: extractGatewayCostNanos({ providerMetadata }),
                 latencyMs: Date.now() - start,
-              });
-            };
+              }));
             const tapped = result.stream.pipeThrough(
               new TransformStream({
-                transform(chunk: any, controller) {
+                async transform(chunk: any, controller) {
                   if (chunk?.type === "text-delta") {
                     text += chunk.delta ?? chunk.textDelta ?? "";
                   }
@@ -769,8 +789,10 @@ export class AIBudget {
                     usage = chunk.usage;
                     providerMetadata = chunk.providerMetadata ?? providerMetadata;
                   }
-                  if (chunk?.type === "error") void settle(String(chunk.error));
                   controller.enqueue(chunk);
+                  // Settle after forwarding the terminal error chunk, and AWAIT
+                  // it so a failed settle surfaces instead of being dropped.
+                  if (chunk?.type === "error") await settle(String(chunk.error));
                 },
                 async flush() {
                   await settle();
@@ -1037,17 +1059,29 @@ export class AIBudget {
       if (!token) return { ok: false, token: "" };
       const url = new URL(request.url);
       const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-      // `?token=` is accepted only for the initial page navigation (a browser
-      // GET can't set headers); the page strips it from the URL on load and the
-      // JSON API is called with the bearer header. Compared in constant time.
-      const provided = bearer || url.searchParams.get("token") || "";
+      // `?token=` is accepted ONLY for the initial page navigation (a browser GET
+      // can't set headers); the page strips it from the URL on load and calls the
+      // JSON API with the bearer header. Restrict it to that GET page route so a
+      // token can't be smuggled in a query string on API/mutation calls (where it
+      // would also land in access logs). Compared in constant time.
+      const sub = url.pathname.slice(prefix.length) || "/";
+      const isPageNav = request.method === "GET" && !sub.startsWith("/api");
+      const provided = bearer || (isPageNav ? url.searchParams.get("token") ?? "" : "");
       return { ok: timingSafeEqual(provided, token), token };
     };
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data ?? null), {
         status,
-        headers: { "content-type": "application/json" },
+        // Never let a shared cache/proxy retain budget data or the token-bearing
+        // page — these responses are per-viewer and sensitive.
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
       });
+    // JSON.stringify does NOT escape `<`, so a value containing `</script>`
+    // would close the inline <script> and break out. Escape `<` (and the JS line
+    // separators) before embedding in HTML.
+    const jsonForScript = (x: unknown) =>
+      JSON.stringify(x).replace(/[<\u2028\u2029]/g, (ch) =>
+        "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
 
     const handle = async (ctx: any, request: Request): Promise<Response> => {
       const url = new URL(request.url);
@@ -1111,15 +1145,19 @@ export class AIBudget {
         }
       }
 
-      // Inject as JSON literals (function replacers so `$` in the value isn't
-      // treated as a replacement pattern). This keeps a token/prefix containing
-      // quotes, backslashes, or `</script>` from breaking out of the JS string.
+      // Inject as script-safe JSON literals (function replacers so `$` in the
+      // value isn't treated as a replacement pattern; `jsonForScript` escapes
+      // `<` so a token containing `</script>` can't break out of the inline JS).
       const html = DASHBOARD_HTML.replace(
         /__API_BASE__/g,
-        () => JSON.stringify(`${prefix}/api`)
-      ).replace(/__TOKEN__/g, () => JSON.stringify(token));
+        () => jsonForScript(`${prefix}/api`)
+      ).replace(/__TOKEN__/g, () => jsonForScript(token));
+      // The page embeds the bearer token — never let a shared cache retain it.
       return new Response(html, {
-        headers: { "content-type": "text/html; charset=utf-8" },
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
       });
     };
 

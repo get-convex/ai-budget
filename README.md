@@ -390,6 +390,13 @@ reserve-then-settle admission check runs per bucket. Uncapped buckets never seri
 adding tags you don't cap is free at admission; their totals still accrue for
 reporting.
 
+> **Choosing what to cap.** A cap makes its bucket's admissions atomic by
+> reserving on that bucket's single row, so capping a dimension that *all* traffic
+> shares (one `env`/`action` every request carries) serializes those admissions on
+> one document under load. Prefer capping **naturally-sharded** dimensions — per
+> `user`, per `customer` — and use the [global cap](#global-cap) for a
+> deployment-wide ceiling. Uncapped high-traffic tags are always free.
+
 ### Tags — budgeting by any dimension
 
 ```ts
@@ -488,9 +495,12 @@ ai.global.status(ctx)   // { limits, spentTodayNanos, spentTotalNanos, … }
 ai.global.bump(ctx, { dailyNanos?, lifetimeNanos? })
 ```
 
-A killswitch across everything. Backed by a sharded counter for throughput, so
-it's enforced **approximately** (bounded concurrency overshoot under burst).
-Per-bucket admission is atomic against each request's estimate.
+A best-effort killswitch across everything. Backed by a sharded counter for
+throughput, so it's enforced **approximately** — under burst it can overshoot the
+cap by a bounded amount, and it excludes in-flight (not-yet-settled) spend. It is
+**not** a to-the-dollar ceiling: for an exact limit use a per-bucket cap (those
+reserve atomically); reach for the global cap when you want a deployment-wide
+"stop everything" switch.
 
 ### Model policy
 
@@ -551,6 +561,12 @@ ai.global.setRetention(ctx, { retentionMs })   // default 1h; 0 disables
 
 Full request rows (prompts + responses) are swept after the window to bound the
 audit table. **Spend history survives** — it lives in separate durable rollups.
+
+> **Prompt/response content is stored** on the request row until the window sweeps
+> it (default 1h), so it's visible in the request log and to admin reads until
+> then. If your prompts carry PII you don't want retained, shorten `retentionMs`
+> (or set it low enough that content lives only as long as you need replay). Spend
+> rollups never contain content, so trimming retention doesn't cost you history.
 
 ---
 
