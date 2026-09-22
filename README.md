@@ -251,7 +251,10 @@ await ai.meter(ctx,
   });
 ```
 
-### `ai.decisions` — structured decisions (Jev)
+### `ai.decisions` — structured decisions (Jev) · **experimental**
+
+> **Experimental** — the Decisions endpoint is alpha on the gateway; this API may
+> change without a major version bump.
 
 Budget the gateway's Decisions endpoint ([Jev](https://docs.typesafe.ai)) — typed
 `choice` / `score` / `boolean` questions evaluated against a `state` — with the
@@ -280,7 +283,10 @@ defaults to `defaultEvalModel` (`"typesafe/jev-1.13"`). Requires
 `experimental_evaluate` — both imported lazily, so callers who don't use
 `decisions` are unaffected.
 
-### `ai.begin` / `ai.settle` — long async jobs (video)
+### `ai.begin` / `ai.settle` — long async jobs (video) · **experimental**
+
+> **Experimental** — video generation depends on alpha gateway features; the
+> async surface (`reserveTtlMs`, `registerWebhook`) may change without a major bump.
 
 A video job is submit → wait minutes → poll/webhook → done, spanning multiple
 Convex functions, so the synchronous `meter` bracket doesn't fit. Reserve with
@@ -432,8 +438,11 @@ await ai.users.adjust(ctx, { userId, deltaNanos: -5 * 1_000_000_000, reason: "go
 await ai.users.adjustments(ctx, { userId });   // the audit log
 ```
 
-Negative = credit, positive = extra charge; it adjusts the live day/month/lifetime
-windows, the history, and an audit log.
+Positive = an extra charge (adds to **gross** spend). Negative = a credit/refund,
+which accrues in a **separate** credits balance and never reduces gross spend — so
+gross spend and durable history stay consistent. Caps enforce on **net = gross −
+credits**, so a credit gives the bucket real headroom. Both are written to the
+audit log.
 
 ### Alerts
 
@@ -490,9 +499,12 @@ ai.requests.get(ctx, { requestId })                               // one request
 ### Global cap
 
 ```ts
+// enforcement: "approximate" (default, best-effort block) | "soft" (warn only).
+// Pass null to clear a field; only the fields you pass change.
 ai.global.setLimits(ctx, { dailySpendLimitNanos?, lifetimeSpendLimitNanos?, enforcement? })
-ai.global.status(ctx)   // { limits, spentTodayNanos, spentTotalNanos, … }
+ai.global.status(ctx)   // { dailySpendLimitNanos, lifetimeSpendLimitNanos, enforcement, spentTodayNanos, spentTotalNanos, … }
 ai.global.bump(ctx, { dailyNanos?, lifetimeNanos? })
+ai.global.setPolicy(ctx, { allowUnpricedModels?, storeContent? })  // deployment data/pricing policy
 ```
 
 A best-effort killswitch across everything. Backed by a sharded counter for
@@ -754,6 +766,31 @@ are migrated in batches by reconciliation. Existing reservations without ownersh
 metadata use their creation period and current capped buckets as a compatibility
 fallback. Exact historical hold ownership cannot be reconstructed if those caps
 changed before the upgrade. New requests always store explicit ownership.
+
+## Stability (v1)
+
+**Stable (frozen for 1.0)** — these keep backward compatibility within the 1.x line:
+`ai.chat`, `ai.meter`, `ai.begin`/`ai.settle`, `ai.languageModel`, and the admin
+namespaces `ai.users` / `ai.actions` / `ai.tag` / `ai.global` / `ai.models` /
+`ai.prices` / `ai.requests`, plus `ai.registerRoutes`. The stored schema is frozen;
+new fields will only be added as optional.
+
+**Experimental (may change without a major bump):** `ai.decisions` (the Jev /
+Decisions endpoint) and video generation (`begin`/`settle` with `reserveTtlMs` +
+`registerWebhook`). Both depend on gateway features that are still alpha.
+
+**Semantics worth knowing:**
+- **Spend caps** admit on an *estimate*, so a token-priced cap can be exceeded by
+  one request's estimate-vs-actual delta; pass `estimatedCostNanos` for an exact
+  reservation. The **global cap** is a best-effort killswitch (`enforcement:
+  "approximate"` | `"soft"`), not a to-the-dollar ceiling.
+- **Credits** (`ai.tag(d).adjust` / negative `deltaNanos`) accrue in a separate
+  balance and never reduce gross spend; caps enforce on **net = gross − credits**,
+  so a credit grants real headroom while spend history stays consistent.
+- **Deployment policy** (`ai.global.setPolicy`): `allowUnpricedModels: false`
+  rejects models with no configured price under hard enforcement (default charges
+  the conservative fallback); `storeContent: false` persists metadata but no
+  prompt/response content (for teams that want zero prompt retention).
 
 ## Development
 

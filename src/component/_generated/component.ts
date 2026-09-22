@@ -95,7 +95,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           dailySpendLimitNanos: number | null;
           defaultWarnAtPct: number | null;
-          enforcement: "hard" | "soft";
+          enforcement: "approximate" | "soft";
           lifetimeSpendLimitNanos: number | null;
           retentionMs: number | null;
           spentTodayNanos: number;
@@ -181,12 +181,19 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         null,
         Name
       >;
+      setDeploymentPolicy: FunctionReference<
+        "mutation",
+        "internal",
+        { allowUnpricedModels?: boolean; storeContent?: boolean },
+        null,
+        Name
+      >;
       setGlobalLimits: FunctionReference<
         "mutation",
         "internal",
         {
           dailySpendLimitNanos?: number | null;
-          enforcement?: "hard" | "soft" | null;
+          enforcement?: "approximate" | "soft" | null;
           lifetimeSpendLimitNanos?: number | null;
         },
         null,

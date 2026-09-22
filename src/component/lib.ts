@@ -316,7 +316,8 @@ function sanitizeExtraTags(
 function evaluateCaps(o: {
   label: string;
   name: string;
-  enforcement: "hard" | "soft";
+  // "approximate" is the global killswitch mode; it blocks like "hard" here.
+  enforcement: "hard" | "soft" | "approximate";
   warnAtPct?: number;
   estCost: number;
   estTokens: number;
@@ -326,6 +327,10 @@ function evaluateCaps(o: {
   reservedSpendMonth: number;
   totalSpend: number;
   reservedSpendTotal: number;
+  // Manual credits (subtracted from spend so a credit grants headroom).
+  creditsToday?: number;
+  creditsThisMonth?: number;
+  creditsTotal?: number;
   tokensToday: number;
   reservedTokensToday: number;
   tokensThisMonth: number;
@@ -346,9 +351,9 @@ function evaluateCaps(o: {
   // { code, projected usage (incl. this estimate), cap, human window label,
   //   whether it's a money cap (formatted as $), spend? for notices }
   const checks = [
-    { w: "daily_spend_limit", used: o.spendToday + o.reservedSpendToday + o.estCost, cap: o.dailySpendLimitNanos, label: "daily spend limit", money: true },
-    { w: "monthly_spend_limit", used: o.spendThisMonth + o.reservedSpendMonth + o.estCost, cap: o.monthlySpendLimitNanos, label: "monthly spend limit", money: true },
-    { w: "lifetime_spend_limit", used: o.totalSpend + o.reservedSpendTotal + o.estCost, cap: o.lifetimeSpendLimitNanos, label: "lifetime spend limit", money: true },
+    { w: "daily_spend_limit", used: o.spendToday + o.reservedSpendToday + o.estCost - (o.creditsToday ?? 0), cap: o.dailySpendLimitNanos, label: "daily spend limit", money: true },
+    { w: "monthly_spend_limit", used: o.spendThisMonth + o.reservedSpendMonth + o.estCost - (o.creditsThisMonth ?? 0), cap: o.monthlySpendLimitNanos, label: "monthly spend limit", money: true },
+    { w: "lifetime_spend_limit", used: o.totalSpend + o.reservedSpendTotal + o.estCost - (o.creditsTotal ?? 0), cap: o.lifetimeSpendLimitNanos, label: "lifetime spend limit", money: true },
     { w: "daily_token_limit", used: o.tokensToday + o.reservedTokensToday + o.estTokens, cap: o.dailyTokenLimit, label: "daily token limit", money: false },
     { w: "monthly_token_limit", used: o.tokensThisMonth + o.reservedTokensMonth + o.estTokens, cap: o.monthlyTokenLimit, label: "monthly token limit", money: false },
     { w: "lifetime_token_limit", used: o.totalTokens + o.reservedTokensTotal + o.estTokens, cap: o.lifetimeTokenLimit, label: "lifetime token limit", money: false },
@@ -525,6 +530,9 @@ export const startRequest = mutation({
     // (false) and the bucket admits unlimited spend. Reject it up front.
     assertAmount(args.estimatedCostNanos, "estimatedCostNanos");
     const extraTags = sanitizeExtraTags(args.tags);
+    // Set from settings below; when false we persist metadata but no prompt
+    // content (a deployment that opts out of storing prompts entirely).
+    let storeContent = true;
     // Record the blocked attempt and return a rejection (throwing would roll
     // back the record). `persist` is false for the high-frequency-by-design
     // rejections (rate limit, blocked user) that a client retries in a tight
@@ -537,7 +545,7 @@ export const startRequest = mutation({
           actionName: args.actionName,
           ...(extraTags.length ? { tags: extraTags } : {}),
           model: args.model,
-          messages: args.messages,
+          messages: storeContent ? args.messages : [],
           rerunOf: args.rerunOf,
           status: "blocked" as const,
           error: reason,
@@ -569,6 +577,7 @@ export const startRequest = mutation({
 
     // Model allow/deny policy (component-wide).
     const settings = await getSettings(ctx);
+    storeContent = settings?.storeContent !== false;
     const defaultWarnAtPct = settings?.defaultWarnAtPct;
     if (settings) {
       const mode = settings.modelMode ?? "open";
@@ -581,6 +590,14 @@ export const startRequest = mutation({
       }
       if (mode === "denylist" && list.includes(args.model)) {
         return reject("model_denied", `Model "${args.model}" is denied`);
+      }
+      // Optionally refuse models with no known/override price rather than
+      // charging the conservative fallback (which under-counts premium models).
+      if (settings.allowUnpricedModels === false && !priceInfo.known) {
+        return reject(
+          "model_unpriced",
+          `Model "${args.model}" has no configured price; set one with setPrice or allow unpriced models`
+        );
       }
     }
 
@@ -660,6 +677,9 @@ export const startRequest = mutation({
         reservedSpendMonth: sameMonth ? b.reservedMonthNanos ?? 0 : 0,
         totalSpend: b.totalSpendNanos,
         reservedSpendTotal: b.reservedTotalNanos ?? 0,
+        creditsToday: sameDay ? b.creditsTodayNanos ?? 0 : 0,
+        creditsThisMonth: sameMonth ? b.creditsThisMonthNanos ?? 0 : 0,
+        creditsTotal: b.creditsNanos ?? 0,
         tokensToday: sameDay ? b.tokensToday ?? 0 : 0,
         reservedTokensToday: sameDay ? b.reservedTodayTokens ?? 0 : 0,
         tokensThisMonth: sameMonth ? b.tokensThisMonth ?? 0 : 0,
@@ -695,42 +715,26 @@ export const startRequest = mutation({
     // throughput. The sum is transactional, but excludes unsettled usage and
     // has no cross-request reservation, so a hard global cap can overshoot. That's the deliberate consistency/throughput
     // trade for a deployment-wide killswitch; it's the only approximate scope.
+    // H4: don't read the sharded counter here — that per-admission read
+    // contended with every fold that writes it. The reconciler compares the
+    // total to the cap out-of-band and records trip flags on `settings`;
+    // admission just reads those (already-loaded) flags. The killswitch lag is
+    // bounded by the reconcile interval, which is the point of "approximate".
     if (
       settings &&
-      (settings.globalDailySpendLimitNanos !== undefined ||
-        settings.globalLifetimeSpendLimitNanos !== undefined)
+      (settings.globalTrippedDaily || settings.globalTrippedLifetime)
     ) {
-      const globalEval = evaluateCaps({
-        label: "global",
-        name: "deployment",
-        enforcement: settings.globalEnforcement ?? "hard",
-        warnAtPct: defaultWarnAtPct,
-        estCost: est.cost,
-        estTokens: est.tokens,
-        spendToday: await globalSpend.count(ctx, globalDayKey(today)),
-        reservedSpendToday: 0, // sharded holder: no cross-request reservation
-        spendThisMonth: 0, // global tracks daily + lifetime only
-        reservedSpendMonth: 0,
-        totalSpend: await globalSpend.count(ctx, GLOBAL_TOTAL),
-        reservedSpendTotal: 0,
-        tokensToday: 0,
-        reservedTokensToday: 0,
-        tokensThisMonth: 0,
-        reservedTokensMonth: 0,
-        totalTokens: 0,
-        reservedTokensTotal: 0,
-        dailySpendLimitNanos: withBump(
-          settings.globalDailySpendLimitNanos,
-          settings.globalBumpDayStamp === today ? settings.globalDailyBumpNanos : 0
-        ),
-        lifetimeSpendLimitNanos: withBump(
-          settings.globalLifetimeSpendLimitNanos,
-          settings.globalLifetimeBumpNanos
-        ),
-      });
-      if (globalEval.hard) return reject(globalEval.hard.code, globalEval.hard.reason);
-      warnings.push(...globalEval.warnings);
-      notices.push(...globalEval.notices);
+      const enforcement = settings.globalEnforcement ?? "approximate";
+      if (enforcement === "soft") {
+        warnings.push(`Global spend limit reached for the deployment (allowed — soft)`);
+      } else {
+        return reject(
+          "global_spend_limit",
+          "Global spend limit reached for the deployment"
+        );
+      }
+    } else if (settings?.globalNearLimit) {
+      notices.push("Deployment approaching its global spend limit");
     }
 
     // Consume only after every admission check succeeds, in the same
@@ -781,7 +785,7 @@ export const startRequest = mutation({
       actionName: args.actionName,
       ...(extraTags.length ? { tags: extraTags } : {}),
       model: args.model,
-      messages: args.messages,
+      messages: storeContent ? args.messages : [],
       rerunOf: args.rerunOf,
       ...(args.reserveTtlMs !== undefined ? { reserveTtlMs: args.reserveTtlMs } : {}),
       status: "pending",
@@ -849,11 +853,12 @@ export const finishRequest = mutation({
     // tool fees); otherwise price from tokens — discounting the cached
     // (prompt-cache-read) slice — plus any server-tool per-call fees. Require it
     // finite: +Infinity passes a bare `>= 0` and would corrupt the totals.
+    const settings = await getSettings(ctx);
+    const storeContent = settings?.storeContent !== false;
     let costNanos: number;
     if (args.costNanos !== undefined && Number.isFinite(args.costNanos) && args.costNanos >= 0) {
       costNanos = Math.round(args.costNanos);
     } else {
-      const settings = await getSettings(ctx);
       const priced =
         settleCost(
           promptTokens,
@@ -879,7 +884,7 @@ export const finishRequest = mutation({
       reservationExpired: false,
       expiresAt: undefined,
       finishedAt: Date.now(),
-      responseText: args.responseText,
+      responseText: storeContent ? args.responseText : undefined,
       error: args.error,
       promptTokens,
       completionTokens,
@@ -986,6 +991,52 @@ export const reconcile = internalMutation({
     await ctx.scheduler.runAfter(0, internal.lib.foldPhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.expirePhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.retentionPhase, {});
+    await ctx.scheduler.runAfter(0, internal.lib.globalPhase, {});
+    return null;
+  },
+});
+
+// H4: compute the deployment-wide global-cap trip flags out-of-band so admission
+// never reads the sharded counter on its hot path. One cheap counter read here
+// per interval; admission then consults the flags on `settings`.
+export const globalPhase = internalMutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    const s = await getSettings(ctx);
+    if (!s) return null;
+    const hasCap =
+      s.globalDailySpendLimitNanos !== undefined ||
+      s.globalLifetimeSpendLimitNanos !== undefined;
+    if (!hasCap) {
+      // Clear stale flags when no global cap is configured.
+      if (s.globalTrippedDaily || s.globalTrippedLifetime || s.globalNearLimit)
+        await ctx.db.patch(s._id, {
+          globalTrippedDaily: false,
+          globalTrippedLifetime: false,
+          globalNearLimit: false,
+        });
+      return null;
+    }
+    const today = dayStamp();
+    const dailyCap = withBump(
+      s.globalDailySpendLimitNanos,
+      s.globalBumpDayStamp === today ? s.globalDailyBumpNanos : 0
+    );
+    const lifetimeCap = withBump(
+      s.globalLifetimeSpendLimitNanos,
+      s.globalLifetimeBumpNanos
+    );
+    const spentToday = await globalSpend.count(ctx, globalDayKey(today));
+    const spentTotal = await globalSpend.count(ctx, GLOBAL_TOTAL);
+    const pct = s.defaultWarnAtPct;
+    const near = (spent: number, cap?: number) =>
+      cap !== undefined && pct !== undefined && pct > 0 && pct < 1 && spent >= pct * cap;
+    await ctx.db.patch(s._id, {
+      globalTrippedDaily: dailyCap !== undefined && spentToday >= dailyCap,
+      globalTrippedLifetime: lifetimeCap !== undefined && spentTotal >= lifetimeCap,
+      globalNearLimit: near(spentToday, dailyCap) || near(spentTotal, lifetimeCap),
+    });
     return null;
   },
 });
@@ -1302,15 +1353,25 @@ export const adjustBucket = mutation({
     const dSame = b.dayStamp === today;
     const mSame = b.monthStamp === month;
     const dt = tokens ?? 0;
+    // Gross-plus-credits ledger: a positive delta is a real extra charge (adds
+    // to GROSS spend); a negative delta is a credit/refund that accrues to a
+    // separate credits balance and NEVER reduces gross spend — so gross spend
+    // and durable history stay consistent, and net = gross - credits. Credits
+    // grant headroom because admission subtracts them from the cap check.
+    const debit = deltaNanos > 0 ? deltaNanos : 0;
+    const credit = deltaNanos < 0 ? -deltaNanos : 0;
     await ctx.db.patch(b._id, {
-      totalSpendNanos: Math.max(0, b.totalSpendNanos + deltaNanos),
+      totalSpendNanos: b.totalSpendNanos + debit,
       totalTokens: Math.max(0, b.totalTokens + dt),
       dayStamp: today,
       monthStamp: month,
-      spendTodayNanos: Math.max(0, (dSame ? b.spendTodayNanos : 0) + deltaNanos),
+      spendTodayNanos: (dSame ? b.spendTodayNanos : 0) + debit,
       tokensToday: Math.max(0, (dSame ? b.tokensToday ?? 0 : 0) + dt),
-      spendThisMonthNanos: Math.max(0, (mSame ? b.spendThisMonthNanos ?? 0 : 0) + deltaNanos),
+      spendThisMonthNanos: (mSame ? b.spendThisMonthNanos ?? 0 : 0) + debit,
       tokensThisMonth: Math.max(0, (mSame ? b.tokensThisMonth ?? 0 : 0) + dt),
+      creditsNanos: (b.creditsNanos ?? 0) + credit,
+      creditsTodayNanos: (dSame ? b.creditsTodayNanos ?? 0 : 0) + credit,
+      creditsThisMonthNanos: (mSame ? b.creditsThisMonthNanos ?? 0 : 0) + credit,
       // Advancing the window here must also clear the OLD window's reserved
       // holds, or an in-flight request from the previous day/month would be
       // treated as reserving against the new window and its later release would
@@ -1319,8 +1380,10 @@ export const adjustBucket = mutation({
       ...(mSame ? {} : { reservedMonthNanos: 0, reservedMonthTokens: 0 }),
     });
     await ctx.db.insert("adjustments", { dimension, value, deltaNanos, tokens: dt, reason });
-    await addUsage(ctx, dimension, value, "day", today, deltaNanos, dt, 0);
-    await addUsage(ctx, dimension, value, "month", month, deltaNanos, dt, 0);
+    // Durable history tracks GROSS spend only (debits); credits live in the
+    // adjustments log + bucket balance, so usage rollups never go negative.
+    await addUsage(ctx, dimension, value, "day", today, debit, dt, 0);
+    await addUsage(ctx, dimension, value, "month", month, debit, dt, 0);
     return null;
   },
 });
@@ -1363,6 +1426,28 @@ export const setAlertDefaults = mutation({
     const existing = await getSettings(ctx);
     if (existing) await ctx.db.patch(existing._id, { defaultWarnAtPct: warnAtPct });
     else await ctx.db.insert("settings", { key: "singleton", defaultWarnAtPct: warnAtPct });
+    return null;
+  },
+});
+
+// Deployment-wide data/pricing policy. Only the fields you pass change.
+// - allowUnpricedModels: false rejects models with no configured price under
+//   hard enforcement (default true — charge the conservative fallback).
+// - storeContent: false stops persisting prompt/response content on request
+//   rows (default true).
+export const setDeploymentPolicy = mutation({
+  args: {
+    allowUnpricedModels: v.optional(v.boolean()),
+    storeContent: v.optional(v.boolean()),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const patch: Record<string, unknown> = {};
+    if ("allowUnpricedModels" in args) patch.allowUnpricedModels = args.allowUnpricedModels;
+    if ("storeContent" in args) patch.storeContent = args.storeContent;
+    const existing = await getSettings(ctx);
+    if (existing) await ctx.db.patch(existing._id, patch);
+    else await ctx.db.insert("settings", { key: "singleton", ...patch });
     return null;
   },
 });
@@ -1448,7 +1533,7 @@ export const getGlobalStatus = query({
   returns: v.object({
     dailySpendLimitNanos: v.union(v.number(), v.null()),
     lifetimeSpendLimitNanos: v.union(v.number(), v.null()),
-    enforcement: v.union(v.literal("hard"), v.literal("soft")),
+    enforcement: v.union(v.literal("approximate"), v.literal("soft")),
     spentTodayNanos: v.number(),
     spentTotalNanos: v.number(),
     // deployment-wide config (surfaced for the admin dashboard)
@@ -1463,7 +1548,7 @@ export const getGlobalStatus = query({
     return {
       dailySpendLimitNanos: s?.globalDailySpendLimitNanos ?? null,
       lifetimeSpendLimitNanos: s?.globalLifetimeSpendLimitNanos ?? null,
-      enforcement: s?.globalEnforcement ?? "hard",
+      enforcement: s?.globalEnforcement ?? "approximate",
       spentTodayNanos: await globalSpend.count(ctx, globalDayKey(dayStamp())),
       spentTotalNanos: await globalSpend.count(ctx, GLOBAL_TOTAL),
       retentionMs: s?.retentionMs ?? null,
@@ -1481,7 +1566,7 @@ export const setGlobalLimits = mutation({
     dailySpendLimitNanos: v.optional(v.union(v.number(), v.null())),
     lifetimeSpendLimitNanos: v.optional(v.union(v.number(), v.null())),
     enforcement: v.optional(
-      v.union(v.literal("hard"), v.literal("soft"), v.null())
+      v.union(v.literal("approximate"), v.literal("soft"), v.null())
     ),
   },
   returns: v.null(),

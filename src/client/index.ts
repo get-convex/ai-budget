@@ -991,13 +991,17 @@ export class AIBudget {
     return {
       /** Limits + spend today/total. */
       status: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.getGlobalStatus, {}),
-      /** A killswitch spend cap across all users/actions (enforced approximately). */
+      /**
+       * A killswitch spend cap across all users/actions. Enforced
+       * **approximately** (bounded overshoot, no per-request reservation) — for
+       * an exact ceiling use a per-bucket cap. Pass `null` to clear a field.
+       */
       setLimits: (
         ctx: RunMutationCtx,
         args: {
-          dailySpendLimitNanos?: number;
-          lifetimeSpendLimitNanos?: number;
-          enforcement?: "hard" | "soft";
+          dailySpendLimitNanos?: number | null;
+          lifetimeSpendLimitNanos?: number | null;
+          enforcement?: "approximate" | "soft" | null;
         }
       ) => ctx.runMutation(c.lib.setGlobalLimits, args),
       bump: (
@@ -1010,6 +1014,17 @@ export class AIBudget {
       /** Request-row retention window in ms (default 1h; 0 disables). */
       setRetention: (ctx: RunMutationCtx, args: { retentionMs: number }) =>
         ctx.runMutation(c.lib.setRetention, args),
+      /**
+       * Deployment-wide data/pricing policy (only the fields you pass change):
+       * - `allowUnpricedModels: false` rejects models with no configured price
+       *   under hard enforcement (default true — charge the conservative fallback).
+       * - `storeContent: false` stops persisting prompt/response content on
+       *   request rows (default true).
+       */
+      setPolicy: (
+        ctx: RunMutationCtx,
+        args: { allowUnpricedModels?: boolean; storeContent?: boolean }
+      ) => ctx.runMutation(c.lib.setDeploymentPolicy, args),
     };
   }
 

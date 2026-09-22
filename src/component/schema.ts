@@ -59,10 +59,17 @@ export default defineSchema({
     lifetimeBumpNanos: v.optional(v.number()),
     bumpDayStamp: v.optional(v.string()),
     bumpMonthStamp: v.optional(v.string()),
-    // settled totals (from finished requests)
+    // settled GROSS spend (real charges + positive adjustments). Credits never
+    // reduce these — they accrue separately below — so gross spend and durable
+    // history always agree. Cap checks and "net" use (gross - credits).
     totalSpendNanos: v.number(),
     totalRequests: v.number(),
     totalTokens: v.number(),
+    // manual credits (comps/refunds), tracked separately from gross spend and
+    // subtracted at admission so a credit grants real headroom under a cap.
+    creditsNanos: v.optional(v.number()),
+    creditsTodayNanos: v.optional(v.number()),
+    creditsThisMonthNanos: v.optional(v.number()),
     // daily window
     dayStamp: v.string(),
     spendTodayNanos: v.number(),
@@ -211,12 +218,23 @@ export default defineSchema({
     // killswitch; per-bucket concurrent admission is atomic via reserve/settle.
     globalDailySpendLimitNanos: v.optional(v.number()),
     globalLifetimeSpendLimitNanos: v.optional(v.number()),
+    // "approximate" (default): a best-effort killswitch — it blocks once the
+    // sharded total crosses the cap, but with bounded overshoot (no per-request
+    // reservation). "soft": warn only. There is deliberately no "hard": a true
+    // to-the-dollar ceiling is a per-bucket cap.
     globalEnforcement: v.optional(
-      v.union(v.literal("hard"), v.literal("soft"))
+      v.union(v.literal("approximate"), v.literal("soft"))
     ),
     globalDailyBumpNanos: v.optional(v.number()),
     globalLifetimeBumpNanos: v.optional(v.number()),
     globalBumpDayStamp: v.optional(v.string()),
+    // H4: the reconciler compares the sharded global total to the cap and sets
+    // these, so admission reads ONE settings doc instead of the sharded counter
+    // (whose per-admission read contended with every fold). Killswitch lag is
+    // bounded by the reconcile interval — fine for a deployment-wide stop.
+    globalTrippedDaily: v.optional(v.boolean()),
+    globalTrippedLifetime: v.optional(v.boolean()),
+    globalNearLimit: v.optional(v.boolean()),
     // request-row retention window in ms (default 1h); 0 disables sweeping.
     retentionMs: v.optional(v.number()),
     // default approaching-limit alert threshold (fraction of a cap) for buckets
@@ -225,5 +243,13 @@ export default defineSchema({
     // per-call price (nanodollars) overrides for provider server tools, keyed by
     // tool name (e.g. { web_search: 12_000_000 }). Merged over the defaults.
     serverToolPrices: v.optional(v.record(v.string(), v.number())),
+    // When false, reject requests for a model with no known/override price under
+    // hard enforcement (instead of charging the conservative fallback). Default
+    // true (charge the fallback, keep the call working).
+    allowUnpricedModels: v.optional(v.boolean()),
+    // When false, don't persist prompt/response content on request rows (only
+    // metadata + cost). Default true. For teams that want zero prompt retention
+    // rather than short retention.
+    storeContent: v.optional(v.boolean()),
   }).index("key", ["key"]),
 });

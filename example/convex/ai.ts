@@ -723,7 +723,7 @@ export const setGlobalLimits = mutation({
   args: {
     dailySpendLimitNanos: v.optional(v.number()),
     lifetimeSpendLimitNanos: v.optional(v.number()),
-    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
+    enforcement: v.optional(v.union(v.literal("approximate"), v.literal("soft"))),
   },
   handler: async (ctx, args) => {
     await ai.global.setLimits(ctx, args);

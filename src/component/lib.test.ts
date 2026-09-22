@@ -245,7 +245,7 @@ describe("durable usage history", () => {
 });
 
 describe("manual adjustments", () => {
-  test("a credit reduces spend and is logged", async () => {
+  test("a credit accrues separately from gross spend and grants headroom", async () => {
     const t = initTest();
     const r = await start(t, { userId: "u" });
     await settleWith(t, r.requestId, { promptTokens: 1_000_000, completionTokens: 1_000_000 });
@@ -256,10 +256,25 @@ describe("manual adjustments", () => {
       reason: "goodwill credit",
     });
     const u = await userOf(t, "u");
-    expect(u.totalSpendNanos).toBe(500_000_000); // 750M - 250M
+    // Gross spend is unchanged (credits never reduce it); the credit is tracked
+    // separately. Net = gross - credits = 500M.
+    expect(u.totalSpendNanos).toBe(750_000_000);
+    expect(u.creditsNanos).toBe(250_000_000);
     const log = await t.query(api.lib.listAdjustments, { dimension: "user", value: "u" });
     expect(log.length).toBe(1);
     expect(log[0].deltaNanos).toBe(-250_000_000);
+  });
+
+  test("a credit grants headroom under a cap; a debit consumes gross spend", async () => {
+    const t = initTest();
+    await setUserLimits(t, "u", { lifetimeSpendLimitNanos: 1_000_000_000 });
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, { costNanos: 900_000_000 }); // $0.90 gross
+    // Right at the edge: a $0.20 estimate would exceed the $1 cap...
+    expect((await start(t, { userId: "u", estimatedCostNanos: 200_000_000 })).allowed).toBe(false);
+    // ...but a $0.30 credit (net spend $0.60) reopens headroom.
+    await t.mutation(api.lib.adjustBucket, { dimension: "user", value: "u", deltaNanos: -300_000_000 });
+    expect((await start(t, { userId: "u", estimatedCostNanos: 200_000_000 })).allowed).toBe(true);
   });
 });
 
@@ -639,6 +654,11 @@ describe("accounting lifecycle regressions", () => {
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
     expect((await t.query(api.lib.getGlobalStatus, {})).spentTotalNanos).toBe(100);
     await t.mutation(api.lib.setGlobalLimits, { lifetimeSpendLimitNanos: 100 });
+    // The killswitch trips out-of-band (H4): the reconciler's globalPhase
+    // compares the sharded total to the cap and flags settings; admission reads
+    // the flag. So a request admits until the flag is set, then blocks.
+    expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed).toBe(true);
+    await t.mutation(internal.lib.globalPhase, {});
     expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed).toBe(false);
   });
 
@@ -842,5 +862,32 @@ describe("v1 hardening (round 3): reconcile phases", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("v1: deployment policy (unpriced models, content storage)", () => {
+  test("blocking unpriced models rejects a model with no configured price", async () => {
+    const t = initTest();
+    await t.mutation(api.lib.setDeploymentPolicy, { allowUnpricedModels: false });
+    const r = await start(t, { userId: "u", model: "made/up-model" });
+    expect(r.allowed).toBe(false);
+    expect(r.code).toBe("model_unpriced");
+    // A priced model still admits.
+    expect((await start(t, { userId: "u", model: MODEL })).allowed).toBe(true);
+  });
+
+  test("storeContent:false keeps metadata but drops prompt/response content", async () => {
+    const t = initTest();
+    await t.mutation(api.lib.setDeploymentPolicy, { storeContent: false });
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, {
+      promptTokens: 10,
+      completionTokens: 5,
+      responseText: "secret answer",
+    });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.messages).toEqual([]); // prompt not stored
+    expect(req.responseText ?? undefined).toBe(undefined); // response not stored
+    expect(req.promptTokens).toBe(10); // metadata/cost still recorded
   });
 });
