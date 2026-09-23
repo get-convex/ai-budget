@@ -577,8 +577,14 @@ audit table. **Spend history survives** — it lives in separate durable rollups
 > **Prompt/response content is stored** on the request row until the window sweeps
 > it (default 1h), so it's visible in the request log and to admin reads until
 > then. If your prompts carry PII you don't want retained, shorten `retentionMs`
-> (or set it low enough that content lives only as long as you need replay). Spend
-> rollups never contain content, so trimming retention doesn't cost you history.
+> (or use `ai.global.setPolicy({ storeContent: false })`). Spend rollups never
+> contain content, so trimming retention doesn't cost you history.
+>
+> Stored content is **capped** (~16 KB of prompt + ~16 KB of response, most-recent
+> messages kept) so one large prompt can't approach Convex's 1 MiB document limit
+> or bloat the reconciler's scans — a very large prompt is truncated in the audit
+> copy (billing still uses the full estimate/actual cost). Requests are also
+> capped at 16 attribution tags.
 
 ---
 

@@ -891,3 +891,53 @@ describe("v1: deployment policy (unpriced models, content storage)", () => {
     expect(req.promptTokens).toBe(10); // metadata/cost still recorded
   });
 });
+
+describe("v1: Convex byte-limit hardening", () => {
+  test("a huge prompt is truncated for storage but estimated at full size", async () => {
+    const t = initTest();
+    const huge = "x".repeat(500_000);
+    const r = await start(t, { userId: "u", messages: [{ role: "user", content: huge }] });
+    expect(r.allowed).toBe(true);
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const stored = req.messages.reduce((n: number, m: any) => n + m.content.length, 0);
+    expect(stored).toBeLessThanOrEqual(20_000); // row stays far under 1 MiB
+    // The token estimate still reflects the full prompt, so a tiny cap blocks it.
+    await setUserLimits(t, "u2", { dailyTokenLimit: 1000 });
+    const blocked = await start(t, { userId: "u2", messages: [{ role: "user", content: huge }] });
+    expect(blocked.allowed).toBe(false);
+  });
+
+  test("a huge responseText is truncated for storage", async () => {
+    const t = initTest();
+    const r = await start(t, { userId: "u" });
+    await settleWith(t, r.requestId, {
+      promptTokens: 1,
+      completionTokens: 1,
+      responseText: "y".repeat(200_000),
+    });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect((req.responseText ?? "").length).toBeLessThanOrEqual(20_000);
+  });
+
+  test("the number of attribution tags per request is bounded", async () => {
+    const t = initTest();
+    const tags = Array.from({ length: 100 }, (_, i) => ({ dimension: `d${i}`, value: "v" }));
+    const r = await start(t, { userId: "u", tags });
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect((req.tags ?? []).length).toBeLessThanOrEqual(16);
+  });
+
+  test("listRequests clamps the page size and strips content", async () => {
+    const t = initTest();
+    const r = await start(t, { userId: "u", messages: [{ role: "user", content: "hello" }] });
+    await settleWith(t, r.requestId, {
+      promptTokens: 10,
+      completionTokens: 5,
+      responseText: "a response",
+    });
+    const rows = await t.query(api.lib.listRequests, { userId: "u", limit: 10_000_000 });
+    expect(rows.length).toBeLessThanOrEqual(200);
+    expect(rows[0].messages).toEqual([]);
+    expect(rows[0].responseText ?? undefined).toBe(undefined);
+  });
+});

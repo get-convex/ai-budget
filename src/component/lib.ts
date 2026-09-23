@@ -51,6 +51,56 @@ const safeCount = (n: number | undefined) =>
 // staying NaN forever.
 const fin = (n: number | undefined) => (Number.isFinite(n) ? (n as number) : 0);
 
+// Byte-limit guards. A `requests` row stores caller-controlled prompt/response
+// content; Convex caps a document at 1 MiB and a transaction read at ~8 MiB /
+// 16,384 docs. Cap what we STORE (not what we estimate from) so one big prompt
+// can't fail the insert, and so reconcile/retention/delete scans that read full
+// rows stay well under the transaction read limit.
+const MAX_MSG_CONTENT = 8 * 1024; // per message
+const MAX_STORED_MESSAGES_BYTES = 16 * 1024; // total across a row's messages
+const MAX_STORED_RESPONSE_BYTES = 16 * 1024;
+const MAX_STORED_MESSAGES = 48; // keep the most recent N
+const MAX_TAGS = 16; // extra attribution dimensions per request
+const MAX_SERVER_TOOLS = 32; // distinct server-tool keys per settle
+
+const truncate = (s: string, n: number) =>
+  s.length > n ? s.slice(0, n) + "…[truncated]" : s;
+
+// Cap prompt content for STORAGE: keep the most recent messages, cap each and
+// the total. The token estimate still uses the full (uncapped) prompt.
+function capMessages(
+  messages: { role: string; content: string }[]
+): { role: string; content: string }[] {
+  const recent = messages.slice(-MAX_STORED_MESSAGES);
+  const out: { role: string; content: string }[] = [];
+  let total = 0;
+  for (const m of recent) {
+    if (total >= MAX_STORED_MESSAGES_BYTES) break;
+    const raw = typeof m.content === "string" ? m.content : String(m.content ?? "");
+    const room = Math.min(MAX_MSG_CONTENT, MAX_STORED_MESSAGES_BYTES - total);
+    const content = truncate(raw, room);
+    total += content.length;
+    out.push({ role: String(m.role), content });
+  }
+  return out;
+}
+const capResponse = (s: string | undefined) =>
+  s === undefined ? undefined : truncate(s, MAX_STORED_RESPONSE_BYTES);
+// Bound the server-tool record stored on the row (its keys are caller-supplied).
+function boundServerTools(
+  uses: Record<string, number>
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(uses)) {
+    if (n >= MAX_SERVER_TOOLS) break;
+    out[k.slice(0, 64)] = safeCount(v);
+    n++;
+  }
+  return out;
+}
+
+
 // Built-in attribution dimensions. `user` and `action` are always populated
 // from a request's userId/actionName; apps can add any other dimensions
 // (team, project, customer, env, …) as tags. These two names are reserved —
@@ -112,7 +162,9 @@ const DEFAULT_RETENTION_MS = 60 * 60 * 1000; // 1 hour
 // prompts/responses) so a burst can't push one phase past Convex's 8 MiB / 16k-
 // doc read limit and stall the whole reconciler. A phase that fills its batch
 // reschedules itself immediately, so throughput still scales with backlog.
-const RECONCILE_BATCH = 50;
+// Small enough that even retentionPhase's several full-row scans in one
+// transaction stay well under the ~8 MiB read limit (rows carry capped content).
+const RECONCILE_BATCH = 25;
 // Keep an expired billing tombstone (content already purged) this long so a very
 // late provider charge can still land against it, then delete it. A finish after
 // deletion is a graceful no-op.
@@ -305,6 +357,10 @@ function sanitizeExtraTags(
     if (out.some((x) => x.dimension === t.dimension && x.value === t.value))
       continue;
     out.push({ dimension: t.dimension, value: t.value });
+    // Bound per-request fan-out: each extra tag becomes a bucket read/patch, a
+    // requestTags insert, and a reservation. An unbounded list would blow the
+    // mutation's document write/read limits and wedge the call.
+    if (out.length >= MAX_TAGS) break;
   }
   return out;
 }
@@ -545,7 +601,7 @@ export const startRequest = mutation({
           actionName: args.actionName,
           ...(extraTags.length ? { tags: extraTags } : {}),
           model: args.model,
-          messages: storeContent ? args.messages : [],
+          messages: storeContent ? capMessages(args.messages) : [],
           rerunOf: args.rerunOf,
           status: "blocked" as const,
           error: reason,
@@ -785,7 +841,7 @@ export const startRequest = mutation({
       actionName: args.actionName,
       ...(extraTags.length ? { tags: extraTags } : {}),
       model: args.model,
-      messages: storeContent ? args.messages : [],
+      messages: storeContent ? capMessages(args.messages) : [],
       rerunOf: args.rerunOf,
       ...(args.reserveTtlMs !== undefined ? { reserveTtlMs: args.reserveTtlMs } : {}),
       status: "pending",
@@ -884,12 +940,14 @@ export const finishRequest = mutation({
       reservationExpired: false,
       expiresAt: undefined,
       finishedAt: Date.now(),
-      responseText: storeContent ? args.responseText : undefined,
-      error: args.error,
+      responseText: storeContent ? capResponse(args.responseText) : undefined,
+      error: capResponse(args.error),
       promptTokens,
       completionTokens,
       ...(cachedTokens > 0 ? { cachedTokens } : {}),
-      ...(args.serverToolUses ? { serverToolUses: args.serverToolUses } : {}),
+      ...(args.serverToolUses
+        ? { serverToolUses: boundServerTools(args.serverToolUses) }
+        : {}),
       costNanos,
       latencyMs: args.latencyMs,
       settled: false,
@@ -1180,46 +1238,59 @@ export const listRequests = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const limit = args.limit ?? 50;
+    // Clamp the page size so a caller can't force a scan past the transaction's
+    // read limits, and strip prompt/response content from the LOG view — it's a
+    // metadata list (the dashboard renders no content), and returning up to
+    // `limit` full rows risks both the read-bytes and return-size limits. Full
+    // content is available per-row via getRequest.
+    const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 50)), MAX_LIST);
+    const strip = (r: Doc<"requests">) => ({
+      ...r,
+      messages: [],
+      responseText: undefined,
+    });
     const dim = args.dimension;
     const val = args.value ?? args.userId;
+    let rows: Doc<"requests">[];
     if (dim === undefined && args.userId !== undefined) {
       const userId = args.userId;
-      return await ctx.db
+      rows = await ctx.db
         .query("requests")
         .withIndex("userId", (q) => q.eq("userId", userId))
         .order("desc")
         .take(limit);
-    }
-    if (dim !== undefined && val !== undefined) {
-      if (dim === USER_DIM) {
-        return await ctx.db
-          .query("requests")
-          .withIndex("userId", (q) => q.eq("userId", val))
-          .order("desc")
-          .take(limit);
-      }
-      if (dim === ACTION_DIM) {
-        return await ctx.db
-          .query("requests")
-          .withIndex("actionName", (q) => q.eq("actionName", val))
-          .order("desc")
-          .take(limit);
-      }
+    } else if (dim !== undefined && val !== undefined && dim === USER_DIM) {
+      rows = await ctx.db
+        .query("requests")
+        .withIndex("userId", (q) => q.eq("userId", val))
+        .order("desc")
+        .take(limit);
+    } else if (dim !== undefined && val !== undefined && dim === ACTION_DIM) {
+      rows = await ctx.db
+        .query("requests")
+        .withIndex("actionName", (q) => q.eq("actionName", val))
+        .order("desc")
+        .take(limit);
+    } else if (dim !== undefined && val !== undefined) {
       // Custom tag dimension: walk the reverse index, then fetch each request.
       const tagRows = await ctx.db
         .query("requestTags")
         .withIndex("dim_value", (q) => q.eq("dimension", dim).eq("value", val))
         .order("desc")
         .take(limit);
-      const rows = await Promise.all(tagRows.map((t) => ctx.db.get(t.requestId)));
-      return rows.filter((r): r is Doc<"requests"> => r !== null);
+      const fetched = await Promise.all(tagRows.map((t) => ctx.db.get(t.requestId)));
+      rows = fetched.filter((r): r is Doc<"requests"> => r !== null);
+    } else {
+      rows = await ctx.db.query("requests").order("desc").take(limit);
     }
-    return await ctx.db.query("requests").order("desc").take(limit);
+    return rows.map(strip);
   },
 });
 
 const ADMIN_LIST_CAP = 2000;
+// Max rows a single listRequests page returns (content-stripped). Bounds both
+// the read scan and the return-value size.
+const MAX_LIST = 200;
 
 // List budget buckets, optionally filtered to one dimension ("user", "action",
 // or any custom tag dimension). Today's spend is zeroed for stale day windows.
@@ -1455,7 +1526,9 @@ export const setDeploymentPolicy = mutation({
 // Delete a bucket and (for the `user` dimension) all of that user's request
 // rows — e.g. account deletion / GDPR. Deletes requests in bounded batches and
 // self-reschedules so it never exceeds the per-transaction document limit.
-const DELETE_BATCH = 500;
+// Small: each row read carries (capped) content, and each is now folded/released
+// before deletion, so keep the per-transaction read + work bounded.
+const DELETE_BATCH = 50;
 export const deleteBucket = mutation({
   args: { dimension: v.string(), value: v.string() },
   returns: v.object({ deletedThisBatch: v.number(), done: v.boolean() }),
