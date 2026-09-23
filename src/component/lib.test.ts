@@ -36,10 +36,13 @@ async function settle(t: any, requestId: any, p = 10, c = 5) {
     promptTokens: p,
     completionTokens: c,
   });
-  // finishRequest schedules the fold via runAfter(0); drain it.
+  // finishRequest schedules the fold via runAfter(0); drain it, then drain the
+  // rollup (uncapped totals + usage history land there, ~1 reconcile behind in
+  // prod).
   vi.useFakeTimers();
   await t.finishAllScheduledFunctions(vi.runAllTimers);
   vi.useRealTimers();
+  await t.mutation(internal.lib.rollupPhase, {});
 }
 const setUserLimits = (t: any, userId: string, limits: any) =>
   t.mutation(api.lib.setBucketLimits, {
@@ -84,6 +87,7 @@ async function settleWith(t: any, requestId: any, fields: any) {
   vi.useFakeTimers();
   await t.finishAllScheduledFunctions(vi.runAllTimers);
   vi.useRealTimers();
+  await t.mutation(internal.lib.rollupPhase, {});
 }
 
 describe("monthly budgets", () => {
@@ -724,6 +728,7 @@ test("delayed folding attributes spend to completion day and leaves newer holds 
     vi.setSystemTime(new Date("2026-10-01T00:01:00Z"));
     await start(t, { userId: "u", estimatedCostNanos: 100 });
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
+    await t.mutation(internal.lib.rollupPhase, {}); // drain the settlement delta into usage
     const b = await userOf(t, "u");
     expect(b.spendTodayNanos).toBe(0);
     expect(b.reservedTodayNanos).toBe(100);
@@ -838,6 +843,7 @@ describe("v1 hardening (round 2)", () => {
     vi.useFakeTimers();
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     vi.useRealTimers();
+    await t.mutation(internal.lib.rollupPhase, {}); // drain uncapped totals
     const u = await userOf(t, "u");
     expect(u.totalSpendNanos).toBe(2_000_000_000);
   });
@@ -939,5 +945,55 @@ describe("v1: Convex byte-limit hardening", () => {
     expect(rows.length).toBeLessThanOrEqual(200);
     expect(rows[0].messages).toEqual([]);
     expect(rows[0].responseText ?? undefined).toBe(undefined);
+  });
+});
+
+describe("v1: H6 fold de-contention", () => {
+  test("an uncapped shared bucket is folded via the rollup, not on the settle path", async () => {
+    const t = initTest();
+    // Two requests attributed to a shared, UNCAPPED action bucket.
+    for (const i of [1, 2]) {
+      const r = await start(t, { userId: `u${i}`, actionName: "shared" });
+      await t.mutation(api.lib.finishRequest, {
+        requestId: r.requestId,
+        costNanos: 100_000_000,
+      });
+    }
+    vi.useFakeTimers();
+    await t.finishAllScheduledFunctions(vi.runAllTimers); // fold -> append deltas
+    vi.useRealTimers();
+    // The shared action row is NOT written on the hot settle path (no
+    // contention): its total is still 0, the spend sits in queued deltas.
+    const before = await bucketOf(t, "action", "shared");
+    expect(before?.totalSpendNanos ?? 0).toBe(0);
+    const deltas = await t.run((ctx: any) => ctx.db.query("usageDeltas").collect());
+    expect(deltas.length).toBeGreaterThan(0);
+    // The reconciler's rollup drains them into the row + usage history.
+    await t.mutation(internal.lib.rollupPhase, {});
+    const after = await bucketOf(t, "action", "shared");
+    expect(after.totalSpendNanos).toBe(200_000_000);
+    expect(after.totalRequests).toBe(2);
+    const hist = await t.query(api.lib.usageHistory, {
+      dimension: "action",
+      value: "shared",
+      period: "day",
+    });
+    expect(hist[0].spendNanos).toBe(200_000_000);
+    expect(await t.run((ctx: any) => ctx.db.query("usageDeltas").collect())).toHaveLength(0);
+  });
+
+  test("a capped bucket is updated live and NOT double-counted by the rollup", async () => {
+    const t = initTest();
+    await setUserLimits(t, "u", { lifetimeSpendLimitNanos: 1_000_000_000 });
+    const r = await start(t, { userId: "u" });
+    // finish + fold (capped row updated live)...
+    await t.mutation(api.lib.finishRequest, { requestId: r.requestId, costNanos: 300_000_000 });
+    vi.useFakeTimers();
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    vi.useRealTimers();
+    expect((await userOf(t, "u")).totalSpendNanos).toBe(300_000_000); // live
+    // ...draining the rollup must NOT add it again.
+    await t.mutation(internal.lib.rollupPhase, {});
+    expect((await userOf(t, "u")).totalSpendNanos).toBe(300_000_000);
   });
 });

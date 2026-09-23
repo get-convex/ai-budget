@@ -524,6 +524,21 @@ async function admissionBucket(ctx: MutationCtx, dimension: string, value: strin
     totalTokens: 0, dayStamp: "", spendTodayNanos: 0 };
 }
 
+// Does this bucket have a cap (so its row must be updated live at settle for
+// enforcement)? Reads the cold policy table, not the hot counter row. Uncapped
+// buckets are folded into their row lazily by the reconciler's rollupPhase.
+async function bucketIsCapped(
+  ctx: MutationCtx,
+  dimension: string,
+  value: string
+): Promise<boolean> {
+  const policy = await ctx.db
+    .query("bucketPolicies")
+    .withIndex("dim_value", (q) => q.eq("dimension", dimension).eq("value", value))
+    .unique();
+  return policy ? needsReserve(policy) : false;
+}
+
 async function getSettings(ctx: MutationCtx) {
   return await ctx.db
     .query("settings")
@@ -997,26 +1012,44 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   const day = timestamp.slice(0, 10);
   const month = timestamp.slice(0, 7);
   for (const t of requestBuckets(req.userId, req.actionName, req.tags)) {
-    const b = await getOrCreateBucket(ctx, t.dimension, t.value);
-    // Keep the newest reporting window and clear obsolete window holds when
-    // advancing it. Lifetime holds persist until their owner releases them.
-    const targetDay = b.dayStamp > day ? b.dayStamp : day;
-    const targetMonth = (b.monthStamp ?? "") > month ? b.monthStamp! : month;
-    await ctx.db.patch(b._id, {
-      totalSpendNanos: b.totalSpendNanos + actual,
-      totalRequests: b.totalRequests + 1,
-      totalTokens: b.totalTokens + tokens,
-      dayStamp: targetDay,
-      monthStamp: targetMonth,
-      spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0) + (day === targetDay ? actual : 0),
-      tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0) + (day === targetDay ? tokens : 0),
-      spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0) + (month === targetMonth ? actual : 0),
-      tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0) + (month === targetMonth ? tokens : 0),
-      ...(b.dayStamp !== targetDay ? { reservedTodayNanos: 0, reservedTodayTokens: 0 } : {}),
-      ...(b.monthStamp !== targetMonth ? { reservedMonthNanos: 0, reservedMonthTokens: 0 } : {}),
+    // Capped buckets need their row updated LIVE so the next admission sees the
+    // spend (enforcement can't wait for the async rollup). They're per-user /
+    // low-concurrency, so the row isn't a hot contention point. Uncapped buckets
+    // (the shared action/tag rows) get NO write here — only an append-only delta
+    // the reconciler drains — so a hot shared dimension never serializes settles.
+    const capped = await bucketIsCapped(ctx, t.dimension, t.value);
+    if (capped) {
+      const b = await getBucketDoc(ctx, t.dimension, t.value);
+      if (b) {
+        const targetDay = b.dayStamp > day ? b.dayStamp : day;
+        const targetMonth = (b.monthStamp ?? "") > month ? b.monthStamp! : month;
+        await ctx.db.patch(b._id, {
+          totalSpendNanos: b.totalSpendNanos + actual,
+          totalRequests: b.totalRequests + 1,
+          totalTokens: b.totalTokens + tokens,
+          dayStamp: targetDay,
+          monthStamp: targetMonth,
+          spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0) + (day === targetDay ? actual : 0),
+          tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0) + (day === targetDay ? tokens : 0),
+          spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0) + (month === targetMonth ? actual : 0),
+          tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0) + (month === targetMonth ? tokens : 0),
+          ...(b.dayStamp !== targetDay ? { reservedTodayNanos: 0, reservedTodayTokens: 0 } : {}),
+          ...(b.monthStamp !== targetMonth ? { reservedMonthNanos: 0, reservedMonthTokens: 0 } : {}),
+        });
+      }
+    }
+    // Append-only delta: rollupPhase folds it into `usage` (history, all buckets)
+    // and, when uncapped, into the bucket-row totals.
+    await ctx.db.insert("usageDeltas", {
+      dimension: t.dimension,
+      value: t.value,
+      day,
+      month,
+      spendNanos: actual,
+      tokens,
+      requests: 1,
+      drainToRow: !capped,
     });
-    await addUsage(ctx, t.dimension, t.value, "day", day, actual, tokens, 1);
-    await addUsage(ctx, t.dimension, t.value, "month", month, actual, tokens, 1);
   }
   // Reporting is independent of whether enforcement is configured.
   if (actual > 0) {
@@ -1047,10 +1080,47 @@ export const reconcile = internalMutation({
   returns: v.null(),
   handler: async (ctx) => {
     await ctx.scheduler.runAfter(0, internal.lib.foldPhase, {});
+    await ctx.scheduler.runAfter(0, internal.lib.rollupPhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.expirePhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.retentionPhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.globalPhase, {});
     return null;
+  },
+});
+
+// H6: drain append-only settlement deltas into the durable `usage` history (all
+// buckets) and the uncapped bucket-row totals — as a single writer, so the hot
+// settle path never contends on a shared dimension's row. Self-reschedules while
+// backlogged.
+export const rollupPhase = internalMutation({
+  args: {},
+  returns: v.object({ drained: v.number() }),
+  handler: async (ctx) => {
+    const deltas = await ctx.db.query("usageDeltas").take(RECONCILE_BATCH);
+    for (const d of deltas) {
+      await addUsage(ctx, d.dimension, d.value, "day", d.day, d.spendNanos, d.tokens, d.requests);
+      await addUsage(ctx, d.dimension, d.value, "month", d.month, d.spendNanos, d.tokens, d.requests);
+      if (d.drainToRow) {
+        const b = await getOrCreateBucket(ctx, d.dimension, d.value);
+        const targetDay = b.dayStamp > d.day ? b.dayStamp : d.day;
+        const targetMonth = (b.monthStamp ?? "") > d.month ? b.monthStamp! : d.month;
+        await ctx.db.patch(b._id, {
+          totalSpendNanos: b.totalSpendNanos + d.spendNanos,
+          totalRequests: b.totalRequests + d.requests,
+          totalTokens: b.totalTokens + d.tokens,
+          dayStamp: targetDay,
+          monthStamp: targetMonth,
+          spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0) + (d.day === targetDay ? d.spendNanos : 0),
+          tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0) + (d.day === targetDay ? d.tokens : 0),
+          spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0) + (d.month === targetMonth ? d.spendNanos : 0),
+          tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0) + (d.month === targetMonth ? d.tokens : 0),
+        });
+      }
+      await ctx.db.delete(d._id);
+    }
+    if (deltas.length === RECONCILE_BATCH)
+      await ctx.scheduler.runAfter(0, internal.lib.rollupPhase, {});
+    return { drained: deltas.length };
   },
 });
 

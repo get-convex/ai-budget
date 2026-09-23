@@ -106,6 +106,23 @@ export default defineSchema({
     .index("bucket_period_stamp", ["dimension", "value", "period", "stamp"])
     .index("period_stamp", ["period", "stamp"]),
 
+  // Append-only settlement deltas (H6). foldOne INSERTS one row per attributed
+  // dimension here (inserts never conflict), so a shared/uncapped dimension is no
+  // longer a hot single row on the settle path. The reconciler's rollupPhase
+  // drains these into `usage` (history) and, for uncapped buckets, into the
+  // bucket-row totals — a single writer, so no contention. `drainToRow` is false
+  // for capped buckets, whose rows foldOne already updates live for enforcement.
+  usageDeltas: defineTable({
+    dimension: v.string(),
+    value: v.string(),
+    day: v.string(),
+    month: v.string(),
+    spendNanos: v.number(),
+    tokens: v.number(),
+    requests: v.number(),
+    drainToRow: v.boolean(),
+  }),
+
   // Reverse index for filtering the request log by an arbitrary tag dimension
   // (user/action are already indexed on `requests`). One row per extra tag per
   // request; cleaned up with the request on retention/deletion.

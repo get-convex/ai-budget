@@ -669,18 +669,21 @@ more tokens or costs more than estimated, settlement records the real amount and
 the final total can exceed a hard cap by that request's estimation delta. The next
 admission sees the settled total and blocks until there is headroom again.
 
-**Throughput characteristics (know these before you turn on a global cap).**
-Reconciliation runs as small, independently-rescheduling phases, so folding,
-expiry, and retention can't stall each other and each drains its own backlog.
-Two shared-write hot spots remain, by design:
-- The **global cap** reads a sharded counter *inside* admission, which contends
-  with every fold that writes it — so a configured global cap adds contention on
-  the hot path. It's a deployment-wide killswitch, not a high-throughput per-call
-  limit; prefer per-bucket caps for the common case.
-- **Settlement writes every attributed bucket**, including the per-request
-  `action` bucket that every call shares. That single row is written by every
-  settle, so an extremely high single-action settle rate can lag totals. Spread
-  load across naturally-sharded dimensions (per user/customer) where you can.
+**Throughput characteristics.** Reconciliation runs as small,
+independently-rescheduling phases, so folding, rollup, expiry, and retention
+can't stall each other and each drains its own backlog. The settle path is kept
+off shared hot rows:
+- **Admission never reads the sharded global counter.** A reconciler phase
+  compares the total to the cap out-of-band and flags `settings`; admission reads
+  one already-loaded doc. The killswitch trips within ~one reconcile interval
+  (that's what "approximate" means) instead of contending with every fold.
+- **Settlement doesn't write shared bucket rows.** A capped bucket's row is
+  updated live (it's per-user / low-concurrency, and enforcement needs it); every
+  other attributed bucket — the shared `action`/tag rows — gets only an
+  append-only delta, which the reconciler drains into totals + history as a single
+  writer. So a hot single-dimension settle rate no longer serializes on one row.
+  The trade: uncapped totals and spend history are eventually-consistent (≤ one
+  reconcile interval); live enforcement is not affected.
 
 The `error.md` file documents the adversarial audits this design survived, with
 live repros.
