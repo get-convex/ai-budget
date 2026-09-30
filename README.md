@@ -29,7 +29,7 @@ full audit log you can replay later.
 - [Deployment-wide controls](#deployment-wide-controls) — global cap, model policy, pricing, retention
 - [Admin dashboard](#admin-dashboard)
 - [How spend caps stay correct](#how-spend-caps-stay-correct) — the design
-- [Security](#security-before-you-ship)
+- [Security](#security-before-you-ship) — auth, dashboard gating, `no-ungoverned-ai` lint rule
 - [Example app](#example-app)
 - [Development](#development)
 
@@ -733,6 +733,34 @@ endpoints verbatim. In production:
    IDOR — verify `request.userId === caller`, or treat those as admin-only.
 4. **Gate the dashboard.** `registerRoutes` is a public endpoint; always pass a
    real `authorize` (or a token). See [Admin dashboard](#admin-dashboard).
+
+### Enforce it with ESLint · `no-ungoverned-ai`
+
+The budget only tracks spend that flows through it. To catch calls that bypass it —
+a stray `import OpenAI from "openai"`, a direct `generateText` from the AI SDK, or
+direct AI Gateway access — the package ships a flat-config ESLint plugin at
+`@convex-dev/ai-budget/eslint`. It's an **import boundary**: provider SDKs are
+allowed only in your budget wrapper module (where the real call lives inside a
+budget callback), and flagged everywhere else.
+
+```js
+// eslint.config.js
+import aiBudget from "@convex-dev/ai-budget/eslint";
+
+export default [
+  aiBudget.configs.recommended, // warns on ungoverned AI imports
+  // your wrapper module is allowed to touch the raw SDKs:
+  { files: ["convex/ai.ts"],
+    rules: { "@convex-dev/ai-budget/no-ungoverned-ai": "off" } },
+];
+```
+
+By default it flags `ai`, `@ai-sdk/*`, `openai`, `@anthropic-ai/*`, `@openrouter/*`,
+`@convex-dev/ai-sdk-provider` (direct gateway access), and other provider SDKs, at
+**`warn`** severity — set it to `"error"` in CI to truly block. Options:
+`allow` (globs for wrapper files, an alternative to a `files` override),
+`extraProviders` (add packages to flag), and `providers` (replace the list).
+`eslint` is an optional peer dependency — nothing is pulled in unless you use it.
 
 ---
 

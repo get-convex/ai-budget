@@ -51,6 +51,10 @@
     },
     "./_generated/component.js": {
       "types": "./dist/component/_generated/component.d.ts"
+    },
+    "./eslint": {
+      "types": "./dist/eslint/index.d.ts",
+      "default": "./dist/eslint/index.js"
     }
   },
   "types": "./dist/client/index.d.ts",
@@ -62,12 +66,19 @@
   "peerDependencies": {
     "@convex-dev/ai-sdk-provider": "*",
     "ai": "^5.0.0 || ^6.0.0 || ^7.0.0",
-    "convex": "^1.45.0"
+    "convex": "^1.45.0",
+    "eslint": ">=8.57.0"
+  },
+  "peerDependenciesMeta": {
+    "eslint": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@edge-runtime/vm": "5.0.0",
     "convex": "1.45.0",
     "convex-test": "0.0.56",
+    "eslint": "^9.0.0",
     "typescript": "^5.7.0",
     "vitest": "4.1.11"
   }
