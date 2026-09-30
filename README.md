@@ -251,6 +251,26 @@ await ai.meter(ctx,
   });
 ```
 
+**Image editing** is the same shape — `ai.meter` doesn't care what the callback
+does. Bring the provider's edit call and report the units; give edits their own
+server-tool key if they're priced differently from generations:
+
+```ts
+const IMG_EDIT = 160_000_000; // $0.16/edit, via setServerTool({ tool: "image_edit", … })
+await ai.meter(ctx,
+  { userId, model: "openai/gpt-image-1", messages: [{ role: "user", content: prompt }],
+    estimatedCostNanos: IMG_EDIT * n },
+  async () => {
+    const res = await openrouter.images.edit({ model: "openai/gpt-image-1", image, prompt, n });
+    return { serverToolUses: { image_edit: n } };
+  });
+```
+
+The same pattern meters audio, transcription, TTS, embeddings — anything with a
+known per-call price: reserve with `estimatedCostNanos`, report `serverToolUses`,
+price the units with `setServerTool`. There is no image-specific method; `ai.meter`
+is the entrypoint for every per-call modality.
+
 ### `ai.decisions` — structured decisions (Jev)
 
 > **Note** — the Decisions endpoint is generally available on the gateway. The
