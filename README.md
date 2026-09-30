@@ -251,10 +251,11 @@ await ai.meter(ctx,
   });
 ```
 
-### `ai.decisions` — structured decisions (Jev) · **experimental**
+### `ai.decisions` — structured decisions (Jev)
 
-> **Experimental** — the Decisions endpoint is alpha on the gateway; this API may
-> change without a major version bump.
+> **Note** — the Decisions endpoint is generally available on the gateway. The
+> client sugar calls the AI SDK's `experimental_evaluate` export, which is itself
+> version-gated; pin your `ai` version if you depend on it.
 
 Budget the gateway's Decisions endpoint ([Jev](https://docs.typesafe.ai)) — typed
 `choice` / `score` / `boolean` questions evaluated against a `state` — with the
@@ -779,14 +780,16 @@ changed before the upgrade. New requests always store explicit ownership.
 ## Stability (v1)
 
 **Stable (frozen for 1.0)** — these keep backward compatibility within the 1.x line:
-`ai.chat`, `ai.meter`, `ai.begin`/`ai.settle`, `ai.languageModel`, and the admin
+`ai.chat`, `ai.meter`, `ai.decisions`, `ai.languageModel`, and the admin
 namespaces `ai.users` / `ai.actions` / `ai.tag` / `ai.global` / `ai.models` /
 `ai.prices` / `ai.requests`, plus `ai.registerRoutes`. The stored schema is frozen;
-new fields will only be added as optional.
+new fields will only be added as optional. `ai.decisions` is backed by the
+gateway's generally-available Decisions (Jev) endpoint; the only moving part is the
+AI SDK's `experimental_evaluate` export it calls, so pin your `ai` version.
 
-**Experimental (may change without a major bump):** `ai.decisions` (the Jev /
-Decisions endpoint) and video generation (`begin`/`settle` with `reserveTtlMs` +
-`registerWebhook`). Both depend on gateway features that are still alpha.
+**Experimental (may change without a major bump):** video generation
+(`ai.begin`/`ai.settle` with `reserveTtlMs` + `registerWebhook`), which depends on
+gateway features that are still alpha.
 
 **Semantics worth knowing:**
 - **Spend caps** admit on an *estimate*, so a token-priced cap can be exceeded by
