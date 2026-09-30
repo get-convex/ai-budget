@@ -762,6 +762,11 @@ By default it flags `ai`, `@ai-sdk/*`, `openai`, `@anthropic-ai/*`, `@openrouter
 `extraProviders` (add packages to flag), and `providers` (replace the list).
 `eslint` is an optional peer dependency — nothing is pulled in unless you use it.
 
+The rule matches on import sources, so it works with any parser. Convex code is
+TypeScript, so lint it with [typescript-eslint](https://typescript-eslint.io) in
+your config (as any TS project would); the rule then applies to your `.ts` files
+alongside everything else.
+
 ---
 
 ## Example app
