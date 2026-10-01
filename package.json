@@ -1,6 +1,6 @@
 {
   "name": "@convex-dev/ai-budget",
-  "description": "Metered, budget-governed AI Gateway usage for Convex: cost & usage tracking, per-user/per-action/global spend/token/rate limits, request logging, re-run, and an Agent-component adapter.",
+  "description": "Metered, budget-governed AI spend for Convex — the AI Gateway or any provider (fal, Replicate, image/audio gen, a raw fetch) via ai.meter: cost & usage tracking, per-user/per-action/global spend/token/rate limits, request logging, re-run, and an Agent-component adapter.",
   "repository": "github:get-convex/ai-budget",
   "homepage": "https://github.com/get-convex/ai-budget#readme",
   "bugs": {

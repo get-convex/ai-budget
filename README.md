@@ -15,6 +15,11 @@ token (no API keys to manage), attributed to the authenticated user, checked
 against their limits, billed to the right user and feature, and written to a
 full audit log you can replay later.
 
+**Not just the gateway.** Need a provider it doesn't serve — fal, Replicate,
+image/audio generation, a raw `fetch`? [`ai.meter`](#aimeter--budget-any-provider-call)
+wraps *any* call, made with *your own key*, under the same budgets, caps, and
+audit log. The gateway is the zero-config default, never the only option.
+
 ![Chat with a live request log — every call tracked, priced, and attributed](docs/hero.png)
 
 ## Contents
@@ -40,6 +45,7 @@ full audit log you can replay later.
 | | |
 |---|---|
 | **Usage & cost tracking** | Every request stored with messages, response, tokens, latency, and per-request cost. |
+| **Any provider, not just the gateway** | `ai.meter` budgets *any* call — fal, Replicate, image/audio gen, a raw `fetch` — made with your own key, under the same caps and audit log. `chat`/`languageModel` use the gateway; `meter` doesn't require it. |
 | **Attribution** | Each call is attributed to a `userId` **and** the Convex action that made it — auto-detected via `ctx.meta`, no manual tagging. |
 | **Tagged budgets** | `user` and `action` are just built-in *dimensions* — add your own (team, project, customer, env…) via `tags`, and cap any of them. One request can be billed to several buckets at once. |
 | **Spend & token limits** | Per-bucket **daily / monthly / lifetime** spend and token budgets, plus requests-per-minute, a max-concurrent cap, and a block switch. |
@@ -208,10 +214,16 @@ calling action. See `example/convex/agentDemo.ts`.
 ### `ai.meter` — budget *any* provider call
 
 `chat`/`languageModel` go through the gateway. When you need something the
-gateway can't serve (Anthropic web search, computer-use, a different provider,
-a raw `fetch`), `meter` brings that call under the *same* caps, audit log, and
-cost tracking. It reserves before your `run` (throwing over a hard cap), runs
-it, and records the actual usage:
+gateway can't serve (Anthropic web search, computer-use, **fal / Replicate /
+any other provider**, a raw `fetch`), `meter` brings that call under the *same*
+caps, audit log, and cost tracking. It reserves before your `run` (throwing over
+a hard cap), runs it, and records the actual usage.
+
+The call inside `run` is **yours** — it uses *your* provider credentials (an
+`OPENAI_API_KEY`, a `FAL_KEY`, whatever) and **does not route through the Convex
+AI Gateway**. The gateway is only the default for `chat`/`languageModel`; `meter`
+just needs the resulting cost (token usage, `serverToolUses`, or an authoritative
+`costNanos`). So you can budget any provider the gateway doesn't offer:
 
 ```ts
 await ai.meter(ctx, { userId, model: "anthropic/claude-…", messages }, async () => {
@@ -241,15 +253,23 @@ cap is exact (the token estimate is meaningless for these). Price the units with
 `serverToolUses` + [`setServerTool`](#pricing--cost):
 
 ```ts
-const IMG = 130_000_000; // $0.13/image
+// fal.ai image generation, budgeted per buyer — called directly with YOUR fal
+// key; the gateway is not involved. Just tell the budget the cost.
+import { fal } from "@fal-ai/client"; // fal.config({ credentials: process.env.FAL_KEY })
+const IMG = 50_000_000; // $0.05/image → setServerTool({ tool: "image", nanosPerCall: IMG })
 await ai.meter(ctx,
-  { userId, model: "openai/gpt-image-1", messages: [{ role: "user", content: prompt }],
+  { userId, model: "fal-ai/flux-pro/v1.1", messages: [{ role: "user", content: prompt }],
+    tags: [{ dimension: "buyer", value: buyerId }], // cap spend per buyer
     estimatedCostNanos: IMG * n },
   async () => {
-    const res = await openrouter.images.generate({ model: "openai/gpt-image-1", prompt, n });
+    const res = await fal.subscribe("fal-ai/flux-pro/v1.1", { input: { prompt, num_images: n } });
     return { serverToolUses: { image: n } };   // priced via setServerTool({ tool: "image", … })
   });
 ```
+
+`model` here is just an attribution/pricing label — it can name any provider's
+model, gateway or not. Over a hard per-buyer cap, `meter` throws before the fal
+call runs, so a buyer can't blow past their picture budget.
 
 **Image editing** is the same shape — `ai.meter` doesn't care what the callback
 does. Bring the provider's edit call and report the units; give edits their own
