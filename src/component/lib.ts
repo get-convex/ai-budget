@@ -1,15 +1,18 @@
-import { v } from "convex/values";
-import {
-  mutation,
-  internalMutation,
-  query,
-  type MutationCtx,
-} from "./_generated/server";
-import { api, internal, components } from "./_generated/api";
-import { vMessage, vTag } from "./schema";
-import type { Doc } from "./_generated/dataModel";
-import { RateLimiter, MINUTE } from "@convex-dev/rate-limiter";
+import { MINUTE, RateLimiter } from "@convex-dev/rate-limiter";
 import { ShardedCounter } from "@convex-dev/sharded-counter";
+import { paginator } from "convex-helpers/server/pagination";
+import { paginationOptsValidator } from "convex/server";
+import { type Infer, v } from "convex/values";
+import { components, internal } from "./_generated/api";
+import type { Doc } from "./_generated/dataModel";
+import {
+  internalMutation,
+  mutation,
+  type MutationCtx,
+  query,
+  type QueryCtx,
+} from "./_generated/server";
+import schema, { vMessage, vTag } from "./schema";
 
 // All money is integer **nanodollars** (1 USD = 1e9 nano). Integers avoid the
 // rounding drift that floating-point cents accumulate over millions of
@@ -26,26 +29,97 @@ const fmtUsd = (nanos: number) => `$${(nanos / NANOS_PER_DOLLAR).toFixed(4)}`;
 // unlimited spend; +Infinity in totals is just as corrupting. Validate every
 // externally-supplied accounting amount at the mutation boundary.
 function assertAmount(
-  n: number | undefined,
+  n: number | null | undefined,
   name: string,
-  { signed = false }: { signed?: boolean } = {}
+  { signed = false }: { signed?: boolean; } = {},
 ) {
-  if (n === undefined) return;
+  if (n == null) return;
   if (!Number.isFinite(n) || !Number.isSafeInteger(n)) {
     throw new Error(`${name} must be a finite safe integer (got ${n})`);
   }
   if (!signed && n < 0) throw new Error(`${name} must be nonnegative (got ${n})`);
 }
-function assertFraction(n: number | undefined, name: string) {
-  if (n === undefined) return;
+function assertFraction(n: number | null | undefined, name: string) {
+  if (n == null) return;
   if (!Number.isFinite(n) || n < 0 || n > 1) {
     throw new Error(`${name} must be a number in [0, 1] (got ${n})`);
   }
 }
+// Reject overflow at the write boundary; never silently lose financial precision.
+// `saturate` is for the settle/reconcile hot path ONLY. There, a running total
+// (lifetime spend/tokens) crossing 2^53 (~$9.007M on one bucket) would make
+// assertAmount throw, roll back the fold batch, and make foldPhase retry it
+// forever — wedging the reconciler deployment-wide. On that path we clamp at the
+// safe-integer ceiling (loudly) so accounting keeps flowing; totals past the
+// ceiling go approximate. Admin paths DON'T saturate — overflow there is a user
+// action that must fail closed. (A true fix is int64/BigInt-backed totals.)
+function checkedAccounting<T extends Record<string, unknown>>(
+  fields: T,
+  opts?: { saturate?: boolean; },
+): T {
+  for (const [key, value] of Object.entries(fields)) {
+    if (
+      typeof value === "number" && key !== "warnAtPct" && key !== "defaultWarnAtPct"
+      && !key.endsWith("At")
+    ) {
+      if (opts?.saturate) {
+        if (!Number.isFinite(value)) {
+          throw new Error(`${key} must be a finite number (got ${value})`);
+        }
+        if (!Number.isSafeInteger(value)) {
+          const clamped = value < 0 ? -Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+          console.warn(
+            `ai-budget: ${key} overflowed the safe-integer range (${value}); `
+              + `saturating at ${clamped}. Totals past ~$9M on one bucket are approximate.`,
+          );
+          (fields as Record<string, number>)[key] = clamped;
+        }
+      } else {
+        assertAmount(value, key, { signed: true });
+      }
+    }
+  }
+  return fields;
+}
+const pageSize = (n: number | undefined, fallback: number, max = 200) => {
+  if (n !== undefined) assertAmount(n, "limit");
+  return Math.min(Math.max(1, n ?? fallback), max);
+};
+// All mutations advancing a window must expire its credits along with its holds.
+function windowResets(b: Doc<"buckets">, day: string, month: string) {
+  return {
+    ...(b.dayStamp === day ? {} : {
+      creditsTodayNanos: 0,
+      reservedTodayNanos: 0,
+      reservedTodayTokens: 0,
+    }),
+    ...(b.monthStamp === month ? {} : {
+      creditsThisMonthNanos: 0,
+      reservedMonthNanos: 0,
+      reservedMonthTokens: 0,
+    }),
+  };
+}
+function normalizedBucket(b: Doc<"buckets">, day: string, month: string) {
+  return {
+    ...b,
+    ...windowResets(b, day, month),
+    spendTodayNanos: b.dayStamp === day ? b.spendTodayNanos : 0,
+    tokensToday: b.dayStamp === day ? b.tokensToday ?? 0 : 0,
+    spendThisMonthNanos: b.monthStamp === month ? b.spendThisMonthNanos ?? 0 : 0,
+    tokensThisMonth: b.monthStamp === month ? b.tokensThisMonth ?? 0 : 0,
+  };
+}
 // Coerce a caller/provider-supplied count to a finite nonnegative integer,
 // mapping NaN/Infinity/garbage to 0 rather than poisoning downstream totals.
 const safeCount = (n: number | undefined) =>
-  Number.isFinite(n) ? Math.max(0, Math.floor(n as number)) : 0;
+  Number.isFinite(n)
+    ? (() => {
+      const value = Math.max(0, Math.floor(n as number));
+      assertAmount(value, "token count");
+      return value;
+    })()
+    : 0;
 // Treat a non-finite stored accounting field as 0, so a bucket that was poisoned
 // before validation existed self-heals on its next reserve/release instead of
 // staying NaN forever.
@@ -62,25 +136,41 @@ const MAX_STORED_RESPONSE_BYTES = 16 * 1024;
 const MAX_STORED_MESSAGES = 48; // keep the most recent N
 const MAX_TAGS = 16; // extra attribution dimensions per request
 const MAX_SERVER_TOOLS = 32; // distinct server-tool keys per settle
+const MAX_REASON = 2 * 1024; // adjustment reason, bytes
+const MAX_AUDIT_DETAILS = 8 * 1024; // serialized admin-event details, bytes
+const MAX_MODELS = 1000; // model allow/deny-list entries
+const MAX_MODEL_LEN = 256; // per model-id length, chars
 
-const truncate = (s: string, n: number) =>
-  s.length > n ? s.slice(0, n) + "…[truncated]" : s;
+const encoder = new TextEncoder();
+const truncate = (s: string, n: number) => {
+  const bytes = encoder.encode(s);
+  if (bytes.length <= n) return s;
+  const suffix = "…[truncated]";
+  const suffixBytes = encoder.encode(suffix).length;
+  if (n <= suffixBytes) return new TextDecoder().decode(bytes.slice(0, Math.max(0, n - 3)));
+  return new TextDecoder().decode(bytes.slice(0, Math.max(0, n - suffixBytes - 3))) + suffix;
+};
+function assertKey(value: string, name: string, max = 256) {
+  if (!value || encoder.encode(value).length > max) {
+    throw new Error(`${name} must contain 1–${max} UTF-8 bytes`);
+  }
+}
 
 // Cap prompt content for STORAGE: keep the most recent messages, cap each and
 // the total. The token estimate still uses the full (uncapped) prompt.
 function capMessages(
-  messages: { role: string; content: string }[]
-): { role: string; content: string }[] {
+  messages: { role: string; content: string; }[],
+): { role: string; content: string; }[] {
   const recent = messages.slice(-MAX_STORED_MESSAGES);
-  const out: { role: string; content: string }[] = [];
+  const out: { role: string; content: string; }[] = [];
   let total = 0;
   for (const m of recent) {
     if (total >= MAX_STORED_MESSAGES_BYTES) break;
     const raw = typeof m.content === "string" ? m.content : String(m.content ?? "");
     const room = Math.min(MAX_MSG_CONTENT, MAX_STORED_MESSAGES_BYTES - total);
     const content = truncate(raw, room);
-    total += content.length;
-    out.push({ role: String(m.role), content });
+    total += encoder.encode(content).length;
+    out.push({ role: truncate(String(m.role), 32), content });
   }
   return out;
 }
@@ -88,7 +178,7 @@ const capResponse = (s: string | undefined) =>
   s === undefined ? undefined : truncate(s, MAX_STORED_RESPONSE_BYTES);
 // Bound the server-tool record stored on the row (its keys are caller-supplied).
 function boundServerTools(
-  uses: Record<string, number>
+  uses: Record<string, number>,
 ): Record<string, number> {
   const out: Record<string, number> = {};
   let n = 0;
@@ -99,7 +189,6 @@ function boundServerTools(
   }
   return out;
 }
-
 
 // Built-in attribution dimensions. `user` and `action` are always populated
 // from a request's userId/actionName; apps can add any other dimensions
@@ -127,7 +216,7 @@ const globalDayKey = (stamp: string) => `day:${stamp}`;
 
 // Fallback prices in NANODOLLARS per million tokens, used when no override is
 // stored (e.g. gpt-4o-mini = $0.15 in / $0.60 out per Mtok).
-const DEFAULT_PRICES: Record<string, { input: number; output: number }> = {
+const DEFAULT_PRICES: Record<string, { input: number; output: number; }> = {
   "anthropic/claude-sonnet-4.5": { input: 3_000_000_000, output: 15_000_000_000 },
   "anthropic/claude-haiku-4.5": { input: 1_000_000_000, output: 5_000_000_000 },
   "openai/gpt-4o": { input: 2_500_000_000, output: 10_000_000_000 },
@@ -194,7 +283,7 @@ const CONSERVATIVE_PRICE = Object.values(DEFAULT_PRICES).reduce(
     input: Math.max(m.input, p.input),
     output: Math.max(m.output, p.output),
   }),
-  { input: 20_000_000_000, output: 100_000_000_000 }
+  { input: 20_000_000_000, output: 100_000_000_000 },
 );
 
 async function getPrice(ctx: MutationCtx, model: string) {
@@ -207,30 +296,58 @@ async function getPrice(ctx: MutationCtx, model: string) {
       input: override.inputNanosPerMTok,
       output: override.outputNanosPerMTok,
       cached: override.cachedNanosPerMTok,
+      cacheWrite: override.cacheWriteNanosPerMTok,
+      cacheWrite1h: override.cacheWrite1hNanosPerMTok,
       known: true,
     };
   }
   const known = DEFAULT_PRICES[model];
-  if (known) return { ...known, cached: undefined, known: true };
-  return { ...CONSERVATIVE_PRICE, cached: undefined, known: false };
+  if (known) {
+    return {
+      ...known,
+      cached: undefined,
+      cacheWrite: undefined,
+      cacheWrite1h: undefined,
+      known: true,
+    };
+  }
+  return {
+    ...CONSERVATIVE_PRICE,
+    cached: undefined,
+    cacheWrite: undefined,
+    cacheWrite1h: undefined,
+    known: false,
+  };
 }
 
-type Price = { input: number; output: number; cached?: number };
+type Price = {
+  input: number;
+  output: number;
+  cached?: number;
+  cacheWrite?: number;
+  cacheWrite1h?: number;
+};
 // The per-Mtok rate for cached (prompt-cache-read) tokens: an explicit override,
 // else a discount off the input rate.
-const cachedRate = (p: Price) =>
-  p.cached ?? Math.round(p.input * CACHE_DISCOUNT);
+const cachedRate = (p: Price) => p.cached ?? Math.round(p.input * CACHE_DISCOUNT);
 
-// Integer nanodollars. Divide-before-multiply keeps the intermediate product
-// within 2^53 even for large token counts × large per-Mtok prices.
+// Keep intermediates exact even when token counts × rates exceed 2^53.
+function tokenCost(parts: [number, number][]) {
+  let numerator = 0n;
+  for (const [tokens, rate] of parts) {
+    assertAmount(tokens, "tokens");
+    assertAmount(rate, "token rate");
+    numerator += BigInt(tokens) * BigInt(rate);
+  }
+  const cost = Number((numerator + 500_000n) / 1_000_000n);
+  assertAmount(cost, "token cost");
+  return cost;
+}
 const costOf = (
   inputTokens: number,
   outputTokens: number,
-  price: { input: number; output: number }
-) =>
-  Math.round(
-    (inputTokens / 1e6) * price.input + (outputTokens / 1e6) * price.output
-  );
+  price: { input: number; output: number; },
+) => tokenCost([[inputTokens, price.input], [outputTokens, price.output]]);
 
 // Cache-aware settle cost: the cached slice of the prompt is billed at the
 // (discounted) cache rate, the rest of the prompt at the input rate, and
@@ -240,15 +357,21 @@ const settleCost = (
   promptTokens: number,
   cachedTokens: number,
   completionTokens: number,
-  price: Price
+  price: Price,
+  cachedWriteTokens = 0,
+  cachedWrite1hTokens = 0,
 ) => {
   const cached = Math.min(Math.max(0, cachedTokens), Math.max(0, promptTokens));
-  const fresh = Math.max(0, promptTokens - cached);
-  return Math.round(
-    (fresh / 1e6) * price.input +
-      (cached / 1e6) * cachedRate(price) +
-      (completionTokens / 1e6) * price.output
-  );
+  const written = Math.min(Math.max(0, cachedWriteTokens), Math.max(0, promptTokens - cached));
+  const written1h = Math.min(written, cachedWrite1hTokens);
+  const fresh = Math.max(0, promptTokens - cached - written);
+  return tokenCost([
+    [fresh, price.input],
+    [cached, cachedRate(price)],
+    [written - written1h, price.cacheWrite ?? Math.round(price.input * 1.25)],
+    [written1h, price.cacheWrite1h ?? price.input * 2],
+    [completionTokens, price.output],
+  ]);
 };
 
 // Per-call fees for provider server tools (web search, etc.), merging the
@@ -256,15 +379,20 @@ const settleCost = (
 // but not charged) rather than guessing.
 const serverToolCost = (
   uses: Record<string, number> | undefined,
-  overrides: Record<string, number> | undefined
+  overrides: Record<string, number> | undefined,
 ) => {
   if (!uses) return 0;
   const prices = { ...DEFAULT_SERVER_TOOL_PRICES, ...(overrides ?? {}) };
-  let total = 0;
+  let total = 0n;
   for (const [tool, count] of Object.entries(uses)) {
-    if (count > 0 && prices[tool] > 0) total += Math.round(count * prices[tool]);
+    assertAmount(count, `serverToolUses.${tool}`);
+    // count is an asserted integer; round the (possibly default) price so BigInt
+    // can't throw on a fractional nanodollar rate.
+    if (count > 0 && prices[tool] > 0) total += BigInt(count) * BigInt(Math.round(prices[tool]));
   }
-  return total;
+  const result = Number(total);
+  assertAmount(result, "server-tool cost");
+  return result;
 };
 
 // Upsert-add a settled amount into the durable per-(bucket, period) usage row.
@@ -277,7 +405,7 @@ async function addUsage(
   stamp: string,
   spendNanos: number,
   tokens: number,
-  requests: number
+  requests: number,
 ) {
   const existing = await ctx.db
     .query("usage")
@@ -286,15 +414,17 @@ async function addUsage(
         .eq("dimension", dimension)
         .eq("value", value)
         .eq("period", period)
-        .eq("stamp", stamp)
-    )
+        .eq("stamp", stamp))
     .unique();
   if (existing) {
-    await ctx.db.patch(existing._id, {
-      spendNanos: existing.spendNanos + spendNanos,
-      tokens: existing.tokens + tokens,
-      requests: existing.requests + requests,
-    });
+    await ctx.db.patch(
+      existing._id,
+      checkedAccounting({
+        spendNanos: existing.spendNanos + spendNanos,
+        tokens: existing.tokens + tokens,
+        requests: existing.requests + requests,
+      }),
+    );
   } else {
     await ctx.db.insert("usage", {
       dimension,
@@ -311,8 +441,8 @@ async function addUsage(
 // Up-front estimate of a request's cost and token count, reserved before the
 // call so concurrent in-flight requests are visible to each other's caps.
 function estimateUsage(
-  messages: { content: string }[],
-  price: { input: number; output: number }
+  messages: { content: string; }[],
+  price: { input: number; output: number; },
 ) {
   const chars = messages.reduce((s, m) => s + (m.content?.length ?? 0), 0);
   const inputTokens = Math.ceil(chars / 4);
@@ -330,16 +460,18 @@ function estimateUsage(
 function requestBuckets(
   userId: string,
   actionName: string | undefined,
-  extra: { dimension: string; value: string }[] | undefined
-): { dimension: string; value: string }[] {
+  extra: { dimension: string; value: string; }[] | undefined,
+): { dimension: string; value: string; }[] {
   const out = [{ dimension: USER_DIM, value: userId }];
-  if (actionName !== undefined)
+  if (actionName !== undefined) {
     out.push({ dimension: ACTION_DIM, value: actionName });
+  }
   for (const t of extra ?? []) {
     if (t.dimension === USER_DIM || t.dimension === ACTION_DIM) continue;
     if (!t.dimension || !t.value) continue;
-    if (out.some((x) => x.dimension === t.dimension && x.value === t.value))
+    if (out.some((x) => x.dimension === t.dimension && x.value === t.value)) {
       continue;
+    }
     out.push({ dimension: t.dimension, value: t.value });
   }
   return out;
@@ -348,19 +480,22 @@ function requestBuckets(
 // Drop reserved/empty/duplicate tags from a caller-supplied list, leaving the
 // "extra" dimensions stored on the request row.
 function sanitizeExtraTags(
-  extra: { dimension: string; value: string }[] | undefined
-): { dimension: string; value: string }[] {
-  const out: { dimension: string; value: string }[] = [];
+  extra: { dimension: string; value: string; }[] | undefined,
+): { dimension: string; value: string; }[] {
+  const out: { dimension: string; value: string; }[] = [];
   for (const t of extra ?? []) {
     if (t.dimension === USER_DIM || t.dimension === ACTION_DIM) continue;
     if (!t.dimension || !t.value) continue;
-    if (out.some((x) => x.dimension === t.dimension && x.value === t.value))
+    if (out.some((x) => x.dimension === t.dimension && x.value === t.value)) {
       continue;
+    }
+    assertKey(t.dimension, "tag dimension", 64);
+    assertKey(t.value, "tag value");
     out.push({ dimension: t.dimension, value: t.value });
     // Bound per-request fan-out: each extra tag becomes a bucket read/patch, a
     // requestTags insert, and a reservation. An unbounded list would blow the
     // mutation's document write/read limits and wedge the call.
-    if (out.length >= MAX_TAGS) break;
+    if (out.length > MAX_TAGS) throw new Error(`At most ${MAX_TAGS} attribution tags are allowed`);
   }
   return out;
 }
@@ -369,6 +504,12 @@ function sanitizeExtraTags(
 // request's estimate. Returns a hard rejection (block), soft warnings (allow),
 // and threshold notices (approaching a cap — see warnAtPct). Each window (daily,
 // monthly, lifetime) × kind (spend, token) is one check.
+const projected = (...amounts: number[]) =>
+  amounts.reduce((sum, amount) => {
+    assertAmount(amount, "budget usage", { signed: true });
+    return sum + BigInt(amount);
+  }, 0n);
+
 function evaluateCaps(o: {
   label: string;
   name: string;
@@ -400,22 +541,63 @@ function evaluateCaps(o: {
   monthlyTokenLimit?: number;
   lifetimeTokenLimit?: number;
 }): {
-  hard?: { code: string; reason: string };
+  hard?: { code: string; reason: string; };
   warnings: string[];
   notices: string[];
 } {
   // { code, projected usage (incl. this estimate), cap, human window label,
   //   whether it's a money cap (formatted as $), spend? for notices }
   const checks = [
-    { w: "daily_spend_limit", used: o.spendToday + o.reservedSpendToday + o.estCost - (o.creditsToday ?? 0), cap: o.dailySpendLimitNanos, label: "daily spend limit", money: true },
-    { w: "monthly_spend_limit", used: o.spendThisMonth + o.reservedSpendMonth + o.estCost - (o.creditsThisMonth ?? 0), cap: o.monthlySpendLimitNanos, label: "monthly spend limit", money: true },
-    { w: "lifetime_spend_limit", used: o.totalSpend + o.reservedSpendTotal + o.estCost - (o.creditsTotal ?? 0), cap: o.lifetimeSpendLimitNanos, label: "lifetime spend limit", money: true },
-    { w: "daily_token_limit", used: o.tokensToday + o.reservedTokensToday + o.estTokens, cap: o.dailyTokenLimit, label: "daily token limit", money: false },
-    { w: "monthly_token_limit", used: o.tokensThisMonth + o.reservedTokensMonth + o.estTokens, cap: o.monthlyTokenLimit, label: "monthly token limit", money: false },
-    { w: "lifetime_token_limit", used: o.totalTokens + o.reservedTokensTotal + o.estTokens, cap: o.lifetimeTokenLimit, label: "lifetime token limit", money: false },
+    {
+      w: "daily_spend_limit",
+      used: projected(o.spendToday, o.reservedSpendToday, o.estCost, -(o.creditsToday ?? 0)),
+      cap: o.dailySpendLimitNanos,
+      label: "daily spend limit",
+      money: true,
+    },
+    {
+      w: "monthly_spend_limit",
+      used: projected(
+        o.spendThisMonth,
+        o.reservedSpendMonth,
+        o.estCost,
+        -(o.creditsThisMonth ?? 0),
+      ),
+      cap: o.monthlySpendLimitNanos,
+      label: "monthly spend limit",
+      money: true,
+    },
+    {
+      w: "lifetime_spend_limit",
+      used: projected(o.totalSpend, o.reservedSpendTotal, o.estCost, -(o.creditsTotal ?? 0)),
+      cap: o.lifetimeSpendLimitNanos,
+      label: "lifetime spend limit",
+      money: true,
+    },
+    {
+      w: "daily_token_limit",
+      used: projected(o.tokensToday, o.reservedTokensToday, o.estTokens),
+      cap: o.dailyTokenLimit,
+      label: "daily token limit",
+      money: false,
+    },
+    {
+      w: "monthly_token_limit",
+      used: projected(o.tokensThisMonth, o.reservedTokensMonth, o.estTokens),
+      cap: o.monthlyTokenLimit,
+      label: "monthly token limit",
+      money: false,
+    },
+    {
+      w: "lifetime_token_limit",
+      used: projected(o.totalTokens, o.reservedTokensTotal, o.estTokens),
+      cap: o.lifetimeTokenLimit,
+      label: "lifetime token limit",
+      money: false,
+    },
   ];
 
-  const violations: { code: string; reason: string }[] = [];
+  const violations: { code: string; reason: string; }[] = [];
   const notices: string[] = [];
   const pct = o.warnAtPct;
   for (const c of checks) {
@@ -428,14 +610,17 @@ function evaluateCaps(o: {
       });
     } else if (pct !== undefined && pct > 0 && pct < 1 && c.used >= pct * c.cap) {
       notices.push(
-        `${o.label} "${o.name}" at ${Math.round((c.used / c.cap) * 100)}% of ${c.label} (${capStr})`
+        `${o.label} "${o.name}" at ${
+          Math.round((Number(c.used) / c.cap) * 100)
+        }% of ${c.label} (${capStr})`,
       );
     }
   }
 
   if (violations.length === 0) return { warnings: [], notices };
-  if (o.enforcement === "soft")
+  if (o.enforcement === "soft") {
     return { warnings: violations.map((v) => v.reason), notices };
+  }
   return { hard: violations[0], warnings: [], notices };
 }
 
@@ -444,7 +629,7 @@ const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 // A cap plus any one-time bump. Returns undefined when there's no base cap
 // (a bump alone never creates a cap).
 const withBump = (base: number | undefined, bump: number | undefined) =>
-  base === undefined ? undefined : base + (bump ?? 0);
+  base === undefined ? undefined : checkedAccounting({ cap: base + (bump ?? 0) }).cap;
 
 const hasAnyCap = (e: {
   dailySpendLimitNanos?: number;
@@ -454,32 +639,41 @@ const hasAnyCap = (e: {
   monthlyTokenLimit?: number;
   lifetimeTokenLimit?: number;
 }) =>
-  e.dailySpendLimitNanos !== undefined ||
-  e.monthlySpendLimitNanos !== undefined ||
-  e.lifetimeSpendLimitNanos !== undefined ||
-  e.dailyTokenLimit !== undefined ||
-  e.monthlyTokenLimit !== undefined ||
-  e.lifetimeTokenLimit !== undefined;
+  e.dailySpendLimitNanos !== undefined
+  || e.monthlySpendLimitNanos !== undefined
+  || e.lifetimeSpendLimitNanos !== undefined
+  || e.dailyTokenLimit !== undefined
+  || e.monthlyTokenLimit !== undefined
+  || e.lifetimeTokenLimit !== undefined;
 
 // A bucket needs a reservation row-write if it has any spend/token cap OR a
 // concurrency cap (which reads pendingCount, incremented at reserve time).
-const needsReserve = (e: Parameters<typeof hasAnyCap>[0] & { maxConcurrent?: number }) =>
+const needsReserve = (e: Parameters<typeof hasAnyCap>[0] & { maxConcurrent?: number; }) =>
   hasAnyCap(e) || e.maxConcurrent !== undefined;
 
-async function getBucketDoc(ctx: MutationCtx, dimension: string, value: string) {
+async function getBucketDoc(ctx: MutationCtx | QueryCtx, dimension: string, value: string) {
   return await ctx.db
     .query("buckets")
-    .withIndex("dim_value", (q) =>
-      q.eq("dimension", dimension).eq("value", value)
-    )
+    .withIndex("dim_value", (q) => q.eq("dimension", dimension).eq("value", value))
     .unique();
 }
 
+async function deletionOf(ctx: MutationCtx | QueryCtx, dimension: string, value: string) {
+  return ctx.db.query("deletions").withIndex(
+    "dim_value",
+    q => q.eq("dimension", dimension).eq("value", value),
+  ).unique();
+}
 async function getOrCreateBucket(
   ctx: MutationCtx,
   dimension: string,
-  value: string
+  value: string,
+  allowRecreate = false,
 ) {
+  const deletion = await deletionOf(ctx, dimension, value);
+  if (
+    deletion?.deleting || (deletion && !allowRecreate && !await getBucketDoc(ctx, dimension, value))
+  ) throw new Error("Bucket deleted; recreate explicitly with setLimits");
   const existing = await getBucketDoc(ctx, dimension, value);
   if (existing) return existing;
   const id = await ctx.db.insert("buckets", {
@@ -496,23 +690,40 @@ async function getOrCreateBucket(
 
 // Policy is read on every admission; reporting writes never touch it.
 async function syncPolicy(ctx: MutationCtx, b: Doc<"buckets">) {
-  const existing = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
-    q.eq("dimension", b.dimension).eq("value", b.value)).unique();
+  const existing = await ctx.db.query("bucketPolicies").withIndex(
+    "dim_value",
+    q => q.eq("dimension", b.dimension).eq("value", b.value),
+  ).unique();
   const policy = {
-    bucketId: b._id, dimension: b.dimension, value: b.value,
-    requestsPerMinute: b.requestsPerMinute, maxConcurrent: b.maxConcurrent,
-    dailySpendLimitNanos: b.dailySpendLimitNanos, monthlySpendLimitNanos: b.monthlySpendLimitNanos,
-    lifetimeSpendLimitNanos: b.lifetimeSpendLimitNanos, dailyTokenLimit: b.dailyTokenLimit,
-    monthlyTokenLimit: b.monthlyTokenLimit, lifetimeTokenLimit: b.lifetimeTokenLimit,
-    blocked: b.blocked, warnAtPct: b.warnAtPct, enforcement: b.enforcement,
+    bucketId: b._id,
+    dimension: b.dimension,
+    value: b.value,
+    reconciling: existing?.reconciling,
+    requestsPerMinute: b.requestsPerMinute,
+    maxConcurrent: b.maxConcurrent,
+    dailySpendLimitNanos: b.dailySpendLimitNanos,
+    monthlySpendLimitNanos: b.monthlySpendLimitNanos,
+    lifetimeSpendLimitNanos: b.lifetimeSpendLimitNanos,
+    dailyTokenLimit: b.dailyTokenLimit,
+    monthlyTokenLimit: b.monthlyTokenLimit,
+    lifetimeTokenLimit: b.lifetimeTokenLimit,
+    blocked: b.blocked,
+    warnAtPct: b.warnAtPct,
+    enforcement: b.enforcement,
   };
   if (existing) await ctx.db.replace(existing._id, policy);
   else await ctx.db.insert("bucketPolicies", policy);
 }
 
-async function admissionBucket(ctx: MutationCtx, dimension: string, value: string): Promise<Doc<"buckets">> {
-  const policy = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
-    q.eq("dimension", dimension).eq("value", value)).unique();
+async function admissionBucket(
+  ctx: MutationCtx,
+  dimension: string,
+  value: string,
+): Promise<Doc<"buckets">> {
+  const policy = await ctx.db.query("bucketPolicies").withIndex(
+    "dim_value",
+    q => q.eq("dimension", dimension).eq("value", value),
+  ).unique();
   if (!policy) {
     const bucket = await getOrCreateBucket(ctx, dimension, value);
     await syncPolicy(ctx, bucket);
@@ -520,8 +731,15 @@ async function admissionBucket(ctx: MutationCtx, dimension: string, value: strin
   }
   // Only capped buckets need an atomic read of their accounting state.
   if (needsReserve(policy)) return (await ctx.db.get(policy.bucketId))!;
-  return { ...policy, _id: policy.bucketId, totalSpendNanos: 0, totalRequests: 0,
-    totalTokens: 0, dayStamp: "", spendTodayNanos: 0 };
+  return {
+    ...policy,
+    _id: policy.bucketId,
+    totalSpendNanos: 0,
+    totalRequests: 0,
+    totalTokens: 0,
+    dayStamp: "",
+    spendTodayNanos: 0,
+  };
 }
 
 // Does this bucket have a cap (so its row must be updated live at settle for
@@ -530,7 +748,7 @@ async function admissionBucket(ctx: MutationCtx, dimension: string, value: strin
 async function bucketIsCapped(
   ctx: MutationCtx,
   dimension: string,
-  value: string
+  value: string,
 ): Promise<boolean> {
   const policy = await ctx.db
     .query("bucketPolicies")
@@ -539,7 +757,7 @@ async function bucketIsCapped(
   return policy ? needsReserve(policy) : false;
 }
 
-async function getSettings(ctx: MutationCtx) {
+async function getSettings(ctx: MutationCtx | QueryCtx) {
   return await ctx.db
     .query("settings")
     .withIndex("key", (q) => q.eq("key", "singleton"))
@@ -560,6 +778,7 @@ const vStartResult = v.union(
   v.object({
     allowed: v.literal(true),
     requestId: v.id("requests"),
+    reused: v.optional(v.boolean()),
     warnings: v.array(v.string()), // soft caps exceeded (allowed with a warning)
     notices: v.array(v.string()), // approaching a cap (warnAtPct threshold)
   }),
@@ -567,12 +786,15 @@ const vStartResult = v.union(
     allowed: v.literal(false),
     code: v.string(),
     reason: v.string(),
-  })
+  }),
 );
 
 export const startRequest = mutation({
   args: {
+    idempotencyKey: v.optional(v.string()),
     userId: v.string(),
+    // Host-derived old subject key: prevent an identity upgrade bypassing its budget.
+    legacyUserId: v.optional(v.string()),
     actionName: v.optional(v.string()),
     // Extra attribution dimensions to bill/limit (team, customer, env, …).
     // `user` and `action` are reserved (owned by userId/actionName).
@@ -584,6 +806,7 @@ export const startRequest = mutation({
     // (n × per-image), audio, per-call APIs — so a hard cap reserves the real
     // amount rather than a meaningless token guess.
     estimatedCostNanos: v.optional(v.number()),
+    estimatedTokens: v.optional(v.number()),
     // Hold the reservation this long (ms) before the reconciler may reap it —
     // for long async jobs (video) that settle minutes later. Extends the 30-min
     // default floor.
@@ -591,16 +814,83 @@ export const startRequest = mutation({
     rerunOf: v.optional(v.id("requests")),
   },
   returns: vStartResult,
-  handler: async (ctx, args) => {
-    if (args.reserveTtlMs !== undefined && (!Number.isFinite(args.reserveTtlMs) || args.reserveTtlMs < 0)) {
-      throw new Error("reserveTtlMs must be finite and nonnegative");
+  handler: async (ctx, args): Promise<Infer<typeof vStartResult>> => {
+    assertKey(args.userId, "userId", 1024);
+    if (args.legacyUserId !== undefined) {
+      assertKey(args.legacyUserId, "legacyUserId", 1024);
+      if (
+        args.legacyUserId !== args.userId && (
+          await getBucketDoc(ctx, "user", args.legacyUserId)
+          || await deletionOf(ctx, "user", args.legacyUserId)
+        )
+      ) {
+        return {
+          allowed: false as const,
+          code: "identity_migration_required",
+          reason:
+            "A legacy subject-keyed budget exists. Migrate its identity before using issuer-scoped keys, or explicitly retain subject keys for a trusted single issuer.",
+        };
+      }
+    }
+    assertKey(args.model, "model");
+    if (args.actionName !== undefined) assertKey(args.actionName, "actionName");
+    assertAmount(args.reserveTtlMs, "reserveTtlMs");
+    if ((args.reserveTtlMs ?? 0) > 30 * 24 * 60 * 60 * 1000) {
+      throw new Error("reserveTtlMs cannot exceed 30 days");
     }
     // Infinity/NaN here is catastrophic: it's reserved onto the bucket, and a
     // later release computes `Infinity - Infinity = NaN`, leaving the reserved
     // fields NaN forever — after which every `used > cap` check is `NaN > cap`
     // (false) and the bucket admits unlimited spend. Reject it up front.
     assertAmount(args.estimatedCostNanos, "estimatedCostNanos");
+    assertAmount(args.estimatedTokens, "estimatedTokens");
     const extraTags = sanitizeExtraTags(args.tags);
+    let fingerprint: string | undefined;
+    if (args.idempotencyKey !== undefined) {
+      if (!args.idempotencyKey || args.idempotencyKey.length > 128) {
+        throw new Error("idempotencyKey must have 1–128 characters");
+      }
+      const bytes = new TextEncoder().encode(JSON.stringify({
+        userId: args.userId,
+        action: args.actionName ?? null,
+        model: args.model,
+        messages: args.messages,
+        tags: extraTags,
+        estimatedCostNanos: args.estimatedCostNanos ?? null,
+        estimatedTokens: args.estimatedTokens ?? null,
+        reserveTtlMs: args.reserveTtlMs ?? null,
+        rerunOf: args.rerunOf ?? null,
+      }));
+      fingerprint = Array.from(
+        new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+        b => b.toString(16).padStart(2, "0"),
+      ).join("");
+      const key = await ctx.db.query("admissionKeys").withIndex(
+        "user_key",
+        q => q.eq("userId", args.userId).eq("key", args.idempotencyKey!),
+      ).unique();
+      if (key) {
+        if (key.fingerprint !== fingerprint) {
+          throw new Error("idempotencyKey was already used with different arguments");
+        }
+        const req = await ctx.db.get(key.requestId);
+        if (!req) {
+          return {
+            allowed: false as const,
+            code: "idempotency_expired",
+            reason:
+              "Original request was retained then removed; use a new key only for a new provider job",
+          };
+        }
+        return {
+          allowed: true as const,
+          requestId: key.requestId,
+          reused: true,
+          warnings: [],
+          notices: [],
+        };
+      }
+    }
     // Set from settings below; when false we persist metadata but no prompt
     // content (a deployment that opts out of storing prompts entirely).
     let storeContent = true;
@@ -643,6 +933,9 @@ export const startRequest = mutation({
     if (args.estimatedCostNanos !== undefined && args.estimatedCostNanos >= 0) {
       est.cost = Math.round(args.estimatedCostNanos);
     }
+    if (args.estimatedTokens !== undefined) est.tokens = args.estimatedTokens;
+    assertAmount(est.cost, "estimated cost");
+    assertAmount(est.tokens, "estimated tokens");
     const warnings: string[] = [];
     const notices: string[] = [];
 
@@ -650,13 +943,24 @@ export const startRequest = mutation({
     const settings = await getSettings(ctx);
     storeContent = settings?.storeContent !== false;
     const defaultWarnAtPct = settings?.defaultWarnAtPct;
+    // A 0/0 reservation would satisfy "defined" while reserving nothing, defeating
+    // the atomic hard-cap bound this policy promises — require POSITIVE bounds.
+    if (
+      settings?.requireExplicitReservations
+      && !((args.estimatedCostNanos ?? 0) > 0 && (args.estimatedTokens ?? 0) > 0)
+    ) {
+      return reject(
+        "explicit_reservation_required",
+        "Provide positive explicit spend and token reservation bounds",
+      );
+    }
     if (settings) {
       const mode = settings.modelMode ?? "open";
       const list = settings.models ?? [];
       if (mode === "allowlist" && !list.includes(args.model)) {
         return reject(
           "model_not_allowed",
-          `Model "${args.model}" is not on the allowlist`
+          `Model "${args.model}" is not on the allowlist`,
         );
       }
       if (mode === "denylist" && list.includes(args.model)) {
@@ -667,7 +971,7 @@ export const startRequest = mutation({
       if (settings.allowUnpricedModels === false && !priceInfo.known) {
         return reject(
           "model_unpriced",
-          `Model "${args.model}" has no configured price; set one with setPrice or allow unpriced models`
+          `Model "${args.model}" has no configured price; set one with setPrice or allow unpriced models`,
         );
       }
     }
@@ -677,6 +981,21 @@ export const startRequest = mutation({
     const bucketTags = requestBuckets(args.userId, args.actionName, extraTags);
     const buckets: Doc<"buckets">[] = [];
     for (const t of bucketTags) {
+      const deletion = await deletionOf(ctx, t.dimension, t.value);
+      if (deletion?.deleting || (deletion && !await getBucketDoc(ctx, t.dimension, t.value))) {
+        return reject("bucket_deleted", "Budget bucket has been deleted", false);
+      }
+      const policy = await ctx.db.query("bucketPolicies").withIndex(
+        "dim_value",
+        q => q.eq("dimension", t.dimension).eq("value", t.value),
+      ).unique();
+      if (policy?.reconciling) {
+        return reject(
+          "bucket_reconciling",
+          "Budget policy is being reconciled; retry shortly",
+          false,
+        );
+      }
       buckets.push(await admissionBucket(ctx, t.dimension, t.value));
     }
 
@@ -689,7 +1008,7 @@ export const startRequest = mutation({
         return reject(
           `${b.dimension}_blocked`,
           `${label} "${b.value}" is blocked`,
-          b.dimension !== USER_DIM
+          b.dimension !== USER_DIM,
         );
       }
     }
@@ -702,7 +1021,7 @@ export const startRequest = mutation({
         return reject(
           `${b.dimension}_max_concurrent`,
           `Too many concurrent requests for ${b.dimension} "${b.value}" (max ${b.maxConcurrent})`,
-          false
+          false,
         );
       }
     }
@@ -714,14 +1033,16 @@ export const startRequest = mutation({
       const limit = b.requestsPerMinute;
       if (limit === undefined) continue;
       const ok = limit > 0 && (await requestRateLimiter.check(
-        ctx, "requests", requestRateOptions(b)
+        ctx,
+        "requests",
+        requestRateOptions(b),
       )).ok;
       if (!ok) {
         const code = b.dimension === USER_DIM ? "rate_limit" : `${b.dimension}_rate_limit`;
         return reject(
           code,
           `Rate limit exceeded for ${b.dimension} "${b.value}" (${limit}/min)`,
-          false
+          false,
         );
       }
     }
@@ -759,15 +1080,15 @@ export const startRequest = mutation({
         reservedTokensTotal: b.reservedTotalTokens ?? 0,
         dailySpendLimitNanos: withBump(
           b.dailySpendLimitNanos,
-          b.bumpDayStamp === today ? b.dailyBumpNanos : 0
+          b.bumpDayStamp === today ? b.dailyBumpNanos : 0,
         ),
         monthlySpendLimitNanos: withBump(
           b.monthlySpendLimitNanos,
-          b.bumpMonthStamp === month ? b.monthlyBumpNanos : 0
+          b.bumpMonthStamp === month ? b.monthlyBumpNanos : 0,
         ),
         lifetimeSpendLimitNanos: withBump(
           b.lifetimeSpendLimitNanos,
-          b.lifetimeBumpNanos
+          b.lifetimeBumpNanos,
         ),
         dailyTokenLimit: b.dailyTokenLimit,
         monthlyTokenLimit: b.monthlyTokenLimit,
@@ -792,8 +1113,8 @@ export const startRequest = mutation({
     // admission just reads those (already-loaded) flags. The killswitch lag is
     // bounded by the reconcile interval, which is the point of "approximate".
     if (
-      settings &&
-      (settings.globalTrippedDaily || settings.globalTrippedLifetime)
+      settings
+      && (settings.globalTrippedDaily || settings.globalTrippedLifetime)
     ) {
       const enforcement = settings.globalEnforcement ?? "approximate";
       if (enforcement === "soft") {
@@ -801,7 +1122,7 @@ export const startRequest = mutation({
       } else {
         return reject(
           "global_spend_limit",
-          "Global spend limit reached for the deployment"
+          "Global spend limit reached for the deployment",
         );
       }
     } else if (settings?.globalNearLimit) {
@@ -835,21 +1156,25 @@ export const startRequest = mutation({
       if (!needsReserve(b)) continue;
       const sameDay = b.dayStamp === today;
       const sameMonth = b.monthStamp === month;
-      await ctx.db.patch(b._id, {
-        dayStamp: today,
-        monthStamp: month,
-        spendTodayNanos: sameDay ? b.spendTodayNanos : 0,
-        tokensToday: sameDay ? b.tokensToday ?? 0 : 0,
-        spendThisMonthNanos: sameMonth ? b.spendThisMonthNanos ?? 0 : 0,
-        tokensThisMonth: sameMonth ? b.tokensThisMonth ?? 0 : 0,
-        reservedTodayNanos: (sameDay ? b.reservedTodayNanos ?? 0 : 0) + est.cost,
-        reservedMonthNanos: (sameMonth ? b.reservedMonthNanos ?? 0 : 0) + est.cost,
-        reservedTotalNanos: (b.reservedTotalNanos ?? 0) + est.cost,
-        reservedTodayTokens: (sameDay ? b.reservedTodayTokens ?? 0 : 0) + est.tokens,
-        reservedMonthTokens: (sameMonth ? b.reservedMonthTokens ?? 0 : 0) + est.tokens,
-        reservedTotalTokens: (b.reservedTotalTokens ?? 0) + est.tokens,
-        pendingCount: (b.pendingCount ?? 0) + 1,
-      });
+      await ctx.db.patch(
+        b._id,
+        checkedAccounting({
+          ...windowResets(b, today, month),
+          dayStamp: today,
+          monthStamp: month,
+          spendTodayNanos: sameDay ? b.spendTodayNanos : 0,
+          tokensToday: sameDay ? b.tokensToday ?? 0 : 0,
+          spendThisMonthNanos: sameMonth ? b.spendThisMonthNanos ?? 0 : 0,
+          tokensThisMonth: sameMonth ? b.tokensThisMonth ?? 0 : 0,
+          reservedTodayNanos: (sameDay ? b.reservedTodayNanos ?? 0 : 0) + est.cost,
+          reservedMonthNanos: (sameMonth ? b.reservedMonthNanos ?? 0 : 0) + est.cost,
+          reservedTotalNanos: (b.reservedTotalNanos ?? 0) + est.cost,
+          reservedTodayTokens: (sameDay ? b.reservedTodayTokens ?? 0 : 0) + est.tokens,
+          reservedMonthTokens: (sameMonth ? b.reservedMonthTokens ?? 0 : 0) + est.tokens,
+          reservedTotalTokens: (b.reservedTotalTokens ?? 0) + est.tokens,
+          pendingCount: (b.pendingCount ?? 0) + 1,
+        }),
+      );
     }
     const requestId = await ctx.db.insert("requests", {
       userId: args.userId,
@@ -862,6 +1187,22 @@ export const startRequest = mutation({
       status: "pending",
       expiresAt: Date.now() + Math.max(STALE_PENDING_MS, args.reserveTtlMs ?? 0),
       heldBucketIds: buckets.filter(needsReserve).map(b => b._id),
+      attributedBuckets: buckets.map(b => ({
+        dimension: b.dimension,
+        value: b.value,
+        bucketId: b._id,
+      })),
+      priceSnapshot: {
+        input: priceInfo.input,
+        output: priceInfo.output,
+        cached: cachedRate(priceInfo),
+        cacheWrite: priceInfo.cacheWrite ?? Math.round(priceInfo.input * 1.25),
+        cacheWrite1h: priceInfo.cacheWrite1h ?? priceInfo.input * 2,
+      },
+      serverToolPriceSnapshot: {
+        ...DEFAULT_SERVER_TOOL_PRICES,
+        ...(settings?.serverToolPrices ?? {}),
+      },
       reservationDay: today,
       reservationMonth: month,
       estimatedNanos: est.cost,
@@ -878,6 +1219,14 @@ export const startRequest = mutation({
         requestId,
       });
     }
+    if (args.idempotencyKey !== undefined) {
+      await ctx.db.insert("admissionKeys", {
+        userId: args.userId,
+        key: args.idempotencyKey,
+        fingerprint: fingerprint!,
+        requestId,
+      });
+    }
     return { allowed: true as const, requestId, warnings, notices };
   },
 });
@@ -890,6 +1239,8 @@ export const finishRequest = mutation({
     promptTokens: v.optional(v.number()),
     completionTokens: v.optional(v.number()),
     cachedTokens: v.optional(v.number()),
+    cachedWriteTokens: v.optional(v.number()),
+    cachedWrite1hTokens: v.optional(v.number()),
     // Provider server-tool invocations that bill a per-call fee (e.g.
     // { web_search: 3 }). Added to the token cost when no authoritative cost is
     // supplied; recorded either way.
@@ -906,7 +1257,13 @@ export const finishRequest = mutation({
     // The request may be gone — retention purged it, or the owning bucket was
     // deleted. A late/duplicate webhook must be an idempotent no-op, not a 500
     // (the caller can't do anything useful with the error, and it triggers retries).
-    if (!request) return { costNanos: 0 };
+    if (!request) {
+      const event = await ctx.db.query("billingEvents").withIndex(
+        "requestId",
+        q => q.eq("requestId", args.requestId),
+      ).unique();
+      return { costNanos: event?.costNanos ?? 0 };
+    }
 
     // Expiry releases capacity, but is not evidence that the provider charged
     // nothing. Accept one final result even after expiry; duplicates stay no-ops.
@@ -920,6 +1277,22 @@ export const finishRequest = mutation({
     const promptTokens = safeCount(args.promptTokens);
     const completionTokens = safeCount(args.completionTokens);
     const cachedTokens = Math.min(promptTokens, safeCount(args.cachedTokens));
+    const cachedWriteTokens = Math.min(
+      promptTokens - cachedTokens,
+      safeCount(args.cachedWriteTokens),
+    );
+    const cachedWrite1hTokens = Math.min(cachedWriteTokens, safeCount(args.cachedWrite1hTokens));
+    assertAmount(promptTokens + completionTokens, "total tokens");
+    if (args.serverToolUses) {
+      if (Object.keys(args.serverToolUses).length > MAX_SERVER_TOOLS) {
+        throw new Error("Too many server-tool counters");
+      }
+      for (const [tool, count] of Object.entries(args.serverToolUses)) {
+        assertKey(tool, "tool", 64);
+        assertAmount(count, `serverToolUses.${tool}`);
+      }
+    }
+    assertAmount(args.latencyMs, "latencyMs");
     // Prefer an authoritative gateway cost when supplied (it already includes
     // tool fees); otherwise price from tokens — discounting the cached
     // (prompt-cache-read) slice — plus any server-tool per-call fees. Require it
@@ -927,16 +1300,24 @@ export const finishRequest = mutation({
     const settings = await getSettings(ctx);
     const storeContent = settings?.storeContent !== false;
     let costNanos: number;
+    let costSource: "authoritative" | "token_estimate" | "reservation_estimate";
     if (args.costNanos !== undefined && Number.isFinite(args.costNanos) && args.costNanos >= 0) {
+      costSource = "authoritative";
       costNanos = Math.round(args.costNanos);
+      assertAmount(costNanos, "costNanos");
     } else {
-      const priced =
-        settleCost(
-          promptTokens,
-          cachedTokens,
-          completionTokens,
-          await getPrice(ctx, request.model)
-        ) + serverToolCost(args.serverToolUses, settings?.serverToolPrices);
+      const priced = settleCost(
+        promptTokens,
+        cachedTokens,
+        completionTokens,
+        request.priceSnapshot ?? await getPrice(ctx, request.model),
+        cachedWriteTokens,
+        cachedWrite1hTokens,
+      )
+        + serverToolCost(
+          args.serverToolUses,
+          request.serverToolPriceSnapshot ?? settings?.serverToolPrices,
+        );
       // Fail closed: if the settle carried NO usable cost signal — no tokens and
       // no priced server-tool fee (an unpriced tool like `video_seconds`, or a
       // bare settle()) — fall back to the reserved estimate rather than recording
@@ -944,8 +1325,11 @@ export const finishRequest = mutation({
       // reserve time precisely so this floor is their real cost. A caller that
       // truly wants $0 passes an explicit authoritative costNanos: 0 above.
       const noSignal = promptTokens === 0 && completionTokens === 0 && priced === 0;
+      costSource = noSignal ? "reservation_estimate" : "token_estimate";
       costNanos = noSignal ? (request.estimatedNanos ?? 0) : priced;
     }
+
+    assertAmount(costNanos, "costNanos");
 
     // Durable write to the request's OWN row only — uncontended, so it always
     // lands. `settled: false` hands it to the fold step; the row is never left
@@ -955,15 +1339,25 @@ export const finishRequest = mutation({
       reservationExpired: false,
       expiresAt: undefined,
       finishedAt: Date.now(),
-      responseText: storeContent ? capResponse(args.responseText) : undefined,
-      error: capResponse(args.error),
+      messages: storeContent && !request.privacyErased ? request.messages : [],
+      responseText: storeContent && !request.privacyErased
+        ? capResponse(args.responseText)
+        : undefined,
+      error: args.error
+        ? (storeContent && settings?.storeRawErrors === true && !request.privacyErased
+          ? capResponse(args.error)
+          : "provider_error")
+        : undefined,
       promptTokens,
       completionTokens,
       ...(cachedTokens > 0 ? { cachedTokens } : {}),
+      ...(cachedWriteTokens > 0 ? { cachedWriteTokens } : {}),
+      ...(cachedWrite1hTokens > 0 ? { cachedWrite1hTokens } : {}),
       ...(args.serverToolUses
         ? { serverToolUses: boundServerTools(args.serverToolUses) }
         : {}),
       costNanos,
+      costSource,
       latencyMs: args.latencyMs,
       settled: false,
     });
@@ -988,17 +1382,32 @@ async function releaseReservation(ctx: MutationCtx, req: Doc<"requests">) {
   for (const t of requestBuckets(req.userId, req.actionName, req.tags)) {
     const b = await getBucketDoc(ctx, t.dimension, t.value);
     if (!b || (req.heldBucketIds ? !req.heldBucketIds.includes(b._id) : !needsReserve(b))) continue;
-    await ctx.db.patch(b._id, {
-      reservedTodayNanos: Math.max(0, fin(b.reservedTodayNanos) - (b.dayStamp === day ? cost : 0)),
-      reservedMonthNanos: Math.max(0, fin(b.reservedMonthNanos) - (b.monthStamp === month ? cost : 0)),
-      reservedTotalNanos: Math.max(0, fin(b.reservedTotalNanos) - cost),
-      reservedTodayTokens: Math.max(0, fin(b.reservedTodayTokens) - (b.dayStamp === day ? tokens : 0)),
-      reservedMonthTokens: Math.max(0, fin(b.reservedMonthTokens) - (b.monthStamp === month ? tokens : 0)),
-      reservedTotalTokens: Math.max(0, fin(b.reservedTotalTokens) - tokens),
-      pendingCount: Math.max(0, fin(b.pendingCount) - 1),
-    });
+    await ctx.db.patch(
+      b._id,
+      checkedAccounting({
+        reservedTodayNanos: Math.max(
+          0,
+          fin(b.reservedTodayNanos) - (b.dayStamp === day ? cost : 0),
+        ),
+        reservedMonthNanos: Math.max(
+          0,
+          fin(b.reservedMonthNanos) - (b.monthStamp === month ? cost : 0),
+        ),
+        reservedTotalNanos: Math.max(0, fin(b.reservedTotalNanos) - cost),
+        reservedTodayTokens: Math.max(
+          0,
+          fin(b.reservedTodayTokens) - (b.dayStamp === day ? tokens : 0),
+        ),
+        reservedMonthTokens: Math.max(
+          0,
+          fin(b.reservedMonthTokens) - (b.monthStamp === month ? tokens : 0),
+        ),
+        reservedTotalTokens: Math.max(0, fin(b.reservedTotalTokens) - tokens),
+        pendingCount: Math.max(0, fin(b.pendingCount) - 1),
+      }),
+    );
   }
-  await ctx.db.patch(req._id, { reservationReleased: true });
+  await ctx.db.patch(req._id, checkedAccounting({ reservationReleased: true }));
 }
 
 // Final billing is folded once. Reservation release has its own guard because
@@ -1012,6 +1421,17 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   const day = timestamp.slice(0, 10);
   const month = timestamp.slice(0, 7);
   for (const t of requestBuckets(req.userId, req.actionName, req.tags)) {
+    if (req.privacyErased && t.dimension === USER_DIM) continue;
+    const bNow = await getBucketDoc(ctx, t.dimension, t.value);
+    const attributed = req.attributedBuckets?.find(x =>
+      x.dimension === t.dimension && x.value === t.value
+    );
+    const deletion = await deletionOf(ctx, t.dimension, t.value);
+    if (
+      attributed
+        ? attributed.bucketId !== bNow?._id
+        : deletion && req._creationTime <= deletion._creationTime
+    ) continue;
     // Capped buckets need their row updated LIVE so the next admission sees the
     // spend (enforcement can't wait for the async rollup). They're per-user /
     // low-concurrency, so the row isn't a hot contention point. Uncapped buckets
@@ -1023,19 +1443,30 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
       if (b) {
         const targetDay = b.dayStamp > day ? b.dayStamp : day;
         const targetMonth = (b.monthStamp ?? "") > month ? b.monthStamp! : month;
-        await ctx.db.patch(b._id, {
-          totalSpendNanos: b.totalSpendNanos + actual,
-          totalRequests: b.totalRequests + 1,
-          totalTokens: b.totalTokens + tokens,
-          dayStamp: targetDay,
-          monthStamp: targetMonth,
-          spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0) + (day === targetDay ? actual : 0),
-          tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0) + (day === targetDay ? tokens : 0),
-          spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0) + (month === targetMonth ? actual : 0),
-          tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0) + (month === targetMonth ? tokens : 0),
-          ...(b.dayStamp !== targetDay ? { reservedTodayNanos: 0, reservedTodayTokens: 0 } : {}),
-          ...(b.monthStamp !== targetMonth ? { reservedMonthNanos: 0, reservedMonthTokens: 0 } : {}),
-        });
+        await ctx.db.patch(
+          b._id,
+          checkedAccounting({
+            totalSpendNanos: b.totalSpendNanos + actual,
+            totalRequests: b.totalRequests + 1,
+            totalTokens: b.totalTokens + tokens,
+            ...windowResets(b, targetDay, targetMonth),
+            dayStamp: targetDay,
+            monthStamp: targetMonth,
+            spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0)
+              + (day === targetDay ? actual : 0),
+            tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0)
+              + (day === targetDay ? tokens : 0),
+            spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0)
+              + (month === targetMonth ? actual : 0),
+            tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0)
+              + (month === targetMonth ? tokens : 0),
+            ...(b.dayStamp !== targetDay ? { reservedTodayNanos: 0, reservedTodayTokens: 0 } : {}),
+            ...(b.monthStamp !== targetMonth
+              ? { reservedMonthNanos: 0, reservedMonthTokens: 0 }
+              : {}),
+            // settle hot path: saturate on overflow, never throw (see checkedAccounting)
+          }, { saturate: true }),
+        );
       }
     }
     // Append-only delta: rollupPhase folds it into `usage` (history, all buckets)
@@ -1049,14 +1480,23 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
       tokens,
       requests: 1,
       drainToRow: !capped,
+      ...(bNow ? { bucketId: bNow._id } : {}),
     });
   }
+  await ctx.db.insert("billingEvents", {
+    requestId: req._id,
+    costNanos: actual,
+    costSource: req.costSource,
+    tokens,
+    finishedAt: req.finishedAt ?? Date.now(),
+    bucketIds: req.attributedBuckets?.map(t => t.bucketId) ?? [],
+  });
   // Reporting is independent of whether enforcement is configured.
   if (actual > 0) {
     await globalSpend.add(ctx, GLOBAL_TOTAL, actual);
     await globalSpend.add(ctx, globalDayKey(day), actual);
   }
-  await ctx.db.patch(req._id, { settled: true });
+  await ctx.db.patch(req._id, checkedAccounting({ settled: true }));
 }
 
 export const foldTotals = internalMutation({
@@ -1079,6 +1519,26 @@ export const reconcile = internalMutation({
   args: {},
   returns: v.null(),
   handler: async (ctx) => {
+    const transitions = await ctx.db.query("bucketPolicies").withIndex(
+      "reconciling",
+      q => q.eq("reconciling", true),
+    ).take(RECONCILE_BATCH);
+    for (const p of transitions) {
+      await ctx.scheduler.runAfter(0, internal.lib.reconcileBucket, {
+        bucketId: p.bucketId,
+        cursor: null,
+      });
+    }
+    const deletions = await ctx.db.query("deletions").withIndex(
+      "deleting",
+      q => q.eq("deleting", true),
+    ).take(RECONCILE_BATCH);
+    for (const d of deletions) {
+      await ctx.scheduler.runAfter(0, internal.lib.deleteBucketBatch, {
+        dimension: d.dimension,
+        value: d.value,
+      });
+    }
     await ctx.scheduler.runAfter(0, internal.lib.foldPhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.rollupPhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.expirePhase, {});
@@ -1087,6 +1547,47 @@ export const reconcile = internalMutation({
     return null;
   },
 });
+
+async function drainDelta(ctx: MutationCtx, d: Doc<"usageDeltas">) {
+  const current = await getBucketDoc(ctx, d.dimension, d.value);
+  const deletion = await deletionOf(ctx, d.dimension, d.value);
+  if (
+    d.bucketId
+      ? current?._id !== d.bucketId
+      : deletion && d._creationTime <= deletion._creationTime
+  ) {
+    await ctx.db.delete(d._id);
+    return;
+  }
+  await addUsage(ctx, d.dimension, d.value, "day", d.day, d.spendNanos, d.tokens, d.requests);
+  await addUsage(ctx, d.dimension, d.value, "month", d.month, d.spendNanos, d.tokens, d.requests);
+  if (d.drainToRow) {
+    const b = await getOrCreateBucket(ctx, d.dimension, d.value);
+    const targetDay = b.dayStamp > d.day ? b.dayStamp : d.day;
+    const targetMonth = (b.monthStamp ?? "") > d.month ? b.monthStamp! : d.month;
+    await ctx.db.patch(
+      b._id,
+      checkedAccounting({
+        totalSpendNanos: b.totalSpendNanos + d.spendNanos,
+        totalRequests: b.totalRequests + d.requests,
+        totalTokens: b.totalTokens + d.tokens,
+        ...windowResets(b, targetDay, targetMonth),
+        dayStamp: targetDay,
+        monthStamp: targetMonth,
+        spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0)
+          + (d.day === targetDay ? d.spendNanos : 0),
+        tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0)
+          + (d.day === targetDay ? d.tokens : 0),
+        spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0)
+          + (d.month === targetMonth ? d.spendNanos : 0),
+        tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0)
+          + (d.month === targetMonth ? d.tokens : 0),
+        // reconcile hot path: saturate on overflow, never throw (see checkedAccounting)
+      }, { saturate: true }),
+    );
+  }
+  await ctx.db.delete(d._id);
+}
 
 // H6: drain append-only settlement deltas into the durable `usage` history (all
 // buckets) and the uncapped bucket-row totals — as a single writer, so the hot
@@ -1097,29 +1598,10 @@ export const rollupPhase = internalMutation({
   returns: v.object({ drained: v.number() }),
   handler: async (ctx) => {
     const deltas = await ctx.db.query("usageDeltas").take(RECONCILE_BATCH);
-    for (const d of deltas) {
-      await addUsage(ctx, d.dimension, d.value, "day", d.day, d.spendNanos, d.tokens, d.requests);
-      await addUsage(ctx, d.dimension, d.value, "month", d.month, d.spendNanos, d.tokens, d.requests);
-      if (d.drainToRow) {
-        const b = await getOrCreateBucket(ctx, d.dimension, d.value);
-        const targetDay = b.dayStamp > d.day ? b.dayStamp : d.day;
-        const targetMonth = (b.monthStamp ?? "") > d.month ? b.monthStamp! : d.month;
-        await ctx.db.patch(b._id, {
-          totalSpendNanos: b.totalSpendNanos + d.spendNanos,
-          totalRequests: b.totalRequests + d.requests,
-          totalTokens: b.totalTokens + d.tokens,
-          dayStamp: targetDay,
-          monthStamp: targetMonth,
-          spendTodayNanos: (b.dayStamp === targetDay ? b.spendTodayNanos : 0) + (d.day === targetDay ? d.spendNanos : 0),
-          tokensToday: (b.dayStamp === targetDay ? b.tokensToday ?? 0 : 0) + (d.day === targetDay ? d.tokens : 0),
-          spendThisMonthNanos: (b.monthStamp === targetMonth ? b.spendThisMonthNanos ?? 0 : 0) + (d.month === targetMonth ? d.spendNanos : 0),
-          tokensThisMonth: (b.monthStamp === targetMonth ? b.tokensThisMonth ?? 0 : 0) + (d.month === targetMonth ? d.tokens : 0),
-        });
-      }
-      await ctx.db.delete(d._id);
-    }
-    if (deltas.length === RECONCILE_BATCH)
+    for (const d of deltas) await drainDelta(ctx, d);
+    if (deltas.length === RECONCILE_BATCH) {
       await ctx.scheduler.runAfter(0, internal.lib.rollupPhase, {});
+    }
     return { drained: deltas.length };
   },
 });
@@ -1132,28 +1614,39 @@ export const globalPhase = internalMutation({
   returns: v.null(),
   handler: async (ctx) => {
     const s = await getSettings(ctx);
-    if (!s) return null;
-    const hasCap =
-      s.globalDailySpendLimitNanos !== undefined ||
-      s.globalLifetimeSpendLimitNanos !== undefined;
+    const today = dayStamp(), month = monthStamp();
+    if (!s) {
+      await ctx.db.insert("settings", {
+        key: "singleton",
+        reportingDay: today,
+        reportingMonth: month,
+        globalCheckedAt: Date.now(),
+      });
+      return null;
+    }
+    if (s.reportingDay !== today || s.reportingMonth !== month) {
+      await ctx.db.patch(s._id, { reportingDay: today, reportingMonth: month });
+    }
+    const hasCap = s.globalDailySpendLimitNanos !== undefined
+      || s.globalLifetimeSpendLimitNanos !== undefined;
     if (!hasCap) {
       // Clear stale flags when no global cap is configured.
-      if (s.globalTrippedDaily || s.globalTrippedLifetime || s.globalNearLimit)
+      if (s.globalTrippedDaily || s.globalTrippedLifetime || s.globalNearLimit) {
         await ctx.db.patch(s._id, {
           globalTrippedDaily: false,
           globalTrippedLifetime: false,
           globalNearLimit: false,
         });
+      }
       return null;
     }
-    const today = dayStamp();
     const dailyCap = withBump(
       s.globalDailySpendLimitNanos,
-      s.globalBumpDayStamp === today ? s.globalDailyBumpNanos : 0
+      s.globalBumpDayStamp === today ? s.globalDailyBumpNanos : 0,
     );
     const lifetimeCap = withBump(
       s.globalLifetimeSpendLimitNanos,
-      s.globalLifetimeBumpNanos
+      s.globalLifetimeBumpNanos,
     );
     const spentToday = await globalSpend.count(ctx, globalDayKey(today));
     const spentTotal = await globalSpend.count(ctx, GLOBAL_TOTAL);
@@ -1161,6 +1654,7 @@ export const globalPhase = internalMutation({
     const near = (spent: number, cap?: number) =>
       cap !== undefined && pct !== undefined && pct > 0 && pct < 1 && spent >= pct * cap;
     await ctx.db.patch(s._id, {
+      globalCheckedAt: Date.now(),
       globalTrippedDaily: dailyCap !== undefined && spentToday >= dailyCap,
       globalTrippedLifetime: lifetimeCap !== undefined && spentTotal >= lifetimeCap,
       globalNearLimit: near(spentToday, dailyCap) || near(spentTotal, lifetimeCap),
@@ -1179,8 +1673,9 @@ export const foldPhase = internalMutation({
       .withIndex("settled", (q) => q.eq("settled", false))
       .take(RECONCILE_BATCH);
     for (const req of toFold) await foldOne(ctx, req);
-    if (toFold.length === RECONCILE_BATCH)
+    if (toFold.length === RECONCILE_BATCH) {
       await ctx.scheduler.runAfter(0, internal.lib.foldPhase, {});
+    }
     return { folded: toFold.length };
   },
 });
@@ -1191,24 +1686,49 @@ export const expirePhase = internalMutation({
   args: {},
   returns: v.object({ expired: v.number() }),
   handler: async (ctx) => {
+    const legacyExpired = await ctx.db.query("requests").withIndex(
+      "retention_expiredAt",
+      q => q.eq("reservationExpired", true).eq("settled", true).eq("expiredAt", undefined),
+    ).take(RECONCILE_BATCH);
+    for (const req of legacyExpired) await ctx.db.patch(req._id, { expiredAt: Date.now() });
     // Lazily migrate old pending rows in bounded batches. Once indexed, long
     // TTL jobs cannot hide expired jobs behind them in creation-time order.
-    const legacy = await ctx.db.query("requests").withIndex("status_expires", q =>
-      q.eq("status", "pending").eq("expiresAt", undefined)).take(RECONCILE_BATCH);
+    const legacy = await ctx.db.query("requests").withIndex(
+      "status_expires",
+      q => q.eq("status", "pending").eq("expiresAt", undefined),
+    ).take(RECONCILE_BATCH);
     for (const req of legacy) {
-      await ctx.db.patch(req._id, { expiresAt: req._creationTime + Math.max(STALE_PENDING_MS, req.reserveTtlMs ?? 0) });
+      await ctx.db.patch(
+        req._id,
+        checkedAccounting({
+          expiresAt: req._creationTime + Math.max(STALE_PENDING_MS, req.reserveTtlMs ?? 0),
+        }),
+      );
     }
-    const candidates = await ctx.db.query("requests").withIndex("status_expires", q =>
-      q.eq("status", "pending").gt("expiresAt", 0).lte("expiresAt", Date.now())).take(RECONCILE_BATCH);
+    const candidates = await ctx.db.query("requests").withIndex(
+      "status_expires",
+      q => q.eq("status", "pending").gt("expiresAt", 0).lte("expiresAt", Date.now()),
+    ).take(RECONCILE_BATCH);
     for (const req of candidates) {
       await releaseReservation(ctx, req);
-      await ctx.db.patch(req._id, {
-        status: "error", error: "Reservation expired; awaiting final usage",
-        reservationExpired: true, expiresAt: undefined, settled: true,
-      });
+      await ctx.db.patch(
+        req._id,
+        checkedAccounting({
+          status: "error",
+          error: "Reservation expired; awaiting final usage",
+          reservationExpired: true,
+          expiredAt: Date.now(),
+          expiresAt: undefined,
+          settled: true,
+        }),
+      );
     }
-    if (legacy.length === RECONCILE_BATCH || candidates.length === RECONCILE_BATCH)
+    if (
+      legacyExpired.length === RECONCILE_BATCH || legacy.length === RECONCILE_BATCH
+      || candidates.length === RECONCILE_BATCH
+    ) {
       await ctx.scheduler.runAfter(0, internal.lib.expirePhase, {});
+    }
     return { expired: candidates.length };
   },
 });
@@ -1236,25 +1756,50 @@ export const retentionPhase = internalMutation({
     };
     // Settled, non-expired terminal rows past the window.
     for (const expiredFlag of [undefined, false] as const) {
-      await sweep(await ctx.db.query("requests").withIndex("retention", q =>
-        q.eq("reservationExpired", expiredFlag).eq("settled", true)
-          .lt("_creationTime", retentionCutoff)).take(RECONCILE_BATCH));
+      await sweep(
+        await ctx.db.query("requests").withIndex(
+          "retention",
+          q =>
+            q.eq("reservationExpired", expiredFlag).eq("settled", true)
+              .lt("_creationTime", retentionCutoff),
+        ).take(RECONCILE_BATCH),
+      );
     }
     // Blocked attempts past the window.
-    await sweep(await ctx.db.query("requests").withIndex("status", q =>
-      q.eq("status", "blocked").lt("_creationTime", retentionCutoff)).take(RECONCILE_BATCH));
+    await sweep(
+      await ctx.db.query("requests").withIndex(
+        "status",
+        q => q.eq("status", "blocked").lt("_creationTime", retentionCutoff),
+      ).take(RECONCILE_BATCH),
+    );
     // Expired billing tombstones past the late-settle horizon (content already
     // gone). Without this they'd live forever (one per crashed request).
     const tombstoneCutoff = Date.now() - Math.max(retentionMs, LATE_SETTLE_HORIZON_MS);
-    await sweep(await ctx.db.query("requests").withIndex("retention", q =>
-      q.eq("reservationExpired", true).eq("settled", true)
-        .lt("_creationTime", tombstoneCutoff)).take(RECONCILE_BATCH));
+    await sweep(
+      await ctx.db.query("requests").withIndex(
+        "retention_expiredAt",
+        q =>
+          q.eq("reservationExpired", true).eq("settled", true)
+            .gt("expiredAt", 0).lt("expiredAt", tombstoneCutoff),
+      ).take(RECONCILE_BATCH),
+    );
     // Strip PII from expired tombstones still inside the horizon.
-    const expiredContent = await ctx.db.query("requests").withIndex("expired_content", q =>
-      q.eq("reservationExpired", true).eq("contentPurged", undefined)
-        .lt("_creationTime", retentionCutoff)).take(RECONCILE_BATCH);
+    const expiredContent = await ctx.db.query("requests").withIndex(
+      "expired_content",
+      q =>
+        q.eq("reservationExpired", true).eq("contentPurged", undefined)
+          .lt("_creationTime", retentionCutoff),
+    ).take(RECONCILE_BATCH);
     for (const req of expiredContent) {
-      await ctx.db.patch(req._id, { messages: [], responseText: undefined, contentPurged: true });
+      await ctx.db.patch(
+        req._id,
+        checkedAccounting({
+          messages: [],
+          responseText: undefined,
+          error: "reservation_expired",
+          contentPurged: true,
+        }),
+      );
     }
     if (expiredContent.length === RECONCILE_BATCH) more = true;
     if (more) await ctx.scheduler.runAfter(0, internal.lib.retentionPhase, {});
@@ -1262,12 +1807,32 @@ export const retentionPhase = internalMutation({
   },
 });
 
+async function auditAdmin(
+  ctx: MutationCtx,
+  operation: string,
+  args: { actorId?: string; dimension?: string; value?: string; } & Record<string, unknown>,
+) {
+  const { actorId, ...details } = args;
+  await ctx.db.insert("adminEvents", {
+    operation,
+    actorId: actorId ?? "host",
+    dimension: args.dimension,
+    value: args.value,
+    // Bound the row: admin args (e.g. a huge `reason` or `models` list) must not
+    // push the audit doc toward the 1 MiB limit (which would fail the whole
+    // admin mutation) or blow the 8 MiB read limit in paginateAdminEvents.
+    detailsJson: truncate(JSON.stringify(details), MAX_AUDIT_DETAILS),
+  });
+}
 export const setRetention = mutation({
-  args: { retentionMs: v.number() },
+  args: { actorId: v.optional(v.string()), retentionMs: v.number() },
   returns: v.null(),
-  handler: async (ctx, { retentionMs }) => {
+  handler: async (ctx, args) => {
+    await auditAdmin(ctx, "setRetention", args);
+    const { retentionMs } = args;
+    assertAmount(retentionMs, "retentionMs");
     const existing = await getSettings(ctx);
-    if (existing) await ctx.db.patch(existing._id, { retentionMs });
+    if (existing) await ctx.db.patch(existing._id, checkedAccounting({ retentionMs }));
     else await ctx.db.insert("settings", { key: "singleton", retentionMs });
     return null;
   },
@@ -1279,7 +1844,7 @@ export const lineage = query({
     // Walk up to the root of the re-run chain.
     const ancestors = [];
     let cursor = await ctx.db.get(requestId);
-    while (cursor?.rerunOf) {
+    while (cursor?.rerunOf && ancestors.length < 25) {
       const parent = await ctx.db.get(cursor.rerunOf);
       if (!parent) break;
       ancestors.unshift(parent);
@@ -1288,8 +1853,8 @@ export const lineage = query({
     const reruns = await ctx.db
       .query("requests")
       .withIndex("rerunOf", (q) => q.eq("rerunOf", requestId))
-      .collect();
-    return { ancestors, reruns };
+      .take(25);
+    return { ancestors, reruns, truncated: ancestors.length === 25 || reruns.length === 25 };
   },
 });
 
@@ -1313,7 +1878,7 @@ export const listRequests = query({
     // metadata list (the dashboard renders no content), and returning up to
     // `limit` full rows risks both the read-bytes and return-size limits. Full
     // content is available per-row via getRequest.
-    const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 50)), MAX_LIST);
+    const limit = pageSize(args.limit, 50, MAX_LIST);
     const strip = (r: Doc<"requests">) => ({
       ...r,
       messages: [],
@@ -1357,6 +1922,108 @@ export const listRequests = query({
   },
 });
 
+const vBucket = v.object({
+  ...schema.tables.buckets.validator.fields,
+  _id: v.id("buckets"),
+  _creationTime: v.number(),
+});
+export const paginateBuckets = query({
+  args: { dimension: v.optional(v.string()), paginationOpts: paginationOptsValidator },
+  returns: v.object({ page: v.array(vBucket), isDone: v.boolean(), continueCursor: v.string() }),
+  handler: async (
+    ctx,
+    { dimension, paginationOpts },
+  ): Promise<{ page: Doc<"buckets">[]; isDone: boolean; continueCursor: string; }> => {
+    const options = {
+      cursor: paginationOpts.cursor,
+      numItems: pageSize(paginationOpts.numItems, 50),
+    };
+    const db = paginator(ctx.db, schema);
+    const page = dimension === undefined
+      ? await db.query("buckets").paginate(options)
+      : await db.query("buckets").withIndex("dim_value", q => q.eq("dimension", dimension))
+        .paginate(options);
+    const clock = await getSettings(ctx);
+    return {
+      page: page.page.map(b =>
+        normalizedBucket(
+          b,
+          clock?.reportingDay ?? dayStamp(),
+          clock?.reportingMonth ?? monthStamp(),
+        )
+      ),
+      isDone: page.isDone,
+      continueCursor: page.continueCursor,
+    };
+  },
+});
+const vHealth = v.object({
+  pendingFolds: v.number(),
+  pendingDeltas: v.number(),
+  countsTruncated: v.boolean(),
+  oldestUnfoldedAt: v.union(v.number(), v.null()),
+  oldestDeltaAt: v.union(v.number(), v.null()),
+  globalCheckedAt: v.union(v.number(), v.null()),
+});
+export const getHealth = query({
+  args: {},
+  returns: vHealth,
+  handler: async (ctx): Promise<Infer<typeof vHealth>> => {
+    // Sample a bounded window — a health probe only needs "is there a backlog",
+    // not an exact count, and request rows can carry content. HEALTH_SAMPLE keeps
+    // the read well under the transaction limit; >= it just flags "truncated".
+    const HEALTH_SAMPLE = 51;
+    const folds = await ctx.db.query("requests").withIndex("settled", q => q.eq("settled", false))
+      .take(HEALTH_SAMPLE);
+    const deltas = await ctx.db.query("usageDeltas").take(HEALTH_SAMPLE);
+    const settings = await getSettings(ctx);
+    return {
+      pendingFolds: folds.length,
+      pendingDeltas: deltas.length,
+      countsTruncated: folds.length === HEALTH_SAMPLE || deltas.length === HEALTH_SAMPLE,
+      oldestUnfoldedAt: folds[0]?.finishedAt ?? null,
+      oldestDeltaAt: deltas[0]?._creationTime ?? null,
+      globalCheckedAt: settings?.globalCheckedAt ?? null,
+    };
+  },
+});
+
+const vBillingEvent = v.object({
+  ...schema.tables.billingEvents.validator.fields,
+  _id: v.id("billingEvents"),
+  _creationTime: v.number(),
+});
+export const getBillingEvent = query({
+  args: { requestId: v.id("requests") },
+  returns: v.union(vBillingEvent, v.null()),
+  handler: (ctx, { requestId }) =>
+    ctx.db.query("billingEvents").withIndex("requestId", q => q.eq("requestId", requestId))
+      .unique(),
+});
+const vAdminEvent = v.object({
+  ...schema.tables.adminEvents.validator.fields,
+  _id: v.id("adminEvents"),
+  _creationTime: v.number(),
+});
+export const paginateAdminEvents = query({
+  args: { paginationOpts: paginationOptsValidator },
+  returns: v.object({
+    page: v.array(vAdminEvent),
+    isDone: v.boolean(),
+    continueCursor: v.string(),
+  }),
+  handler: async (
+    ctx,
+    { paginationOpts },
+  ): Promise<{ page: Doc<"adminEvents">[]; isDone: boolean; continueCursor: string; }> => {
+    const page = await paginator(ctx.db, schema).query("adminEvents").order("desc").paginate({
+      cursor: paginationOpts.cursor,
+      numItems: pageSize(paginationOpts.numItems, 50),
+    });
+    return { page: page.page, isDone: page.isDone, continueCursor: page.continueCursor };
+  },
+});
+
 const ADMIN_LIST_CAP = 2000;
 // Max rows a single listRequests page returns (content-stripped). Bounds both
 // the read scan and the return-value size.
@@ -1368,36 +2035,31 @@ export const listBuckets = query({
   args: { dimension: v.optional(v.string()) },
   handler: async (ctx, args) => {
     // Bounded to avoid an unbounded full-table scan on this reactive query.
-    // Paginate (ctx.db.query("buckets").paginate(...)) for larger deployments.
-    const rows =
-      args.dimension !== undefined
-        ? await ctx.db
-            .query("buckets")
-            .withIndex("dimension", (q) => q.eq("dimension", args.dimension!))
-            .take(ADMIN_LIST_CAP)
-        : await ctx.db.query("buckets").take(ADMIN_LIST_CAP);
-    const today = dayStamp();
-    const month = monthStamp();
-    return rows.map((b) => ({
-      ...b,
-      spendTodayNanos: b.dayStamp === today ? b.spendTodayNanos : 0,
-      spendThisMonthNanos: b.monthStamp === month ? b.spendThisMonthNanos ?? 0 : 0,
-    }));
+    // Use paginateBuckets for larger deployments.
+    const rows = args.dimension !== undefined
+      ? await ctx.db
+        .query("buckets")
+        .withIndex("dim_value", (q) => q.eq("dimension", args.dimension!))
+        .take(ADMIN_LIST_CAP)
+      : await ctx.db.query("buckets").take(ADMIN_LIST_CAP);
+    const clock = await getSettings(ctx);
+    return rows.map(b =>
+      normalizedBucket(b, clock?.reportingDay ?? dayStamp(), clock?.reportingMonth ?? monthStamp())
+    );
   },
 });
 
 export const getBucket = query({
   args: { dimension: v.string(), value: v.string() },
   handler: async (ctx, args) => {
-    const b = await getBucketDoc(ctx as any, args.dimension, args.value);
+    const b = await getBucketDoc(ctx, args.dimension, args.value);
     if (!b) return null;
-    const today = dayStamp();
-    const month = monthStamp();
-    return {
-      ...b,
-      spendTodayNanos: b.dayStamp === today ? b.spendTodayNanos : 0,
-      spendThisMonthNanos: b.monthStamp === month ? b.spendThisMonthNanos ?? 0 : 0,
-    };
+    const clock = await getSettings(ctx);
+    return normalizedBucket(
+      b,
+      clock?.reportingDay ?? dayStamp(),
+      clock?.reportingMonth ?? monthStamp(),
+    );
   },
 });
 
@@ -1405,22 +2067,24 @@ export const getBucket = query({
 // the client's ai.users / ai.actions namespaces are thin wrappers over this.
 export const setBucketLimits = mutation({
   args: {
+    actorId: v.optional(v.string()),
     dimension: v.string(),
     value: v.string(),
-    requestsPerMinute: v.optional(v.number()),
-    maxConcurrent: v.optional(v.number()),
-    dailySpendLimitNanos: v.optional(v.number()),
-    monthlySpendLimitNanos: v.optional(v.number()),
-    lifetimeSpendLimitNanos: v.optional(v.number()),
-    dailyTokenLimit: v.optional(v.number()),
-    monthlyTokenLimit: v.optional(v.number()),
-    lifetimeTokenLimit: v.optional(v.number()),
-    warnAtPct: v.optional(v.number()),
-    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
-    blocked: v.optional(v.boolean()),
+    requestsPerMinute: v.optional(v.union(v.number(), v.null())),
+    maxConcurrent: v.optional(v.union(v.number(), v.null())),
+    dailySpendLimitNanos: v.optional(v.union(v.number(), v.null())),
+    monthlySpendLimitNanos: v.optional(v.union(v.number(), v.null())),
+    lifetimeSpendLimitNanos: v.optional(v.union(v.number(), v.null())),
+    dailyTokenLimit: v.optional(v.union(v.number(), v.null())),
+    monthlyTokenLimit: v.optional(v.union(v.number(), v.null())),
+    lifetimeTokenLimit: v.optional(v.union(v.number(), v.null())),
+    warnAtPct: v.optional(v.union(v.number(), v.null())),
+    enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"), v.null())),
+    blocked: v.optional(v.union(v.boolean(), v.null())),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    await auditAdmin(ctx, "setBucketLimits", args);
     assertAmount(args.requestsPerMinute, "requestsPerMinute");
     assertAmount(args.maxConcurrent, "maxConcurrent");
     assertAmount(args.dailySpendLimitNanos, "dailySpendLimitNanos");
@@ -1430,15 +2094,145 @@ export const setBucketLimits = mutation({
     assertAmount(args.monthlyTokenLimit, "monthlyTokenLimit");
     assertAmount(args.lifetimeTokenLimit, "lifetimeTokenLimit");
     assertFraction(args.warnAtPct, "warnAtPct");
-    const bucket = await getOrCreateBucket(ctx, args.dimension, args.value);
-    const { dimension: _d, value: _v, ...limits } = args;
-    await ctx.db.patch(bucket._id, limits);
-    await syncPolicy(ctx, (await ctx.db.get(bucket._id))!);
+    const bucket = await getOrCreateBucket(ctx, args.dimension, args.value, true);
+    const { dimension: _d, value: _v, actorId: _actor, ...limits } = args;
+    assertKey(args.dimension, "dimension", 64);
+    assertKey(args.value, "value");
+    const patch = Object.fromEntries(
+      Object.entries(limits).filter(([, value]) => value !== undefined).map((
+        [key, value],
+      ) => [key, value === null ? undefined : value]),
+    );
+    await ctx.db.patch(bucket._id, patch);
+    const updated = (await ctx.db.get(bucket._id))!;
+    await syncPolicy(ctx, updated);
+    // New empty buckets need no scan. Existing uncapped buckets must catch up
+    // before admission can trust their counters or maxConcurrent.
+    if (!needsReserve(bucket) && needsReserve(updated)) {
+      const pending = await attributedRequests(ctx, bucket.dimension, bucket.value, null);
+      const deltas = await ctx.db.query("usageDeltas").withIndex(
+        "dim_value",
+        q => q.eq("dimension", bucket.dimension).eq("value", bucket.value),
+      ).take(1);
+      if (
+        deltas.length || pending.page.some(r => r.status === "pending" || r.settled === false)
+        || !pending.isDone
+      ) {
+        const policy = (await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
+          q.eq("dimension", bucket.dimension).eq("value", bucket.value)).unique())!;
+        await ctx.db.patch(policy._id, { reconciling: true });
+        await ctx.scheduler.runAfter(0, internal.lib.reconcileBucket, {
+          bucketId: bucket._id,
+          cursor: null,
+        });
+      }
+    }
+    return null;
+  },
+});
+
+async function attributedRequests(
+  ctx: MutationCtx,
+  dimension: string,
+  value: string,
+  cursor: string | null,
+) {
+  const options = { cursor, numItems: RECONCILE_BATCH };
+  const db = paginator(ctx.db, schema);
+  if (dimension === USER_DIM) {
+    return db.query("requests").withIndex("userId", q => q.eq("userId", value)).paginate(options);
+  }
+  if (dimension === ACTION_DIM) {
+    return db.query("requests").withIndex("actionName", q => q.eq("actionName", value)).paginate(
+      options,
+    );
+  }
+  const tags = await db.query("requestTags").withIndex(
+    "dim_value",
+    q => q.eq("dimension", dimension).eq("value", value),
+  ).paginate(options);
+  const requests = await Promise.all(tags.page.map(t => ctx.db.get(t.requestId)));
+  return { ...tags, page: requests.filter((r): r is Doc<"requests"> => r !== null) };
+}
+
+export const reconcileBucket = internalMutation({
+  args: { bucketId: v.id("buckets"), cursor: v.union(v.string(), v.null()) },
+  returns: v.null(),
+  handler: async (ctx, { bucketId, cursor }) => {
+    const initial = await ctx.db.get(bucketId);
+    if (!initial) return null;
+    const policy = await ctx.db.query("bucketPolicies").withIndex(
+      "dim_value",
+      q => q.eq("dimension", initial.dimension).eq("value", initial.value),
+    ).unique();
+    if (!policy?.reconciling) return null;
+    const deltas = await ctx.db.query("usageDeltas").withIndex(
+      "dim_value",
+      q => q.eq("dimension", initial.dimension).eq("value", initial.value),
+    ).take(RECONCILE_BATCH);
+    for (const d of deltas) await drainDelta(ctx, d);
+    if (deltas.length === RECONCILE_BATCH) {
+      await ctx.scheduler.runAfter(0, internal.lib.reconcileBucket, { bucketId, cursor });
+      return null;
+    }
+    const page = await attributedRequests(ctx, initial.dimension, initial.value, cursor);
+    for (const req of page.page) {
+      if (req.settled === false) {
+        await foldOne(ctx, req);
+        continue;
+      }
+      if (
+        req.status !== "pending" || req.reservationReleased || !needsReserve(initial)
+        || req.heldBucketIds?.includes(bucketId)
+      ) continue;
+      const original = req.attributedBuckets?.find(t =>
+        t.dimension === initial.dimension && t.value === initial.value
+      );
+      const deletion = await deletionOf(ctx, initial.dimension, initial.value);
+      if (
+        original
+          ? original.bucketId !== bucketId
+          : deletion && req._creationTime <= deletion._creationTime
+      ) continue;
+      const b = (await ctx.db.get(bucketId))!;
+      const today = dayStamp(), month = monthStamp();
+      const n = normalizedBucket(b, today, month);
+      const day = req.reservationDay ?? new Date(req._creationTime).toISOString().slice(0, 10);
+      const m = req.reservationMonth ?? day.slice(0, 7);
+      const cost = req.estimatedNanos ?? 0, tokens = req.estimatedTokens ?? 0;
+      await ctx.db.patch(
+        bucketId,
+        checkedAccounting({
+          ...windowResets(b, today, month),
+          dayStamp: today,
+          monthStamp: month,
+          spendTodayNanos: n.spendTodayNanos,
+          tokensToday: n.tokensToday,
+          spendThisMonthNanos: n.spendThisMonthNanos,
+          tokensThisMonth: n.tokensThisMonth,
+          reservedTodayNanos: (n.reservedTodayNanos ?? 0) + (day === today ? cost : 0),
+          reservedMonthNanos: (n.reservedMonthNanos ?? 0) + (m === month ? cost : 0),
+          reservedTotalNanos: (b.reservedTotalNanos ?? 0) + cost,
+          reservedTodayTokens: (n.reservedTodayTokens ?? 0) + (day === today ? tokens : 0),
+          reservedMonthTokens: (n.reservedMonthTokens ?? 0) + (m === month ? tokens : 0),
+          reservedTotalTokens: (b.reservedTotalTokens ?? 0) + tokens,
+          pendingCount: (b.pendingCount ?? 0) + 1,
+        }),
+      );
+      await ctx.db.patch(req._id, { heldBucketIds: [...(req.heldBucketIds ?? []), bucketId] });
+    }
+    if (!page.isDone) {
+      await ctx.scheduler.runAfter(0, internal.lib.reconcileBucket, {
+        bucketId,
+        cursor: page.continueCursor,
+      });
+    } else await ctx.db.patch(policy._id, { reconciling: false });
     return null;
   },
 });
 
 const vBumpArgs = {
+  actorId: v.optional(v.string()),
   dailyNanos: v.optional(v.number()),
   monthlyNanos: v.optional(v.number()),
   lifetimeNanos: v.optional(v.number()),
@@ -1450,24 +2244,27 @@ const vBumpArgs = {
 export const bumpBucket = mutation({
   args: { dimension: v.string(), value: v.string(), ...vBumpArgs },
   returns: v.null(),
-  handler: async (ctx, { dimension, value, dailyNanos, monthlyNanos, lifetimeNanos }) => {
+  handler: async (ctx, args) => {
+    await auditAdmin(ctx, "bumpBucket", args);
+    const { dimension, value, dailyNanos, monthlyNanos, lifetimeNanos } = args;
     assertAmount(dailyNanos, "dailyNanos");
     assertAmount(monthlyNanos, "monthlyNanos");
     assertAmount(lifetimeNanos, "lifetimeNanos");
     const bucket = await getOrCreateBucket(ctx, dimension, value);
     const today = dayStamp();
     const month = monthStamp();
-    const curDaily =
-      bucket.bumpDayStamp === today ? bucket.dailyBumpNanos ?? 0 : 0;
-    const curMonthly =
-      bucket.bumpMonthStamp === month ? bucket.monthlyBumpNanos ?? 0 : 0;
-    await ctx.db.patch(bucket._id, {
-      bumpDayStamp: today,
-      dailyBumpNanos: curDaily + (dailyNanos ?? 0),
-      bumpMonthStamp: month,
-      monthlyBumpNanos: curMonthly + (monthlyNanos ?? 0),
-      lifetimeBumpNanos: (bucket.lifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
-    });
+    const curDaily = bucket.bumpDayStamp === today ? bucket.dailyBumpNanos ?? 0 : 0;
+    const curMonthly = bucket.bumpMonthStamp === month ? bucket.monthlyBumpNanos ?? 0 : 0;
+    await ctx.db.patch(
+      bucket._id,
+      checkedAccounting({
+        bumpDayStamp: today,
+        dailyBumpNanos: curDaily + (dailyNanos ?? 0),
+        bumpMonthStamp: month,
+        monthlyBumpNanos: curMonthly + (monthlyNanos ?? 0),
+        lifetimeBumpNanos: (bucket.lifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
+      }),
+    );
     return null;
   },
 });
@@ -1478,6 +2275,7 @@ export const bumpBucket = mutation({
 // audit row. Does not touch the global sharded total or reservations.
 export const adjustBucket = mutation({
   args: {
+    actorId: v.optional(v.string()),
     dimension: v.string(),
     value: v.string(),
     deltaNanos: v.number(),
@@ -1485,7 +2283,11 @@ export const adjustBucket = mutation({
     reason: v.optional(v.string()),
   },
   returns: v.null(),
-  handler: async (ctx, { dimension, value, deltaNanos, tokens, reason }) => {
+  handler: async (ctx, args) => {
+    await auditAdmin(ctx, "adjustBucket", args);
+    const { dimension, value, deltaNanos, tokens } = args;
+    // Bound the stored reason so the adjustments row can't approach the doc limit.
+    const reason = args.reason === undefined ? undefined : truncate(args.reason, MAX_REASON);
     assertAmount(deltaNanos, "deltaNanos", { signed: true });
     assertAmount(tokens, "tokens", { signed: true });
     const b = await getOrCreateBucket(ctx, dimension, value);
@@ -1501,25 +2303,28 @@ export const adjustBucket = mutation({
     // grant headroom because admission subtracts them from the cap check.
     const debit = deltaNanos > 0 ? deltaNanos : 0;
     const credit = deltaNanos < 0 ? -deltaNanos : 0;
-    await ctx.db.patch(b._id, {
-      totalSpendNanos: b.totalSpendNanos + debit,
-      totalTokens: Math.max(0, b.totalTokens + dt),
-      dayStamp: today,
-      monthStamp: month,
-      spendTodayNanos: (dSame ? b.spendTodayNanos : 0) + debit,
-      tokensToday: Math.max(0, (dSame ? b.tokensToday ?? 0 : 0) + dt),
-      spendThisMonthNanos: (mSame ? b.spendThisMonthNanos ?? 0 : 0) + debit,
-      tokensThisMonth: Math.max(0, (mSame ? b.tokensThisMonth ?? 0 : 0) + dt),
-      creditsNanos: (b.creditsNanos ?? 0) + credit,
-      creditsTodayNanos: (dSame ? b.creditsTodayNanos ?? 0 : 0) + credit,
-      creditsThisMonthNanos: (mSame ? b.creditsThisMonthNanos ?? 0 : 0) + credit,
-      // Advancing the window here must also clear the OLD window's reserved
-      // holds, or an in-flight request from the previous day/month would be
-      // treated as reserving against the new window and its later release would
-      // no longer match — stranding those reserved nanos/tokens.
-      ...(dSame ? {} : { reservedTodayNanos: 0, reservedTodayTokens: 0 }),
-      ...(mSame ? {} : { reservedMonthNanos: 0, reservedMonthTokens: 0 }),
-    });
+    await ctx.db.patch(
+      b._id,
+      checkedAccounting({
+        totalSpendNanos: b.totalSpendNanos + debit,
+        totalTokens: Math.max(0, b.totalTokens + dt),
+        dayStamp: today,
+        monthStamp: month,
+        spendTodayNanos: (dSame ? b.spendTodayNanos : 0) + debit,
+        tokensToday: Math.max(0, (dSame ? b.tokensToday ?? 0 : 0) + dt),
+        spendThisMonthNanos: (mSame ? b.spendThisMonthNanos ?? 0 : 0) + debit,
+        tokensThisMonth: Math.max(0, (mSame ? b.tokensThisMonth ?? 0 : 0) + dt),
+        creditsNanos: (b.creditsNanos ?? 0) + credit,
+        creditsTodayNanos: (dSame ? b.creditsTodayNanos ?? 0 : 0) + credit,
+        creditsThisMonthNanos: (mSame ? b.creditsThisMonthNanos ?? 0 : 0) + credit,
+        // Advancing the window here must also clear the OLD window's reserved
+        // holds, or an in-flight request from the previous day/month would be
+        // treated as reserving against the new window and its later release would
+        // no longer match — stranding those reserved nanos/tokens.
+        ...(dSame ? {} : { reservedTodayNanos: 0, reservedTodayTokens: 0 }),
+        ...(mSame ? {} : { reservedMonthNanos: 0, reservedMonthTokens: 0 }),
+      }),
+    );
     await ctx.db.insert("adjustments", { dimension, value, deltaNanos, tokens: dt, reason });
     // Durable history tracks GROSS spend only (debits); credits live in the
     // adjustments log + bucket balance, so usage rollups never go negative.
@@ -1536,7 +2341,7 @@ export const listAdjustments = query({
       .query("adjustments")
       .withIndex("dim_value", (q) => q.eq("dimension", dimension).eq("value", value))
       .order("desc")
-      .take(limit ?? 50),
+      .take(pageSize(limit, 50)),
 });
 
 // Durable spend history for a bucket: per-day or per-month rows, newest first.
@@ -1552,21 +2357,30 @@ export const usageHistory = query({
     ctx.db
       .query("usage")
       .withIndex("bucket_period_stamp", (q) =>
-        q.eq("dimension", dimension).eq("value", value).eq("period", period)
-      )
+        q.eq("dimension", dimension).eq("value", value).eq("period", period))
       .order("desc")
-      .take(limit ?? 90),
+      .take(pageSize(limit, 90)),
 });
 
 // Deployment-wide default threshold for approaching-limit alerts (fraction of a
 // cap, e.g. 0.8). Buckets can override with their own warnAtPct.
 export const setAlertDefaults = mutation({
-  args: { warnAtPct: v.optional(v.number()) },
+  args: { actorId: v.optional(v.string()), warnAtPct: v.optional(v.union(v.number(), v.null())) },
   returns: v.null(),
-  handler: async (ctx, { warnAtPct }) => {
+  handler: async (ctx, args) => {
+    await auditAdmin(ctx, "setAlertDefaults", args);
+    const { warnAtPct } = args;
+    assertFraction(warnAtPct, "warnAtPct");
     const existing = await getSettings(ctx);
-    if (existing) await ctx.db.patch(existing._id, { defaultWarnAtPct: warnAtPct });
-    else await ctx.db.insert("settings", { key: "singleton", defaultWarnAtPct: warnAtPct });
+    if (existing) {
+      await ctx.db.patch(
+        existing._id,
+        checkedAccounting({ defaultWarnAtPct: warnAtPct ?? undefined }),
+      );
+    } else {await ctx.db.insert("settings", {
+        key: "singleton",
+        defaultWarnAtPct: warnAtPct ?? undefined,
+      });}
     return null;
   },
 });
@@ -1578,13 +2392,21 @@ export const setAlertDefaults = mutation({
 //   rows (default true).
 export const setDeploymentPolicy = mutation({
   args: {
+    actorId: v.optional(v.string()),
     allowUnpricedModels: v.optional(v.boolean()),
+    requireExplicitReservations: v.optional(v.boolean()),
     storeContent: v.optional(v.boolean()),
+    storeRawErrors: v.optional(v.boolean()),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    await auditAdmin(ctx, "setDeploymentPolicy", args);
     const patch: Record<string, unknown> = {};
+    if ("requireExplicitReservations" in args) {
+      patch.requireExplicitReservations = args.requireExplicitReservations;
+    }
     if ("allowUnpricedModels" in args) patch.allowUnpricedModels = args.allowUnpricedModels;
+    if ("storeRawErrors" in args) patch.storeRawErrors = args.storeRawErrors;
     if ("storeContent" in args) patch.storeContent = args.storeContent;
     const existing = await getSettings(ctx);
     if (existing) await ctx.db.patch(existing._id, patch);
@@ -1593,63 +2415,124 @@ export const setDeploymentPolicy = mutation({
   },
 });
 
-// Delete a bucket and (for the `user` dimension) all of that user's request
-// rows — e.g. account deletion / GDPR. Deletes requests in bounded batches and
-// self-reschedules so it never exceeds the per-transaction document limit.
-// Small: each row read carries (capped) content, and each is now folded/released
-// before deletion, so keep the per-transaction read + work bounded.
-const DELETE_BATCH = 50;
-export const deleteBucket = mutation({
-  args: { dimension: v.string(), value: v.string() },
-  returns: v.object({ deletedThisBatch: v.number(), done: v.boolean() }),
-  handler: async (ctx, { dimension, value }) => {
-    // Only the user dimension owns request rows (indexed by userId). Other
-    // dimensions just drop their budget-holder row.
-    if (dimension === USER_DIM) {
-      const rows = await ctx.db
-        .query("requests")
-        .withIndex("userId", (q) => q.eq("userId", value))
-        .take(DELETE_BATCH);
-      for (const r of rows) {
-        // Before dropping the row, free or settle any hold it placed on OTHER
-        // (shared) buckets — an action/customer bucket this user's request
-        // reserved against. Otherwise deleting the only row that could release
-        // that hold strands the shared bucket's reservation + pendingCount
-        // forever, and a late finish would throw. A finished-but-unfolded row
-        // is folded (the charge lands on the shared buckets); a still-pending
-        // one just has its reservation released.
-        if (r.settled === false) await foldOne(ctx, r);
-        else if (r.status === "pending") await releaseReservation(ctx, r);
-        await deleteRequestTags(ctx, r._id);
-        await ctx.db.delete(r._id);
-      }
-      if (rows.length === DELETE_BATCH) {
-        await ctx.scheduler.runAfter(0, api.lib.deleteBucket, {
-          dimension,
-          value,
+// Privacy erasure and budget closure are separate from final provider billing.
+const DELETE_BATCH = 25;
+async function deleteBucketWork(ctx: MutationCtx, dimension: string, value: string) {
+  let deletion = await deletionOf(ctx, dimension, value);
+  if (!deletion) {
+    const id = await ctx.db.insert("deletions", { dimension, value, deleting: true });
+    deletion = (await ctx.db.get(id))!;
+  }
+  const currentBucket = await getBucketDoc(ctx, dimension, value);
+  if (!deletion.deleting && currentBucket) {
+    await ctx.db.delete(deletion._id);
+    const id = await ctx.db.insert("deletions", { dimension, value, deleting: true });
+    deletion = (await ctx.db.get(id))!;
+  }
+  if (!deletion.deleting) return { deletedThisBatch: 0, done: true };
+  let count = 0, more = false;
+  if (dimension === USER_DIM) {
+    const rows = await ctx.db.query("requests").withIndex("userId", q => q.eq("userId", value))
+      .take(DELETE_BATCH);
+    for (const r of rows) {
+      if (r.settled === false) await foldOne(ctx, r);
+      await deleteRequestTags(ctx, r._id);
+      if (r.status === "pending" || r.reservationExpired) {
+        await releaseReservation(ctx, r);
+        await ctx.db.patch(r._id, {
+          userId: `erased:${r._id}`,
+          messages: [],
+          responseText: undefined,
+          error: "account_deleted",
+          privacyErased: true,
+          contentPurged: true,
+          reservationReleased: true,
+          reservationExpired: true,
+          expiredAt: Date.now(),
+          status: "error",
+          settled: true,
+          expiresAt: undefined,
+          attributedBuckets: r.attributedBuckets?.filter(t => t.dimension !== USER_DIM),
         });
-        return { deletedThisBatch: rows.length, done: false };
-      }
-      const bucket = await getBucketDoc(ctx, dimension, value);
-      if (bucket) {
-        const policy = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
-          q.eq("dimension", dimension).eq("value", value)).unique();
-        if (policy) await ctx.db.delete(policy._id);
-        await requestRateLimiter.reset(ctx, "requests", { key: bucket._id });
-        await ctx.db.delete(bucket._id);
-      }
-      return { deletedThisBatch: rows.length + (bucket ? 1 : 0), done: true };
+      } else await ctx.db.delete(r._id);
+      count++;
     }
-    const bucket = await getBucketDoc(ctx, dimension, value);
-    if (bucket) {
-      const policy = await ctx.db.query("bucketPolicies").withIndex("dim_value", q =>
-          q.eq("dimension", dimension).eq("value", value)).unique();
-        if (policy) await ctx.db.delete(policy._id);
-        await requestRateLimiter.reset(ctx, "requests", { key: bucket._id });
-      await ctx.db.delete(bucket._id);
+    more ||= rows.length === DELETE_BATCH;
+    const keys = await ctx.db.query("admissionKeys").withIndex(
+      "user_key",
+      q => q.eq("userId", value),
+    ).take(DELETE_BATCH);
+    for (const key of keys) {
+      await ctx.db.delete(key._id);
+      count++;
     }
-    return { deletedThisBatch: bucket ? 1 : 0, done: true };
+    more ||= keys.length === DELETE_BATCH;
+  }
+  const deltas = await ctx.db.query("usageDeltas").withIndex(
+    "dim_value",
+    q => q.eq("dimension", dimension).eq("value", value),
+  ).take(DELETE_BATCH);
+  for (const d of deltas) {
+    await ctx.db.delete(d._id);
+    count++;
+  }
+  more ||= deltas.length === DELETE_BATCH;
+  // NOTE: adminEvents are deliberately NOT deleted here. They are the audit
+  // trail of admin actions on this bucket — including the deleteBucket event
+  // itself (written by auditAdmin just before this runs). Sweeping them would
+  // make the single most sensitive op unauditable and let anyone erase a
+  // bucket's admin history by deleting it. The audit log is retained for
+  // accountability. (Content/usage/credits ARE erased below; the audit of who
+  // changed limits/credits and who deleted the bucket is the record that must
+  // survive. For strict erasure of an identifier from the audit trail, scrub
+  // or anonymize adminEvents separately — do not auto-delete them here.)
+  const adjustments = await ctx.db.query("adjustments").withIndex(
+    "dim_value",
+    q => q.eq("dimension", dimension).eq("value", value),
+  ).take(DELETE_BATCH);
+  for (const d of adjustments) {
+    await ctx.db.delete(d._id);
+    count++;
+  }
+  more ||= adjustments.length === DELETE_BATCH;
+  const history = await ctx.db.query("usage").withIndex(
+    "bucket_period_stamp",
+    q => q.eq("dimension", dimension).eq("value", value),
+  ).take(DELETE_BATCH);
+  for (const d of history) {
+    await ctx.db.delete(d._id);
+    count++;
+  }
+  more ||= history.length === DELETE_BATCH;
+  const bucket = await getBucketDoc(ctx, dimension, value);
+  if (bucket) {
+    const policy = await ctx.db.query("bucketPolicies").withIndex(
+      "dim_value",
+      q => q.eq("dimension", dimension).eq("value", value),
+    ).unique();
+    if (policy) await ctx.db.delete(policy._id);
+    await requestRateLimiter.reset(ctx, "requests", { key: bucket._id });
+    await ctx.db.delete(bucket._id);
+    count++;
+  }
+  if (more) await ctx.scheduler.runAfter(0, internal.lib.deleteBucketBatch, { dimension, value });
+  else await ctx.db.patch(deletion._id, { deleting: false });
+  return { deletedThisBatch: count, done: !more };
+}
+const deleteArgs = { actorId: v.optional(v.string()), dimension: v.string(), value: v.string() };
+const deleteResult = v.object({ deletedThisBatch: v.number(), done: v.boolean() });
+export const deleteBucket = mutation({
+  args: deleteArgs,
+  returns: deleteResult,
+  handler: async (ctx, args) => {
+    await auditAdmin(ctx, "deleteBucket", args);
+    return deleteBucketWork(ctx, args.dimension, args.value);
   },
+});
+export const deleteBucketBatch = internalMutation({
+  args: deleteArgs,
+  returns: deleteResult,
+  handler: (ctx, { dimension, value }) => deleteBucketWork(ctx, dimension, value),
 });
 
 export const getModelPolicy = query({
@@ -1658,7 +2541,7 @@ export const getModelPolicy = query({
     mode: v.union(
       v.literal("open"),
       v.literal("allowlist"),
-      v.literal("denylist")
+      v.literal("denylist"),
     ),
     models: v.array(v.string()),
   }),
@@ -1692,7 +2575,9 @@ export const getGlobalStatus = query({
       dailySpendLimitNanos: s?.globalDailySpendLimitNanos ?? null,
       lifetimeSpendLimitNanos: s?.globalLifetimeSpendLimitNanos ?? null,
       enforcement: s?.globalEnforcement ?? "approximate",
-      spentTodayNanos: await globalSpend.count(ctx, globalDayKey(dayStamp())),
+      // Prefer the reconciler-maintained reporting day so this query is reactive
+      // (no wall-clock read that would freeze the day boundary in a subscription).
+      spentTodayNanos: await globalSpend.count(ctx, globalDayKey(s?.reportingDay ?? dayStamp())),
       spentTotalNanos: await globalSpend.count(ctx, GLOBAL_TOTAL),
       retentionMs: s?.retentionMs ?? null,
       defaultWarnAtPct: s?.defaultWarnAtPct ?? null,
@@ -1702,6 +2587,7 @@ export const getGlobalStatus = query({
 
 export const setGlobalLimits = mutation({
   args: {
+    actorId: v.optional(v.string()),
     // Absent = leave unchanged; explicit null = clear that limit. (A bare
     // v.optional(number) that always rebuilt the full patch would let a
     // one-field edit — exactly what the dashboard sends — silently wipe the
@@ -1709,24 +2595,30 @@ export const setGlobalLimits = mutation({
     dailySpendLimitNanos: v.optional(v.union(v.number(), v.null())),
     lifetimeSpendLimitNanos: v.optional(v.union(v.number(), v.null())),
     enforcement: v.optional(
-      v.union(v.literal("approximate"), v.literal("soft"), v.null())
+      v.union(v.literal("approximate"), v.literal("soft"), v.null()),
     ),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    if (typeof args.dailySpendLimitNanos === "number")
+    await auditAdmin(ctx, "setGlobalLimits", args);
+    if (typeof args.dailySpendLimitNanos === "number") {
       assertAmount(args.dailySpendLimitNanos, "dailySpendLimitNanos");
-    if (typeof args.lifetimeSpendLimitNanos === "number")
+    }
+    if (typeof args.lifetimeSpendLimitNanos === "number") {
       assertAmount(args.lifetimeSpendLimitNanos, "lifetimeSpendLimitNanos");
+    }
     // The settings fields are "global"-prefixed; map the friendly arg names,
     // touching ONLY the keys the caller actually passed. null -> clear.
     const patch: Record<string, unknown> = {};
-    if ("dailySpendLimitNanos" in args)
+    if ("dailySpendLimitNanos" in args) {
       patch.globalDailySpendLimitNanos = args.dailySpendLimitNanos ?? undefined;
-    if ("lifetimeSpendLimitNanos" in args)
+    }
+    if ("lifetimeSpendLimitNanos" in args) {
       patch.globalLifetimeSpendLimitNanos = args.lifetimeSpendLimitNanos ?? undefined;
-    if ("enforcement" in args)
+    }
+    if ("enforcement" in args) {
       patch.globalEnforcement = args.enforcement ?? undefined;
+    }
     const existing = await getSettings(ctx);
     if (existing) {
       await ctx.db.patch(existing._id, patch);
@@ -1740,7 +2632,11 @@ export const setGlobalLimits = mutation({
 export const bumpGlobal = mutation({
   args: vBumpArgs,
   returns: v.null(),
-  handler: async (ctx, { dailyNanos, lifetimeNanos }) => {
+  handler: async (ctx, args) => {
+    await auditAdmin(ctx, "bumpGlobal", args);
+    const { dailyNanos, lifetimeNanos } = args;
+    assertAmount(dailyNanos, "dailyNanos");
+    assertAmount(lifetimeNanos, "lifetimeNanos");
     const today = dayStamp();
     const s = await getSettings(ctx);
     const curDaily = s?.globalBumpDayStamp === today ? s?.globalDailyBumpNanos ?? 0 : 0;
@@ -1749,6 +2645,7 @@ export const bumpGlobal = mutation({
       globalDailyBumpNanos: curDaily + (dailyNanos ?? 0),
       globalLifetimeBumpNanos: (s?.globalLifetimeBumpNanos ?? 0) + (lifetimeNanos ?? 0),
     };
+    checkedAccounting(patch);
     if (s) await ctx.db.patch(s._id, patch);
     else await ctx.db.insert("settings", { key: "singleton", ...patch });
     return null;
@@ -1757,26 +2654,33 @@ export const bumpGlobal = mutation({
 
 export const setModelPolicy = mutation({
   args: {
+    actorId: v.optional(v.string()),
     mode: v.union(
       v.literal("open"),
       v.literal("allowlist"),
-      v.literal("denylist")
+      v.literal("denylist"),
     ),
     models: v.array(v.string()),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    await auditAdmin(ctx, "setModelPolicy", args);
+    // Bound the list so the settings doc can't be pushed toward the 1 MiB limit.
+    const models = args.models.slice(0, MAX_MODELS).map((m) => m.slice(0, MAX_MODEL_LEN));
     const existing = await getSettings(ctx);
     if (existing) {
-      await ctx.db.patch(existing._id, {
-        modelMode: args.mode,
-        models: args.models,
-      });
+      await ctx.db.patch(
+        existing._id,
+        checkedAccounting({
+          modelMode: args.mode,
+          models,
+        }),
+      );
     } else {
       await ctx.db.insert("settings", {
         key: "singleton",
         modelMode: args.mode,
-        models: args.models,
+        models,
       });
     }
     return null;
@@ -1785,14 +2689,18 @@ export const setModelPolicy = mutation({
 
 export const setPrice = mutation({
   args: {
+    actorId: v.optional(v.string()),
     model: v.string(),
     inputNanosPerMTok: v.number(),
     outputNanosPerMTok: v.number(),
     // optional cache-read rate; if omitted, a default discount off input applies
     cachedNanosPerMTok: v.optional(v.number()),
+    cacheWriteNanosPerMTok: v.optional(v.number()),
+    cacheWrite1hNanosPerMTok: v.optional(v.number()),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
+    await auditAdmin(ctx, "setPrice", args);
     // Negative prices would make costOf return a negative cost, which folds
     // into totals as a spend *refund* — pushing a user back under their cap.
     // NaN/Infinity (allowed by v.number()) are just as corrupting — a NaN rate
@@ -1800,14 +2708,17 @@ export const setPrice = mutation({
     assertAmount(args.inputNanosPerMTok, "inputNanosPerMTok");
     assertAmount(args.outputNanosPerMTok, "outputNanosPerMTok");
     assertAmount(args.cachedNanosPerMTok, "cachedNanosPerMTok");
+    assertAmount(args.cacheWriteNanosPerMTok, "cacheWriteNanosPerMTok");
+    assertAmount(args.cacheWrite1hNanosPerMTok, "cacheWrite1hNanosPerMTok");
+    const { actorId: _actor, ...price } = args;
     const existing = await ctx.db
       .query("prices")
       .withIndex("model", (q) => q.eq("model", args.model))
       .unique();
     if (existing) {
-      await ctx.db.patch(existing._id, args);
+      await ctx.db.patch(existing._id, price);
     } else {
-      await ctx.db.insert("prices", args);
+      await ctx.db.insert("prices", price);
     }
     return null;
   },
@@ -1816,10 +2727,17 @@ export const setPrice = mutation({
 export const listPrices = query({
   args: {},
   handler: async (ctx) => {
-    const overrides = await ctx.db.query("prices").collect();
+    const overrides = await ctx.db.query("prices").take(2000);
     const merged: Record<
       string,
-      { input: number; output: number; cached?: number; overridden: boolean }
+      {
+        input: number;
+        output: number;
+        cached?: number;
+        cacheWrite?: number;
+        cacheWrite1h?: number;
+        overridden: boolean;
+      }
     > = {};
     for (const [model, p] of Object.entries(DEFAULT_PRICES)) {
       merged[model] = { ...p, overridden: false };
@@ -1829,6 +2747,8 @@ export const listPrices = query({
         input: o.inputNanosPerMTok,
         output: o.outputNanosPerMTok,
         cached: o.cachedNanosPerMTok,
+        cacheWrite: o.cacheWriteNanosPerMTok,
+        cacheWrite1h: o.cacheWrite1hNanosPerMTok,
         overridden: true,
       };
     }
@@ -1841,18 +2761,24 @@ export const listPrices = query({
 export const listServerToolPrices = query({
   args: {},
   handler: async (ctx) => {
-    const s = await getSettings(ctx as any);
+    const s = await getSettings(ctx);
     return { ...DEFAULT_SERVER_TOOL_PRICES, ...(s?.serverToolPrices ?? {}) };
   },
 });
 
 export const setServerToolPrice = mutation({
-  args: { tool: v.string(), nanosPerCall: v.number() },
+  args: { actorId: v.optional(v.string()), tool: v.string(), nanosPerCall: v.number() },
   returns: v.null(),
-  handler: async (ctx, { tool, nanosPerCall }) => {
-    if (nanosPerCall < 0) throw new Error("Prices must be non-negative");
+  handler: async (ctx, args) => {
+    await auditAdmin(ctx, "setServerToolPrice", args);
+    const { tool, nanosPerCall } = args;
+    assertKey(tool, "tool", 64);
+    assertAmount(nanosPerCall, "nanosPerCall");
     const s = await getSettings(ctx);
     const serverToolPrices = { ...(s?.serverToolPrices ?? {}), [tool]: nanosPerCall };
+    if (Object.keys(serverToolPrices).length > MAX_SERVER_TOOLS) {
+      throw new Error("Too many server-tool prices");
+    }
     if (s) await ctx.db.patch(s._id, { serverToolPrices });
     else await ctx.db.insert("settings", { key: "singleton", serverToolPrices });
     return null;

@@ -12,8 +12,48 @@ export const vMessage = v.object({
 export const vTag = v.object({ dimension: v.string(), value: v.string() });
 
 export default defineSchema({
+  adminEvents: defineTable({
+    operation: v.string(),
+    actorId: v.string(),
+    dimension: v.optional(v.string()),
+    value: v.optional(v.string()),
+    detailsJson: v.string(),
+  }).index("dim_value", ["dimension", "value"]),
+  billingEvents: defineTable({
+    requestId: v.id("requests"),
+    costNanos: v.number(),
+    costSource: v.optional(
+      v.union(
+        v.literal("authoritative"),
+        v.literal("token_estimate"),
+        v.literal("reservation_estimate"),
+      ),
+    ),
+    tokens: v.number(),
+    finishedAt: v.number(),
+    // A durable, PII-light billing ledger: the row stores NO prompt/response
+    // content and NO user identifier field. `bucketIds` are opaque handles —
+    // resolvable to a (dimension, value) only by joining the `buckets` table in
+    // the same deployment, and left dangling once a bucket is deleted. So the
+    // ledger exported on its own carries no identities; within the deployment a
+    // live user-dimension bucket id still resolves to its userId (billing
+    // inherently knows who was charged).
+    bucketIds: v.array(v.id("buckets")),
+  }).index("requestId", ["requestId"]),
+  admissionKeys: defineTable({
+    userId: v.string(),
+    key: v.string(),
+    fingerprint: v.string(),
+    requestId: v.id("requests"),
+  }).index("user_key", ["userId", "key"]),
+  deletions: defineTable({
+    dimension: v.string(),
+    value: v.string(),
+    deleting: v.boolean(),
+  }).index("dim_value", ["dimension", "value"]).index("deleting", ["deleting"]),
   bucketPolicies: defineTable({
     bucketId: v.id("buckets"),
+    reconciling: v.optional(v.boolean()),
     dimension: v.string(),
     value: v.string(),
     requestsPerMinute: v.optional(v.number()), // token-bucket refill per minute and burst capacity
@@ -30,7 +70,7 @@ export default defineSchema({
     warnAtPct: v.optional(v.number()),
     // "hard" (default): exceeding a budget blocks. "soft": warn but allow.
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
-  }).index("dim_value", ["dimension", "value"]),
+  }).index("dim_value", ["dimension", "value"]).index("reconciling", ["reconciling"]),
   // A budget holder, keyed by (dimension, value). Unifies what used to be the
   // `users` and `actions` tables — those are just the "user" and "action"
   // dimensions now. Any tag a request carries can have its own budget here.
@@ -87,8 +127,10 @@ export default defineSchema({
     reservedTotalTokens: v.optional(v.number()),
     pendingCount: v.optional(v.number()),
   })
-    .index("dim_value", ["dimension", "value"])
-    .index("dimension", ["dimension"]),
+    // The compound dim_value index also serves dimension-only (prefix) queries,
+    // so no separate `dimension` index is needed — one fewer index write on the
+    // hot admission/settle path.
+    .index("dim_value", ["dimension", "value"]),
 
   // Durable per-(bucket, period) spend history. Written from settled requests
   // and manual adjustments; NEVER swept by request retention, so spend charts
@@ -121,7 +163,8 @@ export default defineSchema({
     tokens: v.number(),
     requests: v.number(),
     drainToRow: v.boolean(),
-  }),
+    bucketId: v.optional(v.id("buckets")),
+  }).index("dim_value", ["dimension", "value"]),
 
   // Reverse index for filtering the request log by an arbitrary tag dimension
   // (user/action are already indexed on `requests`). One row per extra tag per
@@ -151,6 +194,22 @@ export default defineSchema({
     actionName: v.optional(v.string()),
     tags: v.optional(v.array(vTag)),
     model: v.string(),
+    privacyErased: v.optional(v.boolean()),
+    attributedBuckets: v.optional(
+      v.array(v.object({ dimension: v.string(), value: v.string(), bucketId: v.id("buckets") })),
+    ),
+    priceSnapshot: v.optional(
+      v.object({
+        input: v.number(),
+        output: v.number(),
+        cached: v.number(),
+        cacheWrite: v.number(),
+        cacheWrite1h: v.optional(v.number()),
+      }),
+    ),
+    serverToolPriceSnapshot: v.optional(v.record(v.string(), v.number())),
+    cachedWriteTokens: v.optional(v.number()),
+    cachedWrite1hTokens: v.optional(v.number()),
     // pessimistic holds placed at start; reconciled to actual on settle
     heldBucketIds: v.optional(v.array(v.id("buckets"))),
     reservationDay: v.optional(v.string()),
@@ -159,6 +218,7 @@ export default defineSchema({
     reservationExpired: v.optional(v.boolean()),
     contentPurged: v.optional(v.boolean()),
     expiresAt: v.optional(v.number()),
+    expiredAt: v.optional(v.number()),
     finishedAt: v.optional(v.number()),
     estimatedNanos: v.optional(v.number()),
     estimatedTokens: v.optional(v.number()),
@@ -175,7 +235,7 @@ export default defineSchema({
       v.literal("pending"),
       v.literal("success"),
       v.literal("error"),
-      v.literal("blocked")
+      v.literal("blocked"),
     ),
     responseText: v.optional(v.string()),
     error: v.optional(v.string()),
@@ -192,6 +252,13 @@ export default defineSchema({
     // 30-min floor; only stored while pending.
     reserveTtlMs: v.optional(v.number()),
     costNanos: v.optional(v.number()),
+    costSource: v.optional(
+      v.union(
+        v.literal("authoritative"),
+        v.literal("token_estimate"),
+        v.literal("reservation_estimate"),
+      ),
+    ),
     latencyMs: v.optional(v.number()),
     rerunOf: v.optional(v.id("requests")),
   })
@@ -199,6 +266,7 @@ export default defineSchema({
     .index("status", ["status"])
     .index("status_expires", ["status", "expiresAt"])
     .index("retention", ["reservationExpired", "settled"])
+    .index("retention_expiredAt", ["reservationExpired", "settled", "expiredAt"])
     .index("expired_content", ["reservationExpired", "contentPurged"])
     .index("rerunOf", ["rerunOf"])
     .index("actionName", ["actionName"])
@@ -212,6 +280,8 @@ export default defineSchema({
     // price for cached (prompt-cache-read) input tokens. Providers bill these
     // at a fraction of the input rate; if unset, a default discount is applied.
     cachedNanosPerMTok: v.optional(v.number()),
+    cacheWriteNanosPerMTok: v.optional(v.number()),
+    cacheWrite1hNanosPerMTok: v.optional(v.number()),
   }).index("model", ["model"]),
 
   // singleton component config (key === "singleton")
@@ -223,24 +293,23 @@ export default defineSchema({
       v.union(
         v.literal("open"),
         v.literal("allowlist"),
-        v.literal("denylist")
-      )
+        v.literal("denylist"),
+      ),
     ),
     models: v.optional(v.array(v.string())),
     // Deployment-wide ("global") spend cap across ALL requests. Running totals
     // live in a sharded counter (high write throughput) since every request
     // touches it; only the limit config lives here. Enforced approximately —
     // the sharded total is read without a reservation, so under heavy
-    // concurrency it can overshoot by a bounded amount. Right for a global
+    // concurrency it can overshoot without a monetary bound unless workload limits are configured. Right for a global
     // killswitch; per-bucket concurrent admission is atomic via reserve/settle.
     globalDailySpendLimitNanos: v.optional(v.number()),
     globalLifetimeSpendLimitNanos: v.optional(v.number()),
     // "approximate" (default): a best-effort killswitch — it blocks once the
-    // sharded total crosses the cap, but with bounded overshoot (no per-request
-    // reservation). "soft": warn only. There is deliberately no "hard": a true
-    // to-the-dollar ceiling is a per-bucket cap.
+    // sharded total crosses the cap, but without a monetary overshoot bound (no per-request
+    // reservation). "soft": warn only. There is deliberately no "hard": per-bucket caps reserve atomically against explicit or estimated usage.
     globalEnforcement: v.optional(
-      v.union(v.literal("approximate"), v.literal("soft"))
+      v.union(v.literal("approximate"), v.literal("soft")),
     ),
     globalDailyBumpNanos: v.optional(v.number()),
     globalLifetimeBumpNanos: v.optional(v.number()),
@@ -249,6 +318,9 @@ export default defineSchema({
     // these, so admission reads ONE settings doc instead of the sharded counter
     // (whose per-admission read contended with every fold). Killswitch lag is
     // bounded by the reconcile interval — fine for a deployment-wide stop.
+    reportingDay: v.optional(v.string()),
+    reportingMonth: v.optional(v.string()),
+    globalCheckedAt: v.optional(v.number()),
     globalTrippedDaily: v.optional(v.boolean()),
     globalTrippedLifetime: v.optional(v.boolean()),
     globalNearLimit: v.optional(v.boolean()),
@@ -264,9 +336,11 @@ export default defineSchema({
     // hard enforcement (instead of charging the conservative fallback). Default
     // true (charge the fallback, keep the call working).
     allowUnpricedModels: v.optional(v.boolean()),
+    requireExplicitReservations: v.optional(v.boolean()),
     // When false, don't persist prompt/response content on request rows (only
     // metadata + cost). Default true. For teams that want zero prompt retention
     // rather than short retention.
     storeContent: v.optional(v.boolean()),
+    storeRawErrors: v.optional(v.boolean()),
   }).index("key", ["key"]),
 });

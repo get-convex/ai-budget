@@ -81,7 +81,7 @@ document.querySelectorAll("nav button").forEach((b) =>
 function numInput(value, onSave, { money = false, width = 90 } = {}) {
   const shown = value == null ? "" : money ? value / NANOS : value;
   const i = el("input", { value: shown, style: "width:" + width + "px" });
-  const save = () => { const t = i.value.trim(); onSave(t === "" ? undefined : money ? Math.round(Number(t) * NANOS) : Number(t)); };
+  const save = () => { const t = i.value.trim(); const value = t === "" ? null : money ? Math.round(Number(t) * NANOS) : Number(t); if (value !== null && (!Number.isSafeInteger(value) || value < 0)) { i.setCustomValidity("Enter a nonnegative finite number"); i.reportValidity(); return; } i.setCustomValidity(""); onSave(value); };
   i.addEventListener("keydown", (e) => { if (e.key === "Enter") i.blur(); });
   i.addEventListener("blur", save);
   return i;
@@ -128,7 +128,7 @@ async function renderBuckets() {
       el("td", { class: "mono" }, usd(b.totalSpendNanos)),
       el("td", {}, numInput(b.dailySpendLimitNanos, (v) => set({ dailySpendLimitNanos: v }), { money: true })),
       el("td", {}, numInput(b.monthlySpendLimitNanos, (v) => set({ monthlySpendLimitNanos: v }), { money: true })),
-      el("td", {}, numInput(b.warnAtPct == null ? undefined : Math.round(b.warnAtPct * 100), (v) => set({ warnAtPct: v == null ? undefined : v / 100 }), { width: 55 })),
+      el("td", {}, numInput(b.warnAtPct == null ? undefined : Math.round(b.warnAtPct * 100), (v) => set({ warnAtPct: v == null ? null : v / 100 }), { width: 55 })),
       el("td", {}, numInput(b.maxConcurrent, (v) => set({ maxConcurrent: v }), { width: 55 })),
       el("td", {}, el("input", { type: "checkbox", style: "width:auto", ...(b.blocked ? { checked: "" } : {}), onchange: (e) => set({ blocked: e.target.checked }) })),
       el("td", {}, [
@@ -206,7 +206,7 @@ async function renderSettings() {
   main.append(el("h2", {}, "Alerts & retention"));
   main.append(el("div", { class: "row" }, [
     "Alert at %:", numInput(g.defaultWarnAtPct == null ? undefined : Math.round(g.defaultWarnAtPct * 100),
-      (v) => post("/global/setAlertDefaults", { warnAtPct: v == null ? undefined : v / 100 }).then(render), { width: 55 }),
+      (v) => post("/global/setAlertDefaults", { warnAtPct: v == null ? null : v / 100 }).then(render), { width: 55 }),
     "Retention (ms):", numInput(g.retentionMs, (v) => post("/global/setRetention", { retentionMs: v ?? 0 }).then(render), { width: 130 }),
   ]));
 

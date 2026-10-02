@@ -1,12 +1,12 @@
+import { convexGateway } from "@convex-dev/ai-sdk-provider";
+import { generateText, type LanguageModel, wrapLanguageModel } from "ai";
 import {
-  httpActionGeneric,
   type Expand,
   type FunctionReference,
+  httpActionGeneric,
   type HttpRouter,
 } from "convex/server";
 import { ConvexError, type GenericId } from "convex/values";
-import { generateText, wrapLanguageModel, type LanguageModel } from "ai";
-import { convexGateway } from "@convex-dev/ai-sdk-provider";
 import type { api } from "../component/_generated/api";
 import { DASHBOARD_HTML } from "./dashboard";
 
@@ -15,33 +15,30 @@ import { DASHBOARD_HTML } from "./dashboard";
 // Map branded document Ids to plain strings across the component boundary.
 // Note: only GenericId, not `string` — widening every string (and string-literal
 // union like "hard"|"soft") to `string` breaks structural matching of returns.
-type OpaqueIds<T> = T extends GenericId<infer _T>
-  ? string
-  : T extends (infer U)[]
-    ? OpaqueIds<U>[]
-    : T extends ArrayBuffer
-      ? ArrayBuffer
-      : T extends object
-        ? { [K in keyof T]: OpaqueIds<T[K]> }
-        : T;
+type OpaqueIds<T> = T extends GenericId<infer _T> ? string
+  : T extends (infer U)[] ? OpaqueIds<U>[]
+  : T extends ArrayBuffer ? ArrayBuffer
+  : T extends object ? { [K in keyof T]: OpaqueIds<T[K]>; }
+  : T;
 
-type UseApi<API> = Expand<{
-  [mod in keyof API]: API[mod] extends FunctionReference<
-    infer FType,
-    "public",
-    infer FArgs,
-    infer FReturnType,
-    infer FComponentPath
-  >
-    ? FunctionReference<
+type UseApi<API> = Expand<
+  {
+    [mod in keyof API]: API[mod] extends FunctionReference<
+      infer FType,
+      "public",
+      infer FArgs,
+      infer FReturnType,
+      infer FComponentPath
+    > ? FunctionReference<
         FType,
         "internal",
         OpaqueIds<FArgs>,
         OpaqueIds<FReturnType>,
         FComponentPath
       >
-    : UseApi<API[mod]>;
-}>;
+      : UseApi<API[mod]>;
+  }
+>;
 
 export type AIBudgetApi = UseApi<typeof api>;
 /** @deprecated use AIBudgetApi */
@@ -53,7 +50,7 @@ export type AIGatewayApi = AIBudgetApi;
  * userId/action); use tags for anything else — team, project, tenant, env, ….
  * Any tagged bucket can carry its own budget (see `ai.tag(dimension)`).
  */
-export type Tag = { dimension: string; value: string };
+export type Tag = { dimension: string; value: string; };
 
 /** Common shape for budget-event callbacks. */
 export type BudgetEventInfo = {
@@ -68,9 +65,11 @@ export type BudgetEventInfo = {
   reason?: string;
 };
 /** @deprecated use BudgetEventInfo */
-export type SoftLimitInfo = BudgetEventInfo & { warnings: string[] };
+export type SoftLimitInfo = BudgetEventInfo & { warnings: string[]; };
 export type AIBudgetOptions = {
   defaultModel?: string;
+  /** Legacy single-issuer deployments may opt into subject while migrating. */
+  identityKey?: "tokenIdentifier" | "subject";
   /** Default model for `decisions()` (the Decisions/"Jev" endpoint). */
   defaultEvalModel?: string;
   /**
@@ -88,22 +87,26 @@ export type AIBudgetOptions = {
 type RunQueryCtx = {
   runQuery: <Query extends FunctionReference<"query", "internal">>(
     query: Query,
-    args: Query["_args"]
+    args: Query["_args"],
   ) => Promise<Query["_returnType"]>;
 };
 type RunMutationCtx = RunQueryCtx & {
   runMutation: <M extends FunctionReference<"mutation", "internal">>(
     mutation: M,
-    args: M["_args"]
+    args: M["_args"],
   ) => Promise<M["_returnType"]>;
-  meta?: { getFunctionMetadata(): Promise<{ name: string }> };
-  auth?: { getUserIdentity(): Promise<{ subject?: string } | null> };
+  meta?: { getFunctionMetadata(): Promise<{ name: string; }>; };
+  auth?: {
+    getUserIdentity(): Promise<
+      { subject?: string; issuer?: string; tokenIdentifier?: string; } | null
+    >;
+  };
 };
 
 // The calling Convex action's name (e.g. "ai:sendMessage"), unless overridden.
 async function resolveActionName(
   ctx: RunMutationCtx,
-  explicit?: string
+  explicit?: string,
 ): Promise<string | undefined> {
   if (explicit !== undefined) return explicit;
   try {
@@ -114,23 +117,36 @@ async function resolveActionName(
 }
 
 // The user this call is billed to. If not passed explicitly, it's the
-// authenticated caller (ctx.auth.getUserIdentity().subject) — so budgets are
+// authenticated caller (ctx.auth.getUserIdentity().tokenIdentifier) — so budgets are
 // server-derived by default and can't be spoofed by a client-supplied id.
-async function resolveUserId(
+async function resolveUserAttribution(
   ctx: RunMutationCtx,
-  explicit?: string
-): Promise<string> {
-  if (explicit !== undefined) return explicit;
+  explicit?: string,
+  identityKey: "tokenIdentifier" | "subject" = "tokenIdentifier",
+): Promise<{ userId: string; legacyUserId?: string; }> {
+  if (explicit !== undefined) return { userId: explicit };
   const identity = await ctx.auth?.getUserIdentity?.();
-  if (identity?.subject) return identity.subject;
+  if (identityKey === "subject" && identity?.subject) return { userId: identity.subject };
+  const userId = identity?.tokenIdentifier
+    ?? (identity?.issuer && identity.subject
+      ? `${identity.issuer}|${identity.subject}`
+      : undefined);
+  if (userId) {
+    return {
+      userId,
+      ...(identity?.subject && identity.subject !== userId
+        ? { legacyUserId: identity.subject }
+        : {}),
+    };
+  }
   throw new Error(
-    "ai-budget: no `userId` was passed and there is no authenticated user " +
-      "(ctx.auth.getUserIdentity() returned null). Either authenticate the " +
-      "request or pass an explicit `userId`."
+    "ai-budget: no `userId` was passed and there is no authenticated user "
+      + "(ctx.auth.getUserIdentity() returned null). Either authenticate the "
+      + "request or pass an explicit `userId`.",
   );
 }
 
-export type Message = { role: string; content: string };
+export type Message = { role: string; content: string; };
 
 export type ChatResult = {
   text: string;
@@ -139,6 +155,8 @@ export type ChatResult = {
   promptTokens: number;
   completionTokens: number;
   cachedTokens: number;
+  cachedWriteTokens: number;
+  cachedWrite1hTokens: number;
   /** Soft-limit warnings raised at admission (empty unless a soft cap was hit). */
   warnings: string[];
   /** Approaching-cap notices (empty unless a warnAtPct threshold was crossed). */
@@ -170,33 +188,48 @@ function extractUsage(usage: any): {
   promptTokens: number;
   completionTokens: number;
   cachedTokens: number;
+  cachedWriteTokens: number;
+  cachedWrite1hTokens: number;
 } {
   return {
     // Cover AI SDK camelCase (v5/v7), raw OpenAI-compatible snake_case, AND raw
     // Anthropic (`input_tokens`/`output_tokens`), so a `meter` caller passing any
     // provider's raw `usage` object still gets counts.
-    promptTokens: toTokenCount(
-      usage?.inputTokens ??
-        usage?.promptTokens ??
-        usage?.prompt_tokens ??
-        usage?.input_tokens
-    ),
+    promptTokens: usage?.input_tokens !== undefined
+      ? toTokenCount(usage.input_tokens) + toTokenCount(usage.cache_read_input_tokens)
+        + toTokenCount(usage.cache_creation_input_tokens)
+      : toTokenCount(
+        usage?.inputTokens
+          ?? usage?.promptTokens
+          ?? usage?.prompt_tokens
+          ?? usage?.input_tokens,
+      ),
     completionTokens: toTokenCount(
-      usage?.outputTokens ??
-        usage?.completionTokens ??
-        usage?.completion_tokens ??
-        usage?.output_tokens
+      usage?.outputTokens
+        ?? usage?.completionTokens
+        ?? usage?.completion_tokens
+        ?? usage?.output_tokens,
+    ),
+    cachedWrite1hTokens: toTokenCount(
+      usage?.cache_creation?.ephemeral_1h_input_tokens
+        ?? usage?.raw?.cache_creation?.ephemeral_1h_input_tokens,
+    ),
+    cachedWriteTokens: toTokenCount(
+      usage?.cache_creation_input_tokens ?? usage?.inputTokenDetails?.cacheWriteTokens
+        ?? usage?.inputTokens?.cacheWrite,
     ),
     // cached prompt tokens. The Convex gateway reports these at
     // `usage.inputTokenDetails.cacheReadTokens`; the other paths cover AI SDK v5
     // (`cachedInputTokens`) and raw OpenAI-compatible shapes.
     cachedTokens: toTokenCount(
-      usage?.inputTokenDetails?.cacheReadTokens ??
-        usage?.cachedInputTokens ??
-        usage?.promptTokensDetails?.cachedTokens ??
-        usage?.prompt_tokens_details?.cached_tokens ??
-        usage?.cached_tokens ??
-        usage?.cache_read_input_tokens
+      usage?.inputTokenDetails?.cacheReadTokens
+        ?? usage?.inputTokens?.cacheRead
+        ?? usage?.input_tokens_details?.cached_tokens
+        ?? usage?.cachedInputTokens
+        ?? usage?.promptTokensDetails?.cachedTokens
+        ?? usage?.prompt_tokens_details?.cached_tokens
+        ?? usage?.cached_tokens
+        ?? usage?.cache_read_input_tokens,
     ),
   };
 }
@@ -250,7 +283,7 @@ function simplifyPrompt(prompt: any): Message[] {
     } else {
       content = JSON.stringify(m.content);
     }
-    return { role: String(m.role), content: capContent(content) };
+    return { role: String(m.role), content };
   });
 }
 
@@ -279,18 +312,18 @@ function timingSafeEqual(a: string, b: string): boolean {
 /** Limits/controls settable on any budget bucket (user, action, or tag). */
 export type BucketLimits = {
   /** Token-bucket refill per minute and burst capacity; 0 blocks all requests. */
-  requestsPerMinute?: number;
-  maxConcurrent?: number;
-  dailySpendLimitNanos?: number;
-  monthlySpendLimitNanos?: number;
-  lifetimeSpendLimitNanos?: number;
-  dailyTokenLimit?: number;
-  monthlyTokenLimit?: number;
-  lifetimeTokenLimit?: number;
+  requestsPerMinute?: number | null;
+  maxConcurrent?: number | null;
+  dailySpendLimitNanos?: number | null;
+  monthlySpendLimitNanos?: number | null;
+  lifetimeSpendLimitNanos?: number | null;
+  dailyTokenLimit?: number | null;
+  monthlyTokenLimit?: number | null;
+  lifetimeTokenLimit?: number | null;
   /** Fire an approaching-limit alert at this fraction of a cap (e.g. 0.8). */
-  warnAtPct?: number;
-  enforcement?: "hard" | "soft";
-  blocked?: boolean;
+  warnAtPct?: number | null;
+  enforcement?: "hard" | "soft" | null;
+  blocked?: boolean | null;
 };
 /** One-time bump amounts, added on top of a standing cap. */
 export type BumpArgs = {
@@ -299,16 +332,32 @@ export type BumpArgs = {
   lifetimeNanos?: number;
 };
 
+/** Explicit conservative bounds. The app must include input, output and tool
+ * charges in costNanos/tokens; maxOutputTokens is also enforced at the provider. */
+export type StrictReservation = { costNanos: number; tokens: number; maxOutputTokens: number; };
+function validateReservation(reservation: StrictReservation) {
+  for (const [key, value] of Object.entries(reservation)) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`${key} must be a nonnegative safe integer`);
+    }
+  }
+  if (reservation.maxOutputTokens < 1 || reservation.maxOutputTokens > reservation.tokens) {
+    throw new Error("maxOutputTokens must be positive and fit within the token reservation");
+  }
+}
+
 export class AIBudget {
   public defaultModel: string;
   public defaultEvalModel: string;
+  private identityKey: "tokenIdentifier" | "subject";
   private onSoftLimit?: AIBudgetOptions["onSoftLimit"];
   private onThreshold?: AIBudgetOptions["onThreshold"];
   private onLimitReached?: AIBudgetOptions["onLimitReached"];
   constructor(
     public component: AIBudgetApi,
-    options?: AIBudgetOptions
+    options?: AIBudgetOptions,
   ) {
+    this.identityKey = options?.identityKey ?? "tokenIdentifier";
     this.defaultModel = options?.defaultModel ?? "openai/gpt-4o-mini";
     this.defaultEvalModel = options?.defaultEvalModel ?? "typesafe/jev-1.13";
     this.onSoftLimit = options?.onSoftLimit;
@@ -320,7 +369,7 @@ export class AIBudget {
   private async fireBudgetEvents(
     base: Omit<BudgetEventInfo, "messages">,
     warnings: string[],
-    notices: string[]
+    notices: string[],
   ) {
     if (warnings.length > 0 && this.onSoftLimit) {
       try {
@@ -365,31 +414,40 @@ export class AIBudget {
       tags?: Tag[];
       /** Reserve this exact amount (nanodollars) when the cost is known up front. */
       estimatedCostNanos?: number;
+      estimatedTokens?: number;
       /** Hold the reservation up to this long (ms) for long async jobs. */
       reserveTtlMs?: number;
       rerunOf?: string;
-    }
+      idempotencyKey?: string;
+    },
   ): Promise<
-    | { allowed: true; requestId: string; warnings: string[]; notices: string[] }
-    | { allowed: false; code: string; reason: string }
+    | { allowed: true; requestId: string; reused?: boolean; warnings: string[]; notices: string[]; }
+    | { allowed: false; code: string; reason: string; }
   > {
-    const userId = await resolveUserId(ctx, opts.userId);
+    const { userId, legacyUserId } = await resolveUserAttribution(
+      ctx,
+      opts.userId,
+      this.identityKey,
+    );
     const actionName = await resolveActionName(ctx, opts.action);
     const started = await ctx.runMutation(this.component.lib.startRequest, {
       userId,
+      legacyUserId,
       actionName,
       tags: opts.tags,
       model: opts.model,
       messages: opts.messages ?? [],
       estimatedCostNanos: opts.estimatedCostNanos,
+      estimatedTokens: opts.estimatedTokens,
       reserveTtlMs: opts.reserveTtlMs,
+      idempotencyKey: opts.idempotencyKey,
       rerunOf: opts.rerunOf as any,
     });
     if (started.allowed) {
       await this.fireBudgetEvents(
         { userId, action: actionName, tags: opts.tags, requestId: started.requestId },
         started.warnings,
-        started.notices
+        started.notices,
       );
     } else {
       await this.fireLimitReached({
@@ -420,24 +478,38 @@ export class AIBudget {
       promptTokens?: number;
       completionTokens?: number;
       cachedTokens?: number;
+      cachedWriteTokens?: number;
+      cachedWrite1hTokens?: number;
       serverToolUses?: Record<string, number>;
       costNanos?: number;
       latencyMs?: number;
-    }
-  ): Promise<{ costNanos: number }> {
-    const { requestId, usage, promptTokens, completionTokens, cachedTokens, ...rest } = args;
-    const tokens =
-      promptTokens !== undefined ||
-      completionTokens !== undefined ||
-      cachedTokens !== undefined
-        ? {
-            promptTokens: promptTokens ?? 0,
-            completionTokens: completionTokens ?? 0,
-            cachedTokens: cachedTokens ?? 0,
-          }
-        : usage !== undefined
-          ? extractUsage(usage)
-          : {};
+    },
+  ): Promise<{ costNanos: number; }> {
+    const {
+      requestId,
+      usage,
+      promptTokens,
+      completionTokens,
+      cachedTokens,
+      cachedWriteTokens,
+      cachedWrite1hTokens,
+      ...rest
+    } = args;
+    const tokens = promptTokens !== undefined
+        || completionTokens !== undefined
+        || cachedTokens !== undefined
+        || cachedWriteTokens !== undefined
+        || cachedWrite1hTokens !== undefined
+      ? {
+        promptTokens: promptTokens ?? 0,
+        completionTokens: completionTokens ?? 0,
+        cachedTokens: cachedTokens ?? 0,
+        cachedWriteTokens: cachedWriteTokens ?? 0,
+        cachedWrite1hTokens: cachedWrite1hTokens ?? 0,
+      }
+      : usage !== undefined
+      ? extractUsage(usage)
+      : {};
     return ctx.runMutation(this.component.lib.finishRequest, {
       requestId: requestId as any,
       ...tokens,
@@ -468,16 +540,20 @@ export class AIBudget {
       rerunOf?: string;
       /** Reserve this exact amount (nanodollars) instead of the token estimate. */
       estimatedCostNanos?: number;
+      estimatedTokens?: number;
+      idempotencyKey?: string;
     },
-    run: () => Promise<{
+    run: (tracking: { requestId: string; idempotencyKey?: string; }) => Promise<{
       text?: string;
       usage?: any;
       promptTokens?: number;
       completionTokens?: number;
       cachedTokens?: number;
+      cachedWriteTokens?: number;
+      cachedWrite1hTokens?: number;
       serverToolUses?: Record<string, number>;
       costNanos?: number;
-    }>
+    }>,
   ): Promise<ChatResult> {
     const started = await this.begin(ctx, opts);
     if (!started.allowed) {
@@ -487,13 +563,16 @@ export class AIBudget {
         reason: started.reason,
       });
     }
+    if (started.reused) {
+      throw new ConvexError({ kind: "AIBudgetDuplicate", requestId: started.requestId });
+    }
     const { requestId, warnings, notices } = started;
     const start = Date.now();
     // Run the provider call. ONLY a failure of the call itself settles as an
     // error (no charge expected).
     let out: Awaited<ReturnType<typeof run>>;
     try {
-      out = await run();
+      out = await run({ requestId, idempotencyKey: opts.idempotencyKey });
     } catch (e) {
       await this.settle(ctx, { requestId, error: String(e), latencyMs: Date.now() - start });
       throw e;
@@ -509,21 +588,26 @@ export class AIBudget {
       promptTokens: out.promptTokens,
       completionTokens: out.completionTokens,
       cachedTokens: out.cachedTokens,
+      cachedWriteTokens: out.cachedWriteTokens,
+      cachedWrite1hTokens: out.cachedWrite1hTokens,
       serverToolUses: out.serverToolUses,
       costNanos: out.costNanos,
       latencyMs: Date.now() - start,
     });
     // Re-derive the recorded usage for the return value.
-    const usage =
-      out.promptTokens !== undefined ||
-      out.completionTokens !== undefined ||
-      out.cachedTokens !== undefined
-        ? {
-            promptTokens: out.promptTokens ?? 0,
-            completionTokens: out.completionTokens ?? 0,
-            cachedTokens: out.cachedTokens ?? 0,
-          }
-        : extractUsage(out.usage);
+    const usage = out.promptTokens !== undefined
+        || out.completionTokens !== undefined
+        || out.cachedTokens !== undefined
+        || out.cachedWriteTokens !== undefined
+        || out.cachedWrite1hTokens !== undefined
+      ? {
+        promptTokens: out.promptTokens ?? 0,
+        completionTokens: out.completionTokens ?? 0,
+        cachedTokens: out.cachedTokens ?? 0,
+        cachedWriteTokens: out.cachedWriteTokens ?? 0,
+        cachedWrite1hTokens: out.cachedWrite1hTokens ?? 0,
+      }
+      : extractUsage(out.usage);
     return { text: out.text ?? "", requestId, costNanos, warnings, notices, ...usage };
   }
 
@@ -539,21 +623,26 @@ export class AIBudget {
       prompt?: string;
       messages?: Message[];
       model?: string;
+      reservation?: StrictReservation;
+      idempotencyKey?: string;
       rerunOf?: string;
       /** Attribute spend to this action name. Defaults to the calling Convex action. */
       action?: string;
       /** Extra attribution dimensions to bill/limit (team, customer, env, …). */
       tags?: Tag[];
-    } = {}
+    } = {},
   ): Promise<ChatResult> {
+    if (args.reservation) validateReservation(args.reservation);
     const model = args.model ?? this.defaultModel;
-    const messages: Message[] =
-      args.messages ?? [{ role: "user", content: args.prompt ?? "" }];
+    const messages: Message[] = args.messages ?? [{ role: "user", content: args.prompt ?? "" }];
     return this.meter(
       ctx,
       {
         model,
         messages,
+        estimatedCostNanos: args.reservation?.costNanos,
+        estimatedTokens: args.reservation?.tokens,
+        idempotencyKey: args.idempotencyKey,
         userId: args.userId,
         action: args.action,
         tags: args.tags,
@@ -562,14 +651,14 @@ export class AIBudget {
       async () => {
         // The full chain (incl. system) is stored for audit/replay, but the AI
         // SDK wants system prompts in the `system` option, not messages.
-        const system =
-          messages
-            .filter((m) => m.role === "system")
-            .map((m) => m.content)
-            .join("\n\n") || undefined;
+        const system = messages
+          .filter((m) => m.role === "system")
+          .map((m) => m.content)
+          .join("\n\n") || undefined;
         const convo = messages.filter((m) => m.role !== "system");
         const result = await generateText({
           model: convexGateway(model),
+          ...(args.reservation ? { maxOutputTokens: args.reservation.maxOutputTokens } : {}),
           ...(system ? { system } : {}),
           messages: convo as any,
         });
@@ -578,7 +667,7 @@ export class AIBudget {
           usage: result.usage,
           costNanos: extractGatewayCostNanos(result),
         };
-      }
+      },
     );
   }
 
@@ -620,10 +709,11 @@ export class AIBudget {
       /** Reserve this exact amount (nanodollars) up front — the decision cost
        * isn't known before the call, so a hard cap is only exact with this. */
       estimatedCostNanos?: number;
+      estimatedTokens?: number;
       rerunOf?: string;
       /** Cancel the underlying request. */
       abortSignal?: AbortSignal;
-    }
+    },
   ): Promise<DecisionResult> {
     const model = args.model ?? this.defaultEvalModel;
     // `evaluate` is an experimental, version-gated export; import it lazily and
@@ -631,17 +721,17 @@ export class AIBudget {
     const evaluate = ((await import("ai")) as any).experimental_evaluate;
     if (typeof evaluate !== "function") {
       throw new Error(
-        "ai-budget: decisions() needs `experimental_evaluate` from the `ai` " +
-          "package (AI SDK 7's evaluation interface). Upgrade `ai` to a " +
-          "version that exports it."
+        "ai-budget: decisions() needs `experimental_evaluate` from the `ai` "
+          + "package (AI SDK 7's evaluation interface). Upgrade `ai` to a "
+          + "version that exports it.",
       );
     }
     // Likewise, `evaluationModel` exists on @convex-dev/ai-sdk-provider >= 0.2.1.
     const evaluationModel = (convexGateway as any).evaluationModel;
     if (typeof evaluationModel !== "function") {
       throw new Error(
-        "ai-budget: decisions() needs `convexGateway.evaluationModel` from " +
-          "@convex-dev/ai-sdk-provider >= 0.2.1. Upgrade the provider."
+        "ai-budget: decisions() needs `convexGateway.evaluationModel` from "
+          + "@convex-dev/ai-sdk-provider >= 0.2.1. Upgrade the provider.",
       );
     }
     let decision: any;
@@ -660,6 +750,7 @@ export class AIBudget {
         action: args.action,
         tags: args.tags,
         estimatedCostNanos: args.estimatedCostNanos,
+        estimatedTokens: args.estimatedTokens,
         rerunOf: args.rerunOf,
       },
       async () => {
@@ -673,7 +764,7 @@ export class AIBudget {
           usage: decision?.usage,
           costNanos: extractGatewayCostNanos(decision),
         };
-      }
+      },
     );
     const { text: _text, ...tracking } = result;
     return { ...tracking, answers: decision?.answers ?? {}, response: decision?.response };
@@ -690,25 +781,34 @@ export class AIBudget {
     opts: {
       userId?: string;
       model?: string;
+      reservation?: StrictReservation;
       action?: string;
       /** Extra attribution dimensions to bill/limit (team, customer, env, …). */
       tags?: Tag[];
-    } = {}
+    } = {},
   ): LanguageModel {
+    if (opts.reservation) validateReservation(opts.reservation);
     const modelId = opts.model ?? this.defaultModel;
     const component = this.component;
     const fireBudgetEvents = this.fireBudgetEvents.bind(this);
     const fireLimitReached = this.fireLimitReached.bind(this);
 
     const begin = async (params: any) => {
-      const userId = await resolveUserId(ctx, opts.userId);
+      const { userId, legacyUserId } = await resolveUserAttribution(
+        ctx,
+        opts.userId,
+        this.identityKey,
+      );
       const actionName = await resolveActionName(ctx, opts.action);
       const base = { userId, action: actionName, tags: opts.tags };
       const started = await ctx.runMutation(component.lib.startRequest, {
         userId,
+        legacyUserId,
         actionName,
         tags: opts.tags,
         model: modelId,
+        estimatedCostNanos: opts.reservation?.costNanos,
+        estimatedTokens: opts.reservation?.tokens,
         messages: simplifyPrompt(params.prompt),
       });
       if (!started.allowed) {
@@ -727,7 +827,7 @@ export class AIBudget {
       await fireBudgetEvents(
         { ...base, requestId: started.requestId },
         started.warnings,
-        started.notices
+        started.notices,
       );
       return started.requestId;
     };
@@ -739,14 +839,26 @@ export class AIBudget {
         promptTokens?: number;
         completionTokens?: number;
         cachedTokens?: number;
+        cachedWriteTokens?: number;
+        cachedWrite1hTokens?: number;
         costNanos?: number;
         latencyMs?: number;
-      }
+      },
     ) => ctx.runMutation(component.lib.finishRequest, { requestId, ...fields });
 
     return wrapLanguageModel({
       model: convexGateway(modelId) as any,
       middleware: {
+        transformParams: async ({ params }: any) =>
+          opts.reservation
+            ? {
+              ...params,
+              maxOutputTokens: Math.min(
+                params.maxOutputTokens ?? opts.reservation.maxOutputTokens,
+                opts.reservation.maxOutputTokens,
+              ),
+            }
+            : params,
         wrapGenerate: async ({ doGenerate, params }: any) => {
           const requestId = await begin(params);
           const start = Date.now();
@@ -779,61 +891,56 @@ export class AIBudget {
           let providerMetadata: any = undefined;
           try {
             const result = await doStream();
-            // finishRequest is idempotent (terminal-guarded server-side), so
-            // settling from multiple stream outcomes — normal close, an error
-            // chunk, or a cancel — is safe: the first wins, the rest no-op.
-            // Without this an errored or abandoned stream would never settle and
-            // its real usage would be lost (recorded as free by the reconciler).
-            // Settle at most once, memoizing the PROMISE so the finish chunk, an
-            // error chunk, and flush all await the same settlement instead of
-            // racing, dropping it (the old `void settle()`), or flipping a
-            // "settled" flag before the mutation actually committed. A stream
-            // that is cancelled/never fully consumed won't deliver finish or
-            // flush; the reconciler's reservation expiry is the backstop there.
-            let settlement: Promise<{ costNanos: number }> | undefined;
-            const settle = (error?: string) =>
-              (settlement ??= finish(requestId, {
-                responseText: text,
-                error,
-                ...extractUsage(usage),
-                costNanos: extractGatewayCostNanos({ providerMetadata }),
-                latencyMs: Date.now() - start,
-              }));
-            const tapped = result.stream.pipeThrough(
-              new TransformStream({
-                async transform(chunk: any, controller: any) {
+            // Own the reader lifecycle so cancellation and source errors settle
+            // in every supported runtime, without optional TransformStream hooks.
+            let settlement: Promise<{ costNanos: number; }> | undefined;
+            let streamError: string | undefined;
+            const settle = (error?: string) => (settlement ??= finish(requestId, {
+              responseText: text,
+              error: error ?? streamError,
+              ...extractUsage(usage),
+              costNanos: extractGatewayCostNanos({ providerMetadata }),
+              latencyMs: Date.now() - start,
+            }));
+            const reader = result.stream.getReader();
+            const tapped = new ReadableStream({
+              async pull(controller) {
+                try {
+                  const { done, value: chunk } = await reader.read();
+                  if (done) {
+                    await settle();
+                    controller.close();
+                    reader.releaseLock();
+                    return;
+                  }
                   if (chunk?.type === "text-delta") {
-                    text += chunk.delta ?? chunk.textDelta ?? "";
+                    text = capContent(text + (chunk.delta ?? chunk.textDelta ?? ""));
                   }
                   if (chunk?.type === "finish") {
                     usage = chunk.usage;
                     providerMetadata = chunk.providerMetadata ?? providerMetadata;
                   }
+                  if (chunk?.type === "error") streamError = String(chunk.error);
                   controller.enqueue(chunk);
-                  // Settle after forwarding the terminal error chunk, and AWAIT
-                  // it so a failed settle surfaces instead of being dropped.
-                  if (chunk?.type === "error") await settle(String(chunk.error));
-                },
-                async flush() {
-                  await settle();
-                },
-                // A cancelled/aborted stream (client disconnect, AbortSignal, or
-                // breaking out of `for await`) does NOT run `flush`. Without this
-                // the request would sit pending until the 30-min reservation
-                // expiry and be recorded as $0 though the provider charged for
-                // what streamed. Settle here with the text so far, estimating the
-                // completion tokens when the provider gave no usage.
-                // `cancel` is a newer Streams-spec transformer hook not yet in
-                // the TS DOM lib types; cast the literal so it compiles (runtimes
-                // without it simply won't call it, and the reconciler backstops).
-                async cancel(reason: any) {
-                  if (usage === undefined && text) {
-                    usage = { outputTokens: Math.ceil(text.length / 4) };
+                  if (chunk?.type === "finish") await settle();
+                } catch (error) {
+                  try {
+                    await settle(String(error));
+                  } catch (settlementError) {
+                    controller.error(settlementError);
+                    return;
                   }
+                  controller.error(error);
+                }
+              },
+              async cancel(reason) {
+                try {
+                  await reader.cancel(reason);
+                } finally {
                   await settle(`cancelled: ${String(reason)}`);
-                },
-              } as any)
-            );
+                }
+              },
+            });
             return { ...result, stream: tapped };
           } catch (e) {
             await finish(requestId, {
@@ -849,7 +956,7 @@ export class AIBudget {
 
   private async rerunImpl(
     ctx: RunMutationCtx,
-    args: { requestId: string; messages?: Message[]; model?: string }
+    args: { requestId: string; messages?: Message[]; model?: string; },
   ): Promise<ChatResult> {
     const original = await ctx.runQuery(this.component.lib.getRequest, {
       requestId: args.requestId as any,
@@ -863,6 +970,17 @@ export class AIBudget {
       action: original.actionName,
       tags: original.tags,
     });
+  }
+
+  private async adminMutation<M extends FunctionReference<"mutation", "internal">>(
+    ctx: RunMutationCtx,
+    mutation: M,
+    args: M["_args"],
+  ): Promise<M["_returnType"]> {
+    const identity = await ctx.auth?.getUserIdentity();
+    const actorId = identity?.tokenIdentifier
+      ?? (identity?.issuer && identity.subject ? `${identity.issuer}|${identity.subject}` : "host");
+    return ctx.runMutation(mutation, { ...args, actorId });
   }
 
   // ---------- namespaced admin API ----------
@@ -879,18 +997,20 @@ export class AIBudget {
           dimension?: string;
           value?: string;
           limit?: number;
-        } = {}
+        } = {},
       ) => ctx.runQuery(c.lib.listRequests, args),
       /** One request, including its stored prompt and response. */
-      get: (ctx: RunQueryCtx, args: { requestId: string }) =>
+      get: (ctx: RunQueryCtx, args: { requestId: string; }) =>
         ctx.runQuery(c.lib.getRequest, { requestId: args.requestId as any }),
+      billing: (ctx: RunQueryCtx, args: { requestId: string; }) =>
+        ctx.runQuery(c.lib.getBillingEvent, { requestId: args.requestId as any }),
       /** Ancestors up to the original, plus direct re-runs. */
-      lineage: (ctx: RunQueryCtx, args: { requestId: string }) =>
+      lineage: (ctx: RunQueryCtx, args: { requestId: string; }) =>
         ctx.runQuery(c.lib.lineage, { requestId: args.requestId as any }),
       /** Replay a stored request, optionally with edited messages/model. */
       rerun: (
         ctx: RunMutationCtx,
-        args: { requestId: string; messages?: Message[]; model?: string }
+        args: { requestId: string; messages?: Message[]; model?: string; },
       ) => this.rerunImpl(ctx, args),
     };
   }
@@ -906,25 +1026,30 @@ export class AIBudget {
    * Attribute a call to it by passing `tags` to `chat`/`languageModel`.
    */
   tag(dimension: string) {
-    return this.dimensionApi(dimension, (a: { value: string }) => a.value);
+    return this.dimensionApi(dimension, (a: { value: string; }) => a.value);
   }
 
   // Shared implementation behind tag()/users/actions. `key` maps the namespace's
   // id field (value/userId/name) to the bucket value.
   private dimensionApi<A extends Record<string, any>>(
     dimension: string,
-    key: (a: A) => string
+    key: (a: A) => string,
   ) {
     const c = this.component;
     return {
       /** All buckets in this dimension. */
       list: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.listBuckets, { dimension }),
+      paginate: (ctx: RunQueryCtx, args: { cursor?: string | null; limit?: number; } = {}) =>
+        ctx.runQuery(c.lib.paginateBuckets, {
+          dimension,
+          paginationOpts: { cursor: args.cursor ?? null, numItems: args.limit ?? 50 },
+        }),
       /** One bucket's limits + spend (null if it has none yet). */
       get: (ctx: RunQueryCtx, args: A) =>
         ctx.runQuery(c.lib.getBucket, { dimension, value: key(args) }),
       setLimits: (ctx: RunMutationCtx, args: A & BucketLimits) => {
         const { value, userId, name, ...limits } = args as any;
-        return ctx.runMutation(c.lib.setBucketLimits, {
+        return this.adminMutation(ctx, c.lib.setBucketLimits, {
           dimension,
           value: key(args),
           ...limits,
@@ -932,7 +1057,7 @@ export class AIBudget {
       },
       /** One-time "approve another $X" bump (daily/monthly reset with the window). */
       bump: (ctx: RunMutationCtx, args: A & BumpArgs) =>
-        ctx.runMutation(c.lib.bumpBucket, {
+        this.adminMutation(ctx, c.lib.bumpBucket, {
           dimension,
           value: key(args),
           dailyNanos: args.dailyNanos,
@@ -942,9 +1067,9 @@ export class AIBudget {
       /** Manually credit (negative) or debit (positive) this bucket. */
       adjust: (
         ctx: RunMutationCtx,
-        args: A & { deltaNanos: number; tokens?: number; reason?: string }
+        args: A & { deltaNanos: number; tokens?: number; reason?: string; },
       ) =>
-        ctx.runMutation(c.lib.adjustBucket, {
+        this.adminMutation(ctx, c.lib.adjustBucket, {
           dimension,
           value: key(args),
           deltaNanos: args.deltaNanos,
@@ -954,7 +1079,7 @@ export class AIBudget {
       /** Durable spend history for this bucket (per day or per month). */
       history: (
         ctx: RunQueryCtx,
-        args: A & { period?: "day" | "month"; limit?: number }
+        args: A & { period?: "day" | "month"; limit?: number; },
       ) =>
         ctx.runQuery(c.lib.usageHistory, {
           dimension,
@@ -963,26 +1088,40 @@ export class AIBudget {
           limit: args.limit,
         }),
       /** Manual-adjustment audit log for this bucket. */
-      adjustments: (ctx: RunQueryCtx, args: A & { limit?: number }) =>
+      adjustments: (ctx: RunQueryCtx, args: A & { limit?: number; }) =>
         ctx.runQuery(c.lib.listAdjustments, {
           dimension,
           value: key(args),
           limit: args.limit,
         }),
-      /** Delete the bucket (for "user", also its request rows). */
+      /**
+       * Delete this budget bucket: its limits, usage history, credits, and admin
+       * audit trail are removed (the audit trail of the deletion itself is kept).
+       *
+       * Erasure semantics differ by dimension:
+       * - **`user`**: also erases that user's request rows — prompts/responses are
+       *   purged and the rows tombstoned. This is the per-person data-erasure
+       *   primitive (e.g. for a GDPR/DSR request).
+       * - **any other dimension** (`action`, or a custom tag like `customer`):
+       *   this is **budget closure only**. Request content is NOT erased — those
+       *   requests are owned by a `userId` and shared across dimensions, so their
+       *   prompts/responses remain until normal content retention expires. To
+       *   erase a person's content, delete the `user` bucket. (Deleting an
+       *   `action`/tag does not mass-purge every user's shared content by design.)
+       */
       delete: (ctx: RunMutationCtx, args: A) =>
-        ctx.runMutation(c.lib.deleteBucket, { dimension, value: key(args) }),
+        this.adminMutation(ctx, c.lib.deleteBucket, { dimension, value: key(args) }),
     };
   }
 
   /** Per-user budgets and controls — sugar over the "user" dimension. */
   get users() {
-    return this.dimensionApi<{ userId: string }>("user", (a) => a.userId);
+    return this.dimensionApi<{ userId: string; }>("user", (a) => a.userId);
   }
 
   /** Per-action (per-feature) budgets — sugar over the "action" dimension. */
   get actions() {
-    return this.dimensionApi<{ name: string }>("action", (a) => a.name);
+    return this.dimensionApi<{ name: string; }>("action", (a) => a.name);
   }
 
   /** The deployment-wide budget, alerts, and retention config. */
@@ -991,10 +1130,15 @@ export class AIBudget {
     return {
       /** Limits + spend today/total. */
       status: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.getGlobalStatus, {}),
+      health: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.getHealth, {}),
+      audit: (ctx: RunQueryCtx, args: { cursor?: string | null; limit?: number; } = {}) =>
+        ctx.runQuery(c.lib.paginateAdminEvents, {
+          paginationOpts: { cursor: args.cursor ?? null, numItems: args.limit ?? 50 },
+        }),
       /**
        * A killswitch spend cap across all users/actions. Enforced
-       * **approximately** (bounded overshoot, no per-request reservation) — for
-       * an exact ceiling use a per-bucket cap. Pass `null` to clear a field.
+       * **approximately** (no monetary overshoot bound without workload limits) — for
+       * atomic admission use a per-bucket cap with conservative bounds. Pass `null` to clear a field.
        */
       setLimits: (
         ctx: RunMutationCtx,
@@ -1002,18 +1146,18 @@ export class AIBudget {
           dailySpendLimitNanos?: number | null;
           lifetimeSpendLimitNanos?: number | null;
           enforcement?: "approximate" | "soft" | null;
-        }
-      ) => ctx.runMutation(c.lib.setGlobalLimits, args),
+        },
+      ) => this.adminMutation(ctx, c.lib.setGlobalLimits, args),
       bump: (
         ctx: RunMutationCtx,
-        args: { dailyNanos?: number; lifetimeNanos?: number }
-      ) => ctx.runMutation(c.lib.bumpGlobal, args),
+        args: { dailyNanos?: number; lifetimeNanos?: number; },
+      ) => this.adminMutation(ctx, c.lib.bumpGlobal, args),
       /** Default approaching-limit alert threshold (fraction of a cap, e.g. 0.8). */
-      setAlertDefaults: (ctx: RunMutationCtx, args: { warnAtPct?: number }) =>
-        ctx.runMutation(c.lib.setAlertDefaults, args),
+      setAlertDefaults: (ctx: RunMutationCtx, args: { warnAtPct?: number | null; }) =>
+        this.adminMutation(ctx, c.lib.setAlertDefaults, args),
       /** Request-row retention window in ms (default 1h; 0 disables). */
-      setRetention: (ctx: RunMutationCtx, args: { retentionMs: number }) =>
-        ctx.runMutation(c.lib.setRetention, args),
+      setRetention: (ctx: RunMutationCtx, args: { retentionMs: number; }) =>
+        this.adminMutation(ctx, c.lib.setRetention, args),
       /**
        * Deployment-wide data/pricing policy (only the fields you pass change):
        * - `allowUnpricedModels: false` rejects models with no configured price
@@ -1023,8 +1167,13 @@ export class AIBudget {
        */
       setPolicy: (
         ctx: RunMutationCtx,
-        args: { allowUnpricedModels?: boolean; storeContent?: boolean }
-      ) => ctx.runMutation(c.lib.setDeploymentPolicy, args),
+        args: {
+          allowUnpricedModels?: boolean;
+          storeContent?: boolean;
+          storeRawErrors?: boolean;
+          requireExplicitReservations?: boolean;
+        },
+      ) => this.adminMutation(ctx, c.lib.setDeploymentPolicy, args),
     };
   }
 
@@ -1036,8 +1185,8 @@ export class AIBudget {
       /** mode: "open" | "allowlist" (only these) | "denylist" (all but these). */
       setPolicy: (
         ctx: RunMutationCtx,
-        args: { mode: "open" | "allowlist" | "denylist"; models: string[] }
-      ) => ctx.runMutation(c.lib.setModelPolicy, args),
+        args: { mode: "open" | "allowlist" | "denylist"; models: string[]; },
+      ) => this.adminMutation(ctx, c.lib.setModelPolicy, args),
     };
   }
 
@@ -1054,16 +1203,17 @@ export class AIBudget {
           outputNanosPerMTok: number;
           /** Cache-read rate; defaults to a discount off input if omitted. */
           cachedNanosPerMTok?: number;
-        }
-      ) => ctx.runMutation(c.lib.setPrice, args),
+          cacheWriteNanosPerMTok?: number;
+          cacheWrite1hNanosPerMTok?: number;
+        },
+      ) => this.adminMutation(ctx, c.lib.setPrice, args),
       /** Per-call fees for provider server tools (web search, etc.). */
-      listServerTools: (ctx: RunQueryCtx) =>
-        ctx.runQuery(c.lib.listServerToolPrices, {}),
+      listServerTools: (ctx: RunQueryCtx) => ctx.runQuery(c.lib.listServerToolPrices, {}),
       /** Set a server-tool's per-call price, e.g. { tool: "web_search", nanosPerCall }. */
       setServerTool: (
         ctx: RunMutationCtx,
-        args: { tool: string; nanosPerCall: number }
-      ) => ctx.runMutation(c.lib.setServerToolPrice, args),
+        args: { tool: string; nanosPerCall: number; },
+      ) => this.adminMutation(ctx, c.lib.setServerToolPrice, args),
     };
   }
 
@@ -1094,7 +1244,7 @@ export class AIBudget {
       path?: string;
       /** Return true to allow the request. Runs on the HTML page and every API call. */
       authorize?: (ctx: any, request: Request) => boolean | Promise<boolean>;
-    } = {}
+    } = {},
   ) {
     const prefix = (opts.path ?? "/aibudget").replace(/\/+$/, "");
     const c = this.component.lib;
@@ -1102,8 +1252,8 @@ export class AIBudget {
 
     const guard = async (
       ctx: any,
-      request: Request
-    ): Promise<{ ok: boolean; token: string }> => {
+      request: Request,
+    ): Promise<{ ok: boolean; token: string; }> => {
       if (authorize) return { ok: await authorize(ctx, request), token: "" };
       const token = (globalThis as any).process?.env?.AI_BUDGET_DASHBOARD_TOKEN;
       if (!token) return { ok: false, token: "" };
@@ -1130,8 +1280,10 @@ export class AIBudget {
     // would close the inline <script> and break out. Escape `<` (and the JS line
     // separators) before embedding in HTML.
     const jsonForScript = (x: unknown) =>
-      JSON.stringify(x).replace(/[<\u2028\u2029]/g, (ch) =>
-        "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+      JSON.stringify(x).replace(
+        /[<\u2028\u2029]/g,
+        (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"),
+      );
 
     const handle = async (ctx: any, request: Request): Promise<Response> => {
       const url = new URL(request.url);
@@ -1140,36 +1292,53 @@ export class AIBudget {
       if (!ok) {
         return new Response(
           "Unauthorized. Pass `authorize` to registerRoutes or set AI_BUDGET_DASHBOARD_TOKEN.",
-          { status: 401 }
+          { status: 401 },
         );
       }
 
+      if (request.method === "POST" && authorize) {
+        const origin = request.headers.get("origin");
+        if (origin !== url.origin) return json({ error: "same-origin request required" }, 403);
+        if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+          return json({ error: "application/json required" }, 415);
+        }
+      }
       if (sub.startsWith("/api/")) {
         const route = request.method + " " + sub.slice(4); // strip "/api"
         const p: Record<string, string> = {};
         url.searchParams.forEach((v, k) => {
           p[k] = v;
         });
-        const body =
-          request.method === "POST"
-            ? await request.json().catch(() => ({}))
-            : {};
+        const body = request.method === "POST"
+          ? await request.json().catch(() => ({}))
+          : {};
+        if (request.method === "POST") {
+          if (!body || typeof body !== "object" || Array.isArray(body)) {
+            return json({ error: "JSON object required" }, 400);
+          }
+          const identity = await ctx.auth?.getUserIdentity();
+          body.actorId = identity?.tokenIdentifier ?? "dashboard";
+        }
         switch (route) {
           case "GET /buckets":
             return json(await ctx.runQuery(c.listBuckets, { dimension: p.dimension || undefined }));
           case "GET /requests":
-            return json(await ctx.runQuery(c.listRequests, {
-              userId: p.userId || undefined,
-              dimension: p.dimension || undefined,
-              value: p.value || undefined,
-              limit: 100,
-            }));
+            return json(
+              await ctx.runQuery(c.listRequests, {
+                userId: p.userId || undefined,
+                dimension: p.dimension || undefined,
+                value: p.value || undefined,
+                limit: 100,
+              }),
+            );
           case "GET /usage":
-            return json(await ctx.runQuery(c.usageHistory, {
-              dimension: p.dimension,
-              value: p.value,
-              period: p.period === "month" ? "month" : "day",
-            }));
+            return json(
+              await ctx.runQuery(c.usageHistory, {
+                dimension: p.dimension,
+                value: p.value,
+                period: p.period === "month" ? "month" : "day",
+              }),
+            );
           case "GET /global":
             return json(await ctx.runQuery(c.getGlobalStatus, {}));
           case "GET /prices":
@@ -1200,13 +1369,16 @@ export class AIBudget {
       // `<` so a token containing `</script>` can't break out of the inline JS).
       const html = DASHBOARD_HTML.replace(
         /__API_BASE__/g,
-        () => jsonForScript(`${prefix}/api`)
+        () => jsonForScript(`${prefix}/api`),
       ).replace(/__TOKEN__/g, () => jsonForScript(token));
       // The page embeds the bearer token — never let a shared cache retain it.
       return new Response(html, {
         headers: {
           "content-type": "text/html; charset=utf-8",
           "cache-control": "no-store",
+          "referrer-policy": "no-referrer",
+          "x-content-type-options": "nosniff",
+          "content-security-policy": "frame-ancestors 'none'; base-uri 'none'",
         },
       });
     };
@@ -1240,21 +1412,23 @@ export class AIBudget {
       resolve: (
         ctx: any,
         request: Request,
-        body: any
+        body: any,
       ) => Promise<
-        | ({ requestId: string } & {
-            responseText?: string;
-            error?: string;
-            usage?: any;
-            promptTokens?: number;
-            completionTokens?: number;
-            cachedTokens?: number;
-            serverToolUses?: Record<string, number>;
-            costNanos?: number;
-          })
+        | ({ requestId: string; } & {
+          responseText?: string;
+          error?: string;
+          usage?: any;
+          promptTokens?: number;
+          completionTokens?: number;
+          cachedTokens?: number;
+          cachedWriteTokens?: number;
+          cachedWrite1hTokens?: number;
+          serverToolUses?: Record<string, number>;
+          costNanos?: number;
+        })
         | null
       >;
-    }
+    },
   ) {
     const path = opts.path ?? "/aibudget/webhook";
     const self = this;

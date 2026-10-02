@@ -233,9 +233,7 @@ await ai.meter(ctx, { userId, model: "anthropic/claude-…", messages }, async (
   });
   return {
     text: extractText(res),
-    promptTokens: res.usage.input_tokens,
-    completionTokens: res.usage.output_tokens,
-    cachedTokens: res.usage.cache_read_input_tokens ?? 0,
+    usage: res.usage, // includes fresh input, cache reads, and cache writes
     serverToolUses: { web_search: res.usage.server_tool_use?.web_search_requests ?? 0 },
     // costNanos? — pass an authoritative total to skip token/tool pricing
   };
@@ -388,7 +386,7 @@ different dimensions. Each exposes:
 | `adjust(ctx, { …, deltaNanos, reason? })` | manual credit / debit |
 | `history(ctx, { …, period })` | durable day/month spend history |
 | `adjustments(ctx, { … })` | the manual-adjustment audit log |
-| `delete(ctx, { … })` | remove the bucket (and, for `user`, its request rows) |
+| `delete(ctx, { … })` | remove the bucket — **`user`** also erases that user's request content (the erasure primitive); other dimensions are **budget closure only** (shared request content is kept, see [Security](#security-before-you-ship)) |
 
 The identifier field is `userId` for `ai.users`, `name` for `ai.actions`, and
 `value` for `ai.tag(d)`. For example: `ai.tag("customer").setLimits(ctx, { value: "acme", … })`.
@@ -545,15 +543,16 @@ ai.requests.get(ctx, { requestId })                               // one request
 ai.global.setLimits(ctx, { dailySpendLimitNanos?, lifetimeSpendLimitNanos?, enforcement? })
 ai.global.status(ctx)   // { dailySpendLimitNanos, lifetimeSpendLimitNanos, enforcement, spentTodayNanos, spentTotalNanos, … }
 ai.global.bump(ctx, { dailyNanos?, lifetimeNanos? })
-ai.global.setPolicy(ctx, { allowUnpricedModels?, storeContent? })  // deployment data/pricing policy
+ai.global.setPolicy(ctx, { allowUnpricedModels?, storeContent?, storeRawErrors?, requireExplicitReservations? })  // deployment data/pricing policy
 ```
 
 A best-effort killswitch across everything. Backed by a sharded counter for
 throughput, so it's enforced **approximately** — under burst it can overshoot the
-cap by a bounded amount, and it excludes in-flight (not-yet-settled) spend. It is
-**not** a to-the-dollar ceiling: for an exact limit use a per-bucket cap (those
-reserve atomically); reach for the global cap when you want a deployment-wide
-"stop everything" switch.
+cap while it excludes in-flight spend and waits for reconciliation. There is no
+finite monetary overshoot bound without limits on traffic, duration, and per-call
+cost. Use a per-bucket cap for atomic admission against reservations; a true
+spending ceiling additionally requires conservative provider cost bounds and
+provider-enforced generation or job limits.
 
 ### Model policy
 
@@ -723,8 +722,10 @@ off shared hot rows:
   other attributed bucket — the shared `action`/tag rows — gets only an
   append-only delta, which the reconciler drains into totals + history as a single
   writer. So a hot single-dimension settle rate no longer serializes on one row.
-  The trade: uncapped totals and spend history are eventually-consistent (≤ one
-  reconcile interval); live enforcement is not affected.
+  The trade: uncapped totals and spend history are eventually consistent. A healthy reconciler normally catches up on its next
+  interval, but backlog and failures can extend that lag. Capped buckets retain
+  their reservations until the final charge folds; enabling enforcement pauses
+  admission until existing spend and in-flight work have been reconciled.
 
 The `error.md` file documents the adversarial audits this design survived, with
 live repros.
@@ -740,19 +741,28 @@ demo frictionless (a persona dropdown, public admin functions); do not copy its
 endpoints verbatim. In production:
 
 1. **Let `userId` default to the authenticated caller** (the built-in behavior —
-   `ai.chat(ctx, { prompt })` uses `ctx.auth.getUserIdentity()`). Only pass an
+   `ai.chat(ctx, { prompt })` uses the caller’s globally unique `tokenIdentifier`). Only pass an
    explicit `userId` from a trusted server context; never forward a client-supplied
    id, or a caller can spend under someone else's budget or dodge their own limits
    by rotating ids.
 2. **Gate every admin call** — `setLimits`, `bump`, `adjust`, `setModelPolicy`,
    `setPrice`, `delete` — behind an admin check. A limit-management surface must
    not be operable by the party being limited.
-3. **Scope reads and replay to the owner.** `requests.list` / `requests.get` /
-   `lineage` return full prompts, responses, and spend, and `rerun` re-runs a
+3. **Scope reads and replay to the owner.** `requests.list` returns metadata; `requests.get` and
+   `lineage` can return prompts, responses, and spend, and `rerun` re-runs a
    request billed to its **original** user. An unchecked client `requestId` is an
    IDOR — verify `request.userId === caller`, or treat those as admin-only.
 4. **Gate the dashboard.** `registerRoutes` is a public endpoint; always pass a
    real `authorize` (or a token). See [Admin dashboard](#admin-dashboard).
+5. **Know what `delete` erases.** Deleting a **`user`** bucket erases that user's
+   request content (prompts/responses) — it's the per-person erasure primitive for
+   a DSR. Deleting any **other** dimension (`action`, a `customer` tag, …) is
+   **budget closure only**: it removes that bucket's limits/usage/credits but
+   leaves the underlying request content, which belongs to a `userId` and is
+   shared across dimensions, until normal [retention](#retention) expires. For a
+   person's right-to-erasure, delete the **user**, or shorten `retentionMs`.
+   Admin audit events survive deletion (accountability), including a record of the
+   deletion itself.
 
 ### Enforce it with ESLint · `no-ungoverned-ai`
 
@@ -843,12 +853,114 @@ handles rather than taking a dependency on either sibling component.
 
 ## Accounting upgrade notes
 
-New request fields are optional for existing deployments. Policy documents are
-created on first admission or limit update; pending requests without deadlines
-are migrated in batches by reconciliation. Existing reservations without ownership
-metadata use their creation period and current capped buckets as a compatibility
-fallback. Exact historical hold ownership cannot be reconstructed if those caps
-changed before the upgrade. New requests always store explicit ownership.
+Existing tables gain only optional fields. New tables hold durable billing
+records, admin audit events, admission keys, and deletion markers. Older settled
+traffic is not backfilled into the billing ledger; existing aggregates remain.
+Old reservations without ownership metadata retain the compatibility fallback;
+exact historical hold ownership cannot be reconstructed if policies changed
+before the upgrade.
+
+**Identity migration:** automatic attribution uses issuer-scoped `tokenIdentifier`.
+Admission checks the caller's old `subject` key atomically: if a legacy user bucket
+or deletion marker exists, it returns `identity_migration_required` before creating
+any new bucket. Upgrades therefore cannot silently reset an existing budget or
+bypass a deleted user. Existing applications with subject-keyed budgets and one
+trusted issuer can preserve their keys with
+`new AIBudget(component, { identityKey: "subject" })`, or continue passing trusted
+app-owned user IDs explicitly. For multiple issuers, pause admission, drain pending
+work and deltas, migrate policies, balances, history, and attribution to stable
+issuer-scoped keys, and verify the resulting limits before resuming. The component
+does not automatically merge identity records. The guard remains active while old
+subject buckets or deletion markers exist; remove them only as part of a verified
+migration. Never combine equal subjects from distinct issuers.
+
+**Policy transitions:** enabling spend/token/concurrency enforcement on a used
+uncapped bucket temporarily returns `bucket_reconciling`. Bounded reconciliation
+drains prior deltas and adopts existing in-flight holds before admission resumes.
+The cron retries interrupted transitions and deletion work. Existing requests use
+the price and tool-price snapshot taken at admission; legacy requests without a
+snapshot continue to use the settlement-time price.
+
+**Deletion:** `users.delete` blocks new admission, erases that user’s prompt logs,
+user-bucket history, adjustments, and target-keyed admin records in bounded
+batches. Pending or expired requests become sanitized billing tombstones so late
+charges still reach shared buckets and the deployment total exactly once. A
+minimal deletion marker retains the bucket key to prevent accidental recreation;
+explicit admin `setLimits` can create a new bucket generation after deletion
+finishes. Shared tag/action history, opaque billing events, and operator identities
+in unrelated audit events remain. This is a documented retention policy, not a
+claim of complete legal erasure. Your app must separately erase identifying
+custom tags or operator records when required. Tombstones retain the existing
+seven-day late-settlement horizon measured from expiry or privacy erasure; final usage after that horizon cannot be
+recovered from a deleted request.
+
+**Numeric limits:** accounting writes reject nonfinite values and unsafe integer
+arithmetic instead of silently losing precision. If a bucket approaches
+`Number.MAX_SAFE_INTEGER` nanodollars (about $9 million), migrate its accounting
+to a larger representation before continuing. A failed fold keeps its request
+available for recovery; monitor reconciliation health. Deployment-wide sharded
+counters remain numeric approximate reporting counters.
+
+### Explicit reservations and provider limits
+
+Reject heuristic reservations deployment-wide when your app can supply
+conservative bounds:
+
+```ts
+await ai.global.setPolicy(ctx, { requireExplicitReservations: true });
+const result = await ai.chat(ctx, {
+  prompt,
+  reservation: { costNanos: 50_000_000, tokens: 4000, maxOutputTokens: 1000 },
+});
+```
+
+`chat` and `languageModel` reserve the provided spend/token amounts and enforce
+`maxOutputTokens` through the provider SDK. The app must include input, output,
+reasoning, multimodal and tool charges in those bounds; the component cannot
+prove that an arbitrary provider will honor a dollar ceiling. For non-text or
+async jobs, pass `estimatedCostNanos` and `estimatedTokens` to `meter`/`begin` and
+configure the provider’s own job limits. An underestimated final charge is still
+recorded in full.
+
+### Retries, operational visibility, and clearing limits
+
+Pass a stable `idempotencyKey` to `begin` or `meter`. Repeated `begin` calls with
+the same user/key and arguments reuse the request and return `reused: true`;
+changed arguments are rejected. The `meter` callback receives
+`{ requestId, idempotencyKey }`; forward the key to providers that support it.
+`meter` throws `AIBudgetDuplicate` on reused admission instead of repeating the
+provider call. After an ambiguous provider failure, use its job lookup and
+`settle` to record the actual result. Keys remain reserved after request retention;
+a reused key whose request was removed returns `idempotency_expired`. The host
+owns key lifecycle and provider-side deduplication; this is not an exactly-once
+external execution guarantee.
+
+- `ai.users.paginate`, `ai.actions.paginate`, and `ai.tag(d).paginate` accept
+  `{ cursor, limit }` and return `{ page, continueCursor, isDone }`. Legacy `list`
+  APIs remain bounded previews; they are not complete inventories.
+- `ai.global.health(ctx)` reports sampled fold/delta backlog, whether counts are
+  truncated, and the last global-cap check. Reporting window stamps update
+  reactively on the minute cron, including for otherwise idle buckets.
+- `ai.requests.billing(ctx, { requestId })` reads the durable billing event even
+  after its prompt log is retained then removed. `costSource` distinguishes
+  authoritative charges, token estimates, and reservation estimates. New events
+  are inserted atomically with folding and contain no prompt text or user keys.
+- `ai.global.audit(ctx, { cursor, limit })` pages admin changes. Client wrappers
+  derive actors from authentication; trusted host calls without identity record
+  `host`, and shared dashboard-token calls record `dashboard`. Gate this API as
+  an admin read. Direct component calls trust the host-provided actor.
+- Omit a bucket/global limit to leave it unchanged; pass `null` to clear it.
+  The dashboard sends `null` for empty controls and rejects invalid numbers.
+- Raw Anthropic usage includes cache reads and cache writes in prompt totals.
+  Configure `cacheWriteNanosPerMTok` and `cacheWrite1hNanosPerMTok` for exact
+  fallback pricing; defaults are 1.25× and 2× input respectively. Authoritative
+  provider cost always takes precedence.
+- More than sixteen unique extra attribution tags is rejected, never silently
+  truncated. Storage limits count UTF-8 bytes.
+- Cookie-authorized dashboard mutations require same-origin JSON requests;
+  bearer-token mode remains available for server automation. The HTML response
+  disables referrers and framing. Streaming completion, cancellation, and source
+  errors all attempt settlement; absent authoritative usage remains estimated.
 
 ## Stability (v1)
 
@@ -856,7 +968,8 @@ changed before the upgrade. New requests always store explicit ownership.
 `ai.chat`, `ai.meter`, `ai.decisions`, `ai.languageModel`, and the admin
 namespaces `ai.users` / `ai.actions` / `ai.tag` / `ai.global` / `ai.models` /
 `ai.prices` / `ai.requests`, plus `ai.registerRoutes`. The stored schema is frozen;
-new fields will only be added as optional. `ai.decisions` is backed by the
+new fields on existing tables will only be added as optional. The identity
+default change below requires an explicit migration decision for existing apps. `ai.decisions` is backed by the
 gateway's generally-available Decisions (Jev) endpoint; the only moving part is the
 AI SDK's `experimental_evaluate` export it calls, so pin your `ai` version.
 
@@ -866,7 +979,7 @@ gateway features that are still alpha.
 
 **Semantics worth knowing:**
 - **Spend caps** admit on an *estimate*, so a token-priced cap can be exceeded by
-  one request's estimate-vs-actual delta; pass `estimatedCostNanos` for an exact
+  the aggregate estimate-versus-actual delta of admitted requests; pass `estimatedCostNanos` for an exact
   reservation. The **global cap** is a best-effort killswitch (`enforcement:
   "approximate"` | `"soft"`), not a to-the-dollar ceiling.
 - **Credits** (`ai.tag(d).adjust` / negative `deltaNanos`) accrue in a separate
@@ -875,7 +988,9 @@ gateway features that are still alpha.
 - **Deployment policy** (`ai.global.setPolicy`): `allowUnpricedModels: false`
   rejects models with no configured price under hard enforcement (default charges
   the conservative fallback); `storeContent: false` persists metadata but no
-  prompt/response content (for teams that want zero prompt retention).
+  prompt/response content and sanitizes provider errors. Raw provider errors are sanitized by default; retaining them requires
+  explicit `storeRawErrors: true` together with content storage. Changing these policies
+  applies to subsequent writes; it does not erase all pre-existing records.
 
 ## Development
 

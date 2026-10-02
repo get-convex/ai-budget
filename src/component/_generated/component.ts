@@ -28,6 +28,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          actorId?: string;
           deltaNanos: number;
           dimension: string;
           reason?: string;
@@ -41,6 +42,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          actorId?: string;
           dailyNanos?: number;
           dimension: string;
           lifetimeNanos?: number;
@@ -53,14 +55,19 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       bumpGlobal: FunctionReference<
         "mutation",
         "internal",
-        { dailyNanos?: number; lifetimeNanos?: number; monthlyNanos?: number },
+        {
+          actorId?: string;
+          dailyNanos?: number;
+          lifetimeNanos?: number;
+          monthlyNanos?: number;
+        },
         null,
         Name
       >;
       deleteBucket: FunctionReference<
         "mutation",
         "internal",
-        { dimension: string; value: string },
+        { actorId?: string; dimension: string; value: string },
         { deletedThisBatch: number; done: boolean },
         Name
       >;
@@ -69,6 +76,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         {
           cachedTokens?: number;
+          cachedWrite1hTokens?: number;
+          cachedWriteTokens?: number;
           completionTokens?: number;
           costNanos?: number;
           error?: string;
@@ -79,6 +88,23 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           serverToolUses?: Record<string, number>;
         },
         { costNanos: number },
+        Name
+      >;
+      getBillingEvent: FunctionReference<
+        "query",
+        "internal",
+        { requestId: string },
+        {
+          _creationTime: number;
+          _id: string;
+          bucketIds: Array<string>;
+          costNanos: number;
+          costSource?:
+            "authoritative" | "token_estimate" | "reservation_estimate";
+          finishedAt: number;
+          requestId: string;
+          tokens: number;
+        } | null,
         Name
       >;
       getBucket: FunctionReference<
@@ -100,6 +126,20 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           retentionMs: number | null;
           spentTodayNanos: number;
           spentTotalNanos: number;
+        },
+        Name
+      >;
+      getHealth: FunctionReference<
+        "query",
+        "internal",
+        {},
+        {
+          countsTruncated: boolean;
+          globalCheckedAt: number | null;
+          oldestDeltaAt: number | null;
+          oldestUnfoldedAt: number | null;
+          pendingDeltas: number;
+          pendingFolds: number;
         },
         Name
       >;
@@ -153,10 +193,99 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         any,
         Name
       >;
+      paginateAdminEvents: FunctionReference<
+        "query",
+        "internal",
+        {
+          paginationOpts: {
+            cursor: string | null;
+            endCursor?: string | null;
+            id?: number;
+            maximumBytesRead?: number;
+            maximumRowsRead?: number;
+            numItems: number;
+          };
+        },
+        {
+          continueCursor: string;
+          isDone: boolean;
+          page: Array<{
+            _creationTime: number;
+            _id: string;
+            actorId: string;
+            detailsJson: string;
+            dimension?: string;
+            operation: string;
+            value?: string;
+          }>;
+        },
+        Name
+      >;
+      paginateBuckets: FunctionReference<
+        "query",
+        "internal",
+        {
+          dimension?: string;
+          paginationOpts: {
+            cursor: string | null;
+            endCursor?: string | null;
+            id?: number;
+            maximumBytesRead?: number;
+            maximumRowsRead?: number;
+            numItems: number;
+          };
+        },
+        {
+          continueCursor: string;
+          isDone: boolean;
+          page: Array<{
+            _creationTime: number;
+            _id: string;
+            blocked?: boolean;
+            bumpDayStamp?: string;
+            bumpMonthStamp?: string;
+            creditsNanos?: number;
+            creditsThisMonthNanos?: number;
+            creditsTodayNanos?: number;
+            dailyBumpNanos?: number;
+            dailySpendLimitNanos?: number;
+            dailyTokenLimit?: number;
+            dayStamp: string;
+            dimension: string;
+            enforcement?: "hard" | "soft";
+            lifetimeBumpNanos?: number;
+            lifetimeSpendLimitNanos?: number;
+            lifetimeTokenLimit?: number;
+            maxConcurrent?: number;
+            monthStamp?: string;
+            monthlyBumpNanos?: number;
+            monthlySpendLimitNanos?: number;
+            monthlyTokenLimit?: number;
+            pendingCount?: number;
+            requestsPerMinute?: number;
+            reservedMonthNanos?: number;
+            reservedMonthTokens?: number;
+            reservedTodayNanos?: number;
+            reservedTodayTokens?: number;
+            reservedTotalNanos?: number;
+            reservedTotalTokens?: number;
+            spendThisMonthNanos?: number;
+            spendTodayNanos: number;
+            tokensThisMonth?: number;
+            tokensToday?: number;
+            totalRequests: number;
+            totalSpendNanos: number;
+            totalTokens: number;
+            value: string;
+            warnAtPct?: number;
+          }>;
+        },
+        Name
+      >;
       setAlertDefaults: FunctionReference<
         "mutation",
         "internal",
-        { warnAtPct?: number },
+        { actorId?: string; warnAtPct?: number | null },
         null,
         Name
       >;
@@ -164,19 +293,20 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
-          blocked?: boolean;
-          dailySpendLimitNanos?: number;
-          dailyTokenLimit?: number;
+          actorId?: string;
+          blocked?: boolean | null;
+          dailySpendLimitNanos?: number | null;
+          dailyTokenLimit?: number | null;
           dimension: string;
-          enforcement?: "hard" | "soft";
-          lifetimeSpendLimitNanos?: number;
-          lifetimeTokenLimit?: number;
-          maxConcurrent?: number;
-          monthlySpendLimitNanos?: number;
-          monthlyTokenLimit?: number;
-          requestsPerMinute?: number;
+          enforcement?: "hard" | "soft" | null;
+          lifetimeSpendLimitNanos?: number | null;
+          lifetimeTokenLimit?: number | null;
+          maxConcurrent?: number | null;
+          monthlySpendLimitNanos?: number | null;
+          monthlyTokenLimit?: number | null;
+          requestsPerMinute?: number | null;
           value: string;
-          warnAtPct?: number;
+          warnAtPct?: number | null;
         },
         null,
         Name
@@ -184,7 +314,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       setDeploymentPolicy: FunctionReference<
         "mutation",
         "internal",
-        { allowUnpricedModels?: boolean; storeContent?: boolean },
+        {
+          actorId?: string;
+          allowUnpricedModels?: boolean;
+          requireExplicitReservations?: boolean;
+          storeContent?: boolean;
+          storeRawErrors?: boolean;
+        },
         null,
         Name
       >;
@@ -192,6 +328,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          actorId?: string;
           dailySpendLimitNanos?: number | null;
           enforcement?: "approximate" | "soft" | null;
           lifetimeSpendLimitNanos?: number | null;
@@ -202,7 +339,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       setModelPolicy: FunctionReference<
         "mutation",
         "internal",
-        { mode: "open" | "allowlist" | "denylist"; models: Array<string> },
+        {
+          actorId?: string;
+          mode: "open" | "allowlist" | "denylist";
+          models: Array<string>;
+        },
         null,
         Name
       >;
@@ -210,6 +351,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          actorId?: string;
+          cacheWrite1hNanosPerMTok?: number;
+          cacheWriteNanosPerMTok?: number;
           cachedNanosPerMTok?: number;
           inputNanosPerMTok: number;
           model: string;
@@ -221,14 +365,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       setRetention: FunctionReference<
         "mutation",
         "internal",
-        { retentionMs: number },
+        { actorId?: string; retentionMs: number },
         null,
         Name
       >;
       setServerToolPrice: FunctionReference<
         "mutation",
         "internal",
-        { nanosPerCall: number; tool: string },
+        { actorId?: string; nanosPerCall: number; tool: string },
         null,
         Name
       >;
@@ -238,6 +382,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           actionName?: string;
           estimatedCostNanos?: number;
+          estimatedTokens?: number;
+          idempotencyKey?: string;
+          legacyUserId?: string;
           messages: Array<{ content: string; role: string }>;
           model: string;
           rerunOf?: string;
@@ -249,6 +396,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             allowed: true;
             notices: Array<string>;
             requestId: string;
+            reused?: boolean;
             warnings: Array<string>;
           }
         | { allowed: false; code: string; reason: string },

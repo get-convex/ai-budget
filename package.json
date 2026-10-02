@@ -24,7 +24,7 @@
     "build": "tsc --project ./tsconfig.build.json",
     "build:codegen": "convex codegen --component-dir ./src/component && npm run build",
     "build:clean": "rm -rf dist *.tsbuildinfo && npm run build:codegen",
-    "typecheck": "tsc --noEmit --project ./tsconfig.build.json && tsc --noEmit -p example",
+    "typecheck": "tsc --noEmit --project ./tsconfig.build.json && tsc --noEmit -p example && tsc --noEmit -p example/convex",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepack": "npm run build",
@@ -60,8 +60,9 @@
   "types": "./dist/client/index.d.ts",
   "module": "./dist/client/index.js",
   "dependencies": {
+    "@convex-dev/rate-limiter": "0.4.0",
     "@convex-dev/sharded-counter": "^0.2.1",
-    "@convex-dev/rate-limiter": "0.4.0"
+    "convex-helpers": "^0.1.124"
   },
   "peerDependencies": {
     "@convex-dev/ai-sdk-provider": ">=0.2.1",

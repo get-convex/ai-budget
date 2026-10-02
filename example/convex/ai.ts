@@ -4,9 +4,9 @@
 // See the "Security: before you ship this" section of the README for the
 // server-derived-identity + admin-gate + scoped-query pattern.
 import { v } from "convex/values";
-import { action, mutation, query } from "./_generated/server";
-import { components } from "./_generated/api";
 import { AIBudget } from "../../src/client";
+import { components } from "./_generated/api";
+import { action, mutation, query } from "./_generated/server";
 
 const ai = new AIBudget(components.aiBudget, {
   defaultModel: "openai/gpt-4o-mini",
@@ -25,7 +25,7 @@ export const sendMessage = action({
     prompt: v.string(),
     // prior turns (excluding the system message, which is prepended here)
     history: v.optional(
-      v.array(v.object({ role: v.string(), content: v.string() }))
+      v.array(v.object({ role: v.string(), content: v.string() })),
     ),
     model: v.optional(v.string()),
   },
@@ -113,9 +113,8 @@ export const burst = action({
               index: i,
               ok: false as const,
               reason: String(e?.data?.reason ?? e?.message ?? e),
-            })
-          )
-      )
+            }),
+          )),
     );
     const admitted = results.filter((r) => r.ok);
     return {
@@ -202,7 +201,7 @@ export const experiment = action({
           });
           return result;
         }
-      })
+      }),
     );
     await ctx.runMutation(evalStore.completeRun, {
       runId,
@@ -302,15 +301,26 @@ export const backtest = action({
   },
   handler: async (ctx, { action: targetAction, newSystem, criteria, model, limit }) => {
     const rubric = criteria?.trim() || "overall quality and helpfulness";
-    const N = Math.min(limit ?? 5, 10);
-    const all = await ai.requests.list(ctx, { limit: 200 });
+    const N = Math.min(Math.max(1, Math.floor(limit ?? 5)), 10);
+    const recent = await ai.requests.list(ctx, {
+      dimension: "action",
+      value: targetAction,
+      limit: 200,
+    });
+    // Fetch only a bounded corpus; production adapters must authorize each detail read.
+    const details = await Promise.all(
+      recent.filter(r => r.status === "success").slice(0, N).map(r =>
+        ai.requests.get(ctx, { requestId: r._id })
+      ),
+    );
+    const all = details.filter((r): r is NonNullable<typeof r> => r !== null);
     const sample = all
       .filter(
         (r: any) =>
-          r.status === "success" &&
-          r.actionName === targetAction &&
-          r.responseText &&
-          r.messages?.some((m: any) => m.role === "user")
+          r.status === "success"
+          && r.actionName === targetAction
+          && r.responseText
+          && r.messages?.some((m: any) => m.role === "user"),
       )
       .slice(0, N);
 
@@ -338,7 +348,7 @@ export const backtest = action({
           }),
           expectedJson: JSON.stringify({ responseText: request.responseText }),
           sourceId: String(request._id),
-        })
+        }),
       );
     }
 
@@ -366,7 +376,9 @@ export const backtest = action({
               },
               {
                 role: "user",
-                content: `Request:\n${convo.map((m: any) => `${m.role}: ${m.content}`).join("\n")}\n\nORIGINAL:\n${r.responseText}\n\nNEW:\n${rr.text}`,
+                content: `Request:\n${
+                  convo.map((m: any) => `${m.role}: ${m.content}`).join("\n")
+                }\n\nORIGINAL:\n${r.responseText}\n\nNEW:\n${rr.text}`,
               },
             ],
           });
@@ -410,7 +422,7 @@ export const backtest = action({
           });
           return result;
         }
-      })
+      }),
     );
     const summary = {
       results,
@@ -446,19 +458,33 @@ export const evolve = action({
     sampleSize: v.optional(v.number()),
     budgetNanos: v.optional(v.number()),
   },
-  handler: async (ctx, { action: targetAction, goal, criteria, seedSystem, rounds, sampleSize, budgetNanos }) => {
+  handler: async (
+    ctx,
+    { action: targetAction, goal, criteria, seedSystem, rounds, sampleSize, budgetNanos },
+  ) => {
     const rubric = criteria?.trim() || goal;
     const maxRounds = Math.min(rounds ?? 4, 8);
-    const N = Math.min(sampleSize ?? 3, 5);
+    const N = Math.min(Math.max(1, Math.floor(sampleSize ?? 3)), 5);
     const budget = budgetNanos ?? Infinity;
 
-    const all = await ai.requests.list(ctx, { limit: 200 });
+    const recent = await ai.requests.list(ctx, {
+      dimension: "action",
+      value: targetAction,
+      limit: 200,
+    });
+    // Fetch only a bounded corpus; production adapters must authorize each detail read.
+    const details = await Promise.all(
+      recent.filter(r => r.status === "success").slice(0, N).map(r =>
+        ai.requests.get(ctx, { requestId: r._id })
+      ),
+    );
+    const all = details.filter((r): r is NonNullable<typeof r> => r !== null);
     const sample = all
       .filter(
         (r: any) =>
-          r.status === "success" &&
-          r.actionName === targetAction &&
-          r.messages?.some((m: any) => m.role === "user")
+          r.status === "success"
+          && r.actionName === targetAction
+          && r.messages?.some((m: any) => m.role === "user"),
       )
       .slice(0, N)
       .map((r: any) => ({
@@ -466,8 +492,9 @@ export const evolve = action({
         model: r.model,
         convo: r.messages.filter((m: any) => m.role !== "system"),
       }));
-    if (!sample.length)
+    if (!sample.length) {
       return { error: "No real chat requests to evolve against. Chat first." };
+    }
 
     const runId = await ctx.runMutation(evalStore.createRun, {
       kind: "evolve",
@@ -493,7 +520,7 @@ export const evolve = action({
             userId: item.userId,
             model: item.model,
           }),
-        })
+        }),
       );
     }
     if (budgetNanos !== undefined) {
@@ -527,12 +554,23 @@ export const evolve = action({
           userId: "evolve-judge",
           model: "openai/gpt-4o-mini",
           messages: [
-            { role: "system", content: `Rate 0-10 how well the response meets these criteria: "${rubric}". Respond ONLY JSON {"score":<number>}.` },
-            { role: "user", content: `User: ${s.convo.map((m: any) => m.content).join(" ")}\n\nResponse: ${gen.text}` },
+            {
+              role: "system",
+              content:
+                `Rate 0-10 how well the response meets these criteria: "${rubric}". Respond ONLY JSON {"score":<number>}.`,
+            },
+            {
+              role: "user",
+              content: `User: ${
+                s.convo.map((m: any) => m.content).join(" ")
+              }\n\nResponse: ${gen.text}`,
+            },
           ],
         });
         let sc = 0;
-        try { sc = Number(JSON.parse(jr.text.match(/\{[\s\S]*\}/)?.[0] ?? "{}").score) || 0; } catch {}
+        try {
+          sc = Number(JSON.parse(jr.text.match(/\{[\s\S]*\}/)?.[0] ?? "{}").score) || 0;
+        } catch {}
         total += sc;
       }
       return { avg: total / sample.length, outs };
@@ -545,7 +583,10 @@ export const evolve = action({
 
     try {
       for (let round = 0; round < maxRounds; round++) {
-        if (spent >= budget) { stopped = "budget"; break; }
+        if (spent >= budget) {
+          stopped = "budget";
+          break;
+        }
         const spentBeforeRound = spent;
         const { avg, outs } = await scoreSystem(current);
         history.push({ round: round + 1, system: current, score: avg, spentNanos: spent });
@@ -557,17 +598,33 @@ export const evolve = action({
           costNanos: spent - spentBeforeRound,
         });
         if (avg > best.score) best = { system: current, score: avg };
-        if (spent >= budget) { stopped = "budget"; break; }
+        if (spent >= budget) {
+          stopped = "budget";
+          break;
+        }
         const prop = await chat({
           userId: "evolve",
           model: "openai/gpt-4o",
           messages: [
-            { role: "system", content: `You refine system prompts toward a goal: "${goal}". Given the current prompt (scored ${avg.toFixed(1)}/10) and sample outputs, propose a better system prompt. Respond ONLY JSON {"system":"<new prompt>"}.` },
-            { role: "user", content: `Current system prompt:\n${current}\n\nSample outputs:\n${outs.map((o) => `- ${o.slice(0, 140)}`).join("\n")}` },
+            {
+              role: "system",
+              content:
+                `You refine system prompts toward a goal: "${goal}". Given the current prompt (scored ${
+                  avg.toFixed(1)
+                }/10) and sample outputs, propose a better system prompt. Respond ONLY JSON {"system":"<new prompt>"}.`,
+            },
+            {
+              role: "user",
+              content: `Current system prompt:\n${current}\n\nSample outputs:\n${
+                outs.map((o) => `- ${o.slice(0, 140)}`).join("\n")
+              }`,
+            },
           ],
         });
         let next: string | undefined;
-        try { next = JSON.parse(prop.text.match(/\{[\s\S]*\}/s)?.[0] ?? "{}").system; } catch {}
+        try {
+          next = JSON.parse(prop.text.match(/\{[\s\S]*\}/s)?.[0] ?? "{}").system;
+        } catch {}
         if (!next) break;
         current = next;
       }
@@ -596,7 +653,7 @@ export const rerun = action({
   args: {
     requestId: v.string(),
     messages: v.optional(
-      v.array(v.object({ role: v.string(), content: v.string() }))
+      v.array(v.object({ role: v.string(), content: v.string() })),
     ),
     model: v.optional(v.string()),
   },
@@ -671,7 +728,7 @@ export const syncPrices = action({
   args: {},
   handler: async (ctx) => {
     const res = await fetch("https://openrouter.ai/api/v1/models");
-    const { data } = (await res.json()) as { data: any[] };
+    const { data } = (await res.json()) as { data: any[]; };
     const byId = new Map(data.map((m) => [m.id, m]));
     const models = [
       "openai/gpt-4o-mini",
@@ -735,7 +792,7 @@ export const setModelPolicy = mutation({
     mode: v.union(
       v.literal("open"),
       v.literal("allowlist"),
-      v.literal("denylist")
+      v.literal("denylist"),
     ),
     models: v.array(v.string()),
   },
@@ -787,8 +844,7 @@ export const adjust = mutation({
 
 export const listAdjustments = query({
   args: { dimension: v.string(), value: v.string() },
-  handler: async (ctx, { dimension, value }) =>
-    ai.tag(dimension).adjustments(ctx, { value }),
+  handler: async (ctx, { dimension, value }) => ai.tag(dimension).adjustments(ctx, { value }),
 });
 
 export const setAlertDefaults = mutation({
