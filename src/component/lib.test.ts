@@ -581,9 +581,11 @@ describe("F-04 fail-closed pricing", () => {
     expect(r.allowed).toBe(true);
     await settle(t, r.requestId, 1_000_000, 1_000_000);
     const u = await userOf(t, "u");
-    // Conservative fallback is a frontier ceiling of {$20 in, $100 out}/Mtok, so
-    // 1M in + 1M out => $120 = 120e9 nano (over-count is the safe direction).
-    expect(u.totalSpendNanos).toBe(120_000_000_000);
+    // Conservative fallback is the most expensive KNOWN model (Opus-class
+    // {$15 in, $75 out}/Mtok), so 1M in + 1M out => $90 = 90e9 nano. Over-count is
+    // still the safe direction, without the old arbitrary $20/$100 that blocked
+    // concurrency under small caps.
+    expect(u.totalSpendNanos).toBe(90_000_000_000);
     const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
     expect(req.unpricedModel).toBe(true);
   });
@@ -1638,4 +1640,49 @@ test("issuer migration cannot bypass a legacy deletion marker", async () => {
   const r = await start(t, { userId: "issuer|deleted-subject", legacyUserId: "deleted-subject" });
   expect(r).toMatchObject({ allowed: false, code: "identity_migration_required" });
   expect(await userOf(t, "issuer|deleted-subject")).toBeUndefined();
+});
+
+describe("1.1.1 fixes: failure billing, default prices, global enforcement", () => {
+  test("B4: a failed call is NOT charged its reserved estimate", async () => {
+    const t = initTest();
+    await setUserLimits(t, "fail-u", { dailySpendLimitNanos: 1_000_000_000 });
+    const r = await start(t, { userId: "fail-u", estimatedCostNanos: 500_000_000 }); // reserve $0.50
+    expect(r.allowed).toBe(true);
+    await settleWith(t, r.requestId, { error: "provider boom" }); // failed, no usage signal
+    const u = await userOf(t, "fail-u");
+    expect(u.totalSpendNanos).toBe(0); // no charge on failure
+    expect(u.reservedTotalNanos ?? 0).toBe(0); // reservation released
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.status).toBe("error");
+    expect(req.costNanos).toBe(0);
+  });
+
+  test("B4: a SUCCESSFUL no-usage call still falls back to the reserved estimate", async () => {
+    const t = initTest();
+    const r = await start(t, { userId: "succ-u", estimatedCostNanos: 500_000_000 });
+    expect(r.allowed).toBe(true);
+    await settleWith(t, r.requestId, {}); // success, no tokens/cost signal
+    const u = await userOf(t, "succ-u");
+    expect(u.totalSpendNanos).toBe(500_000_000); // charged the estimate (fail-closed)
+  });
+
+  test("B6: current models carry real default prices (not the fallback)", async () => {
+    const t = initTest();
+    const r = await start(t, { userId: "s5", model: "anthropic/claude-sonnet-5" });
+    await settle(t, r.requestId, 1_000_000, 1_000_000); // 1M in + 1M out
+    const u = await userOf(t, "s5");
+    expect(u.totalSpendNanos).toBe(18_000_000_000); // $3 in + $15 out, NOT the $90 fallback
+    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    expect(req.unpricedModel).not.toBe(true);
+  });
+
+  test("B2/B8: global enforcement accepts 'hard' (legacy value + intuitive name)", async () => {
+    const t = initTest();
+    await t.mutation(api.lib.setGlobalLimits, {
+      dailySpendLimitNanos: 1_000_000_000,
+      enforcement: "hard",
+    });
+    const status = await t.query(api.lib.getGlobalStatus, {});
+    expect(status.enforcement).toBe("hard");
+  });
 });

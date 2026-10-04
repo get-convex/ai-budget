@@ -107,3 +107,21 @@ describe("plugin shape", () => {
     if (!DEFAULT_PROVIDERS.includes("ai")) throw new Error("defaults missing 'ai'");
   });
 });
+
+ruleTester.run("no-ungoverned-ai (re-exports, B5)", noUngovernedAi, {
+  valid: [
+    { code: `export { helper } from "./local";` },
+    { code: `export * from "./util";` },
+    { code: `export const x = 1;` },
+  ],
+  invalid: [
+    {
+      code: `export { openai } from "openai";`,
+      errors: [{ messageId: "ungoverned", data: { name: "openai" } }],
+    },
+    {
+      code: `export * from "ai";`,
+      errors: [{ messageId: "ungoverned", data: { name: "ai" } }],
+    },
+  ],
+});

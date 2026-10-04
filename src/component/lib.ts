@@ -3,16 +3,16 @@ import { ShardedCounter } from "@convex-dev/sharded-counter";
 import { paginator } from "convex-helpers/server/pagination";
 import { paginationOptsValidator } from "convex/server";
 import { type Infer, v } from "convex/values";
-import { components, internal } from "./_generated/api";
-import type { Doc } from "./_generated/dataModel";
+import { components, internal } from "./_generated/api.js";
+import type { Doc } from "./_generated/dataModel.js";
 import {
   internalMutation,
   mutation,
   type MutationCtx,
   query,
   type QueryCtx,
-} from "./_generated/server";
-import schema, { vMessage, vTag } from "./schema";
+} from "./_generated/server.js";
+import schema, { vMessage, vTag } from "./schema.js";
 
 // All money is integer **nanodollars** (1 USD = 1e9 nano). Integers avoid the
 // rounding drift that floating-point cents accumulate over millions of
@@ -217,12 +217,16 @@ const globalDayKey = (stamp: string) => `day:${stamp}`;
 // Fallback prices in NANODOLLARS per million tokens, used when no override is
 // stored (e.g. gpt-4o-mini = $0.15 in / $0.60 out per Mtok).
 const DEFAULT_PRICES: Record<string, { input: number; output: number; }> = {
+  "anthropic/claude-opus-5": { input: 15_000_000_000, output: 75_000_000_000 },
+  "anthropic/claude-sonnet-5": { input: 3_000_000_000, output: 15_000_000_000 },
   "anthropic/claude-sonnet-4.5": { input: 3_000_000_000, output: 15_000_000_000 },
   "anthropic/claude-haiku-4.5": { input: 1_000_000_000, output: 5_000_000_000 },
   "openai/gpt-4o": { input: 2_500_000_000, output: 10_000_000_000 },
   "openai/gpt-4o-mini": { input: 150_000_000, output: 600_000_000 },
   "openai/gpt-5": { input: 1_250_000_000, output: 10_000_000_000 },
   "openai/gpt-5-mini": { input: 250_000_000, output: 2_000_000_000 },
+  // The Decisions ("Jev") endpoint used by ai.decisions.
+  "typesafe/jev-1.13": { input: 1_000_000_000, output: 5_000_000_000 },
 };
 
 // Per-call price (nanodollars) for provider server-side tools that bill a fee on
@@ -267,23 +271,20 @@ const monthStamp = () => new Date().toISOString().slice(0, 7); // "2026-09"
 // fraction of its input rate (providers commonly discount ~90%).
 const CACHE_DISCOUNT = 0.1;
 
-// Conservative fallback for any model not in the price table: the max of every
-// known price dimension. Falling back to 0 would be fail-open — an unpriced
-// model would reserve 0, pass every cap, and log 0¢ while the AI Gateway still
-// bills real money. Charging the conservative max instead keeps the caps honest
-// (over-counting is the safe direction); admins can pin an exact price via
-// setPrice, which also clears the `unpricedModel` flag on future requests.
-// Seed with a true frontier ceiling ($20/$100 per Mtok), not just the max of the
-// small built-in table — otherwise premium models (Opus-class $15/$75, etc.) not
-// in the table would be under-counted several-fold whenever the gateway's
-// authoritative cost isn't available. Over-counting an unpriced model is the safe
-// direction; admins pin the exact rate with setPrice.
+// Conservative fallback for any model not in the price table: the most expensive
+// model we DO know (frontier / Opus-class). Falling back to 0 would be fail-open
+// — an unpriced model would reserve 0, pass every cap, and log 0¢ while the AI
+// Gateway still bills real money. Charging the frontier rate instead keeps caps
+// honest (over-counting is the safe direction) WITHOUT the old arbitrary
+// $20/$100 ceiling, which over-reserved so hard it could block a second
+// concurrent turn under a small cap. Admins pin an exact rate with setPrice;
+// gateway calls still settle at the authoritative cost regardless.
 const CONSERVATIVE_PRICE = Object.values(DEFAULT_PRICES).reduce(
   (m, p) => ({
     input: Math.max(m.input, p.input),
     output: Math.max(m.output, p.output),
   }),
-  { input: 20_000_000_000, output: 100_000_000_000 },
+  { input: 0, output: 0 },
 );
 
 async function getPrice(ctx: MutationCtx, model: string) {
@@ -1325,8 +1326,17 @@ export const finishRequest = mutation({
       // reserve time precisely so this floor is their real cost. A caller that
       // truly wants $0 passes an explicit authoritative costNanos: 0 above.
       const noSignal = promptTokens === 0 && completionTokens === 0 && priced === 0;
-      costSource = noSignal ? "reservation_estimate" : "token_estimate";
-      costNanos = noSignal ? (request.estimatedNanos ?? 0) : priced;
+      if (noSignal && args.error) {
+        // A FAILED call with no usage signal is not charged — the provider
+        // doesn't bill for a failure, and charging the reserved estimate here
+        // would bill every error. (If the provider DID bill before the callback
+        // threw, pass an authoritative `costNanos` or usage so it's recorded.)
+        costSource = "token_estimate";
+        costNanos = 0;
+      } else {
+        costSource = noSignal ? "reservation_estimate" : "token_estimate";
+        costNanos = noSignal ? (request.estimatedNanos ?? 0) : priced;
+      }
     }
 
     assertAmount(costNanos, "costNanos");
@@ -2559,7 +2569,7 @@ export const getGlobalStatus = query({
   returns: v.object({
     dailySpendLimitNanos: v.union(v.number(), v.null()),
     lifetimeSpendLimitNanos: v.union(v.number(), v.null()),
-    enforcement: v.union(v.literal("approximate"), v.literal("soft")),
+    enforcement: v.union(v.literal("approximate"), v.literal("hard"), v.literal("soft")),
     spentTodayNanos: v.number(),
     spentTotalNanos: v.number(),
     // deployment-wide config (surfaced for the admin dashboard)
@@ -2595,7 +2605,7 @@ export const setGlobalLimits = mutation({
     dailySpendLimitNanos: v.optional(v.union(v.number(), v.null())),
     lifetimeSpendLimitNanos: v.optional(v.union(v.number(), v.null())),
     enforcement: v.optional(
-      v.union(v.literal("approximate"), v.literal("soft"), v.null()),
+      v.union(v.literal("approximate"), v.literal("hard"), v.literal("soft"), v.null()),
     ),
   },
   returns: v.null(),

@@ -305,11 +305,17 @@ export default defineSchema({
     // killswitch; per-bucket concurrent admission is atomic via reserve/settle.
     globalDailySpendLimitNanos: v.optional(v.number()),
     globalLifetimeSpendLimitNanos: v.optional(v.number()),
-    // "approximate" (default): a best-effort killswitch — it blocks once the
-    // sharded total crosses the cap, but without a monetary overshoot bound (no per-request
-    // reservation). "soft": warn only. There is deliberately no "hard": per-bucket caps reserve atomically against explicit or estimated usage.
+    // Global enforcement modes:
+    // - "approximate" (default) and "hard" both BLOCK once the sharded total
+    //   crosses the cap. They behave identically: the global total is read
+    //   out-of-band (no per-request reservation), so blocking is best-effort with
+    //   bounded lag, not to-the-dollar. "hard" is accepted as the intuitive name
+    //   for the blocking mode (and so legacy 0.0.1 settings that stored "hard"
+    //   still deploy). For a true to-the-dollar ceiling, use a per-bucket cap,
+    //   which reserves atomically.
+    // - "soft": warn only.
     globalEnforcement: v.optional(
-      v.union(v.literal("approximate"), v.literal("soft")),
+      v.union(v.literal("approximate"), v.literal("hard"), v.literal("soft")),
     ),
     globalDailyBumpNanos: v.optional(v.number()),
     globalLifetimeBumpNanos: v.optional(v.number()),

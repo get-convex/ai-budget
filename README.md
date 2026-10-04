@@ -538,7 +538,8 @@ ai.requests.get(ctx, { requestId })                               // one request
 ### Global cap
 
 ```ts
-// enforcement: "approximate" (default, best-effort block) | "soft" (warn only).
+// enforcement: "approximate" (default) | "hard" | "soft". "approximate" and
+// "hard" both BLOCK (identically — best-effort, see below); "soft" warns only.
 // Pass null to clear a field; only the fields you pass change.
 ai.global.setLimits(ctx, { dailySpendLimitNanos?, lifetimeSpendLimitNanos?, enforcement? })
 ai.global.status(ctx)   // { dailySpendLimitNanos, lifetimeSpendLimitNanos, enforcement, spentTodayNanos, spentTotalNanos, … }
@@ -553,6 +554,12 @@ finite monetary overshoot bound without limits on traffic, duration, and per-cal
 cost. Use a per-bucket cap for atomic admission against reservations; a true
 spending ceiling additionally requires conservative provider cost bounds and
 provider-enforced generation or job limits.
+
+`"hard"` is accepted as the intuitive name for the blocking mode and behaves
+exactly like `"approximate"` — the global total is read out-of-band, so even
+`"hard"` is best-effort with bounded lag, *not* to-the-dollar. (Accepting `"hard"`
+also lets a settings doc from the 0.0.1 line, which stored `"hard"`, deploy on 1.x
+without a schema error.) For a precise ceiling, use a per-bucket cap.
 
 ### Model policy
 

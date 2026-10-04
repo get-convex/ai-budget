@@ -7,8 +7,8 @@ import {
   type HttpRouter,
 } from "convex/server";
 import { ConvexError, type GenericId } from "convex/values";
-import type { api } from "../component/_generated/api";
-import { DASHBOARD_HTML } from "./dashboard";
+import type { api } from "../component/_generated/api.js";
+import { DASHBOARD_HTML } from "./dashboard.js";
 
 // ---------- types ----------
 
@@ -1136,16 +1136,18 @@ export class AIBudget {
           paginationOpts: { cursor: args.cursor ?? null, numItems: args.limit ?? 50 },
         }),
       /**
-       * A killswitch spend cap across all users/actions. Enforced
-       * **approximately** (no monetary overshoot bound without workload limits) — for
-       * atomic admission use a per-bucket cap with conservative bounds. Pass `null` to clear a field.
+       * A killswitch spend cap across all users/actions. `"approximate"`
+       * (default) and `"hard"` both BLOCK — identically — once the deployment
+       * total crosses the cap; the total is read out-of-band, so blocking is
+       * best-effort with bounded lag, not to-the-dollar (use a per-bucket cap for
+       * that). `"soft"` warns only. Pass `null` to clear a field.
        */
       setLimits: (
         ctx: RunMutationCtx,
         args: {
           dailySpendLimitNanos?: number | null;
           lifetimeSpendLimitNanos?: number | null;
-          enforcement?: "approximate" | "soft" | null;
+          enforcement?: "approximate" | "hard" | "soft" | null;
         },
       ) => this.adminMutation(ctx, c.lib.setGlobalLimits, args),
       bump: (

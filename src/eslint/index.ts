@@ -172,13 +172,28 @@ const noUngovernedAi: Rule.RuleModule = {
       }
     }
 
+    // A type-only import/export (`import type …`, `export type … from`) is erased
+    // at compile time and makes no runtime provider call, so it's not a bypass.
+    const isTypeOnly = (node: { importKind?: string; exportKind?: string }) =>
+      node.importKind === "type" || node.exportKind === "type";
+
     return {
       ImportDeclaration(node) {
+        if (isTypeOnly(node as any)) return;
         check(node.source, node);
       },
       // dynamic import("...")
       ImportExpression(node) {
         check((node as unknown as { source: Node }).source, node);
+      },
+      // re-exports: `export { x } from "openai"`, `export * from "ai"`
+      ExportNamedDeclaration(node) {
+        if (isTypeOnly(node as any)) return;
+        check((node as unknown as { source?: Node | null }).source, node);
+      },
+      ExportAllDeclaration(node) {
+        if (isTypeOnly(node as any)) return;
+        check((node as unknown as { source?: Node | null }).source, node);
       },
       // require("...")
       CallExpression(node) {
