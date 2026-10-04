@@ -1,9 +1,17 @@
 # ☂️ @convex-dev/ai-budget
 
-**Add this component and get worry-free AI.** A metered, budget-governed layer
-over the [Convex AI Gateway](https://docs.convex.dev/ai-gateway/overview). Point
-your LLM calls through it and every request is tracked, priced, attributed, and
-held to a budget — with atomic admission that accounts for concurrent load.
+**Track, attribute, and cap every user's AI spend.** A metered, budget-governed
+layer over the [Convex AI Gateway](https://docs.convex.dev/ai-gateway/overview).
+Point your LLM calls through it and every request is tracked, priced, attributed,
+and held to a budget — with atomic admission that accounts for concurrent load.
+
+> ⚠️ **Best-effort, not a guarantee.** This component *reduces and bounds* AI
+> spend; it does **not** guarantee against all overspend. Per-bucket caps admit on
+> an **estimate**, so a call can settle above its cap by the estimate-vs-actual
+> delta; the **global** cap is **approximate** (best-effort, bounded lag — not
+> to-the-dollar). Treat it as one layer of defense: **also set hard spend limits
+> at your AI provider / billing account** as the real backstop, and monitor spend.
+> Provided **"AS IS"**, without warranty of any kind, under Apache-2.0.
 
 ```ts
 // userId defaults to the signed-in user — this is the whole integration:
