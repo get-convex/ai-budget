@@ -21,6 +21,10 @@
     "rate-limit"
   ],
   "scripts": {
+    "dev": "convex dev --start 'npm run dev:build'",
+    "dev:frontend": "cd example && vite --clearScreen false",
+    "dev:build": "chokidar 'tsconfig*.json' 'src/**/*.ts' -i '**/*.test.ts' -c 'npm run build:codegen' --initial",
+    "predev": "convex init && npm run build:codegen",
     "build": "tsc --project ./tsconfig.build.json",
     "build:codegen": "convex codegen --component-dir ./src/component && npm run build",
     "build:clean": "rm -rf dist *.tsbuildinfo && npm run build:codegen",
@@ -62,12 +66,12 @@
   "dependencies": {
     "@convex-dev/rate-limiter": "0.4.0",
     "@convex-dev/sharded-counter": "^0.2.1",
-    "convex-helpers": "^0.1.124"
+    "convex-helpers": "^0.1.127"
   },
   "peerDependencies": {
     "@convex-dev/ai-sdk-provider": ">=0.2.1",
     "ai": "^5.0.0 || ^6.0.0 || ^7.0.0",
-    "convex": "^1.45.0",
+    "convex": "^1.46.0",
     "eslint": ">=8.57.0"
   },
   "peerDependenciesMeta": {
@@ -76,11 +80,23 @@
     }
   },
   "devDependencies": {
+    "@convex-dev/agent": "0.7.6",
+    "@convex-dev/ai-sdk-provider": "^0.2.1",
+    "@convex-dev/rate-limiter": "0.4.0",
+    "@convex-dev/sharded-counter": "^0.2.1",
     "@edge-runtime/vm": "5.0.0",
-    "convex": "1.45.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "ai": "^7.0.108",
+    "chokidar-cli": "1.2.0",
+    "convex": "1.46.0",
     "convex-test": "0.0.56",
     "eslint": "^9.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "typescript": "^5.7.0",
+    "vite": "^6.0.0",
     "vitest": "4.1.11"
   }
 }

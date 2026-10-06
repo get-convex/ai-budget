@@ -121,7 +121,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           dailySpendLimitNanos: number | null;
           defaultWarnAtPct: number | null;
-          enforcement: "approximate" | "soft";
+          enforcement: "approximate" | "hard" | "soft";
           lifetimeSpendLimitNanos: number | null;
           retentionMs: number | null;
           spentTodayNanos: number;
@@ -330,7 +330,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           actorId?: string;
           dailySpendLimitNanos?: number | null;
-          enforcement?: "approximate" | "soft" | null;
+          enforcement?: "approximate" | "hard" | "soft" | null;
           lifetimeSpendLimitNanos?: number | null;
         },
         null,
