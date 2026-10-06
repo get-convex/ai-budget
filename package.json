@@ -29,11 +29,14 @@
     "build:codegen": "convex codegen --component-dir ./src/component && npm run build",
     "build:clean": "rm -rf dist *.tsbuildinfo && npm run build:codegen",
     "typecheck": "tsc --noEmit --project ./tsconfig.build.json && tsc --noEmit -p example && tsc --noEmit -p example/convex",
-    "test": "vitest run",
+    "test": "vitest run --typecheck",
+    "lint": "eslint .",
     "test:watch": "vitest",
     "prepack": "npm run build",
-    "alpha": "npm version prerelease --preid alpha && git push --follow-tags",
-    "release": "npm version patch && git push --follow-tags"
+    "preversion": "npm ci && npm run build:clean && npm run test && npm run lint && npm run typecheck",
+    "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
+    "release": "npm version patch && npm publish && git push --follow-tags",
+    "version": "(npm whoami || npm login) && vim -c 'normal o' -c 'normal o## '$npm_package_version CHANGELOG.md && prettier -w CHANGELOG.md && git add CHANGELOG.md"
   },
   "files": [
     "dist",
