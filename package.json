@@ -94,7 +94,7 @@
     "ai": "^7.0.108",
     "chokidar-cli": "1.2.0",
     "convex": "1.46.0",
-    "convex-test": "0.0.56",
+    "convex-test": "0.0.60",
     "eslint": "^9.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
