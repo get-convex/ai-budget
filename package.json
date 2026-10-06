@@ -92,7 +92,7 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
     "ai": "^7.0.108",
-    "chokidar-cli": "1.2.0",
+    "chokidar-cli": "3.0.0",
     "convex": "1.46.0",
     "convex-test": "0.0.60",
     "eslint": "^9.0.0",
