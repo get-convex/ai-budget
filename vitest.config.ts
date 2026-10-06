@@ -9,5 +9,8 @@ export default defineConfig({
     // in the example dev context, not here — otherwise `npm test` in a fresh
     // checkout (i.e. release CI) can't resolve its `./_generated` imports.
     include: ["src/**/*.test.ts"],
+    typecheck: {
+      tsconfig: "./tsconfig.test.json",
+    },
   },
 });
