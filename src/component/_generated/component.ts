@@ -111,7 +111,47 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "query",
         "internal",
         { dimension: string; value: string },
-        any,
+        {
+          _creationTime: number;
+          _id: string;
+          blocked?: boolean;
+          bumpDayStamp?: string;
+          bumpMonthStamp?: string;
+          creditsNanos?: number;
+          creditsThisMonthNanos?: number;
+          creditsTodayNanos?: number;
+          dailyBumpNanos?: number;
+          dailySpendLimitNanos?: number;
+          dailyTokenLimit?: number;
+          dayStamp: string;
+          dimension: string;
+          enforcement?: "hard" | "soft";
+          lifetimeBumpNanos?: number;
+          lifetimeSpendLimitNanos?: number;
+          lifetimeTokenLimit?: number;
+          maxConcurrent?: number;
+          monthStamp?: string;
+          monthlyBumpNanos?: number;
+          monthlySpendLimitNanos?: number;
+          monthlyTokenLimit?: number;
+          pendingCount?: number;
+          requestsPerMinute?: number;
+          reservedMonthNanos?: number;
+          reservedMonthTokens?: number;
+          reservedTodayNanos?: number;
+          reservedTodayTokens?: number;
+          reservedTotalNanos?: number;
+          reservedTotalTokens?: number;
+          spendThisMonthNanos: number;
+          spendTodayNanos: number;
+          tokensThisMonth: number;
+          tokensToday: number;
+          totalRequests: number;
+          totalSpendNanos: number;
+          totalTokens: number;
+          value: string;
+          warnAtPct?: number;
+        } | null,
         Name
       >;
       getGlobalStatus: FunctionReference<
@@ -154,43 +194,314 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "query",
         "internal",
         { requestId: string },
-        any,
+        {
+          _creationTime: number;
+          _id: string;
+          actionName?: string;
+          attributedBuckets?: Array<{
+            bucketId: string;
+            dimension: string;
+            value: string;
+          }>;
+          cachedTokens?: number;
+          cachedWrite1hTokens?: number;
+          cachedWriteTokens?: number;
+          completionTokens?: number;
+          contentPurged?: boolean;
+          costNanos?: number;
+          costSource?:
+            "authoritative" | "token_estimate" | "reservation_estimate";
+          error?: string;
+          estimatedNanos?: number;
+          estimatedTokens?: number;
+          expiredAt?: number;
+          expiresAt?: number;
+          finishedAt?: number;
+          heldBucketIds?: Array<string>;
+          latencyMs?: number;
+          messages: Array<{ content: string; role: string }>;
+          model: string;
+          overBudget?: boolean;
+          priceSnapshot?: {
+            cacheWrite: number;
+            cacheWrite1h?: number;
+            cached: number;
+            input: number;
+            output: number;
+          };
+          privacyErased?: boolean;
+          promptTokens?: number;
+          rerunOf?: string;
+          reservationDay?: string;
+          reservationExpired?: boolean;
+          reservationMonth?: string;
+          reservationReleased?: boolean;
+          reserveTtlMs?: number;
+          responseText?: string;
+          serverToolPriceSnapshot?: Record<string, number>;
+          serverToolUses?: Record<string, number>;
+          settled?: boolean;
+          status: "pending" | "success" | "error" | "blocked";
+          tags?: Array<{ dimension: string; value: string }>;
+          unpricedModel?: boolean;
+          userId: string;
+        } | null,
         Name
       >;
       lineage: FunctionReference<
         "query",
         "internal",
         { requestId: string },
-        any,
+        {
+          ancestors: Array<{
+            _creationTime: number;
+            _id: string;
+            actionName?: string;
+            attributedBuckets?: Array<{
+              bucketId: string;
+              dimension: string;
+              value: string;
+            }>;
+            cachedTokens?: number;
+            cachedWrite1hTokens?: number;
+            cachedWriteTokens?: number;
+            completionTokens?: number;
+            contentPurged?: boolean;
+            costNanos?: number;
+            costSource?:
+              "authoritative" | "token_estimate" | "reservation_estimate";
+            error?: string;
+            estimatedNanos?: number;
+            estimatedTokens?: number;
+            expiredAt?: number;
+            expiresAt?: number;
+            finishedAt?: number;
+            heldBucketIds?: Array<string>;
+            latencyMs?: number;
+            messages: Array<{ content: string; role: string }>;
+            model: string;
+            overBudget?: boolean;
+            priceSnapshot?: {
+              cacheWrite: number;
+              cacheWrite1h?: number;
+              cached: number;
+              input: number;
+              output: number;
+            };
+            privacyErased?: boolean;
+            promptTokens?: number;
+            rerunOf?: string;
+            reservationDay?: string;
+            reservationExpired?: boolean;
+            reservationMonth?: string;
+            reservationReleased?: boolean;
+            reserveTtlMs?: number;
+            responseText?: string;
+            serverToolPriceSnapshot?: Record<string, number>;
+            serverToolUses?: Record<string, number>;
+            settled?: boolean;
+            status: "pending" | "success" | "error" | "blocked";
+            tags?: Array<{ dimension: string; value: string }>;
+            unpricedModel?: boolean;
+            userId: string;
+          }>;
+          reruns: Array<{
+            _creationTime: number;
+            _id: string;
+            actionName?: string;
+            attributedBuckets?: Array<{
+              bucketId: string;
+              dimension: string;
+              value: string;
+            }>;
+            cachedTokens?: number;
+            cachedWrite1hTokens?: number;
+            cachedWriteTokens?: number;
+            completionTokens?: number;
+            contentPurged?: boolean;
+            costNanos?: number;
+            costSource?:
+              "authoritative" | "token_estimate" | "reservation_estimate";
+            error?: string;
+            estimatedNanos?: number;
+            estimatedTokens?: number;
+            expiredAt?: number;
+            expiresAt?: number;
+            finishedAt?: number;
+            heldBucketIds?: Array<string>;
+            latencyMs?: number;
+            messages: Array<{ content: string; role: string }>;
+            model: string;
+            overBudget?: boolean;
+            priceSnapshot?: {
+              cacheWrite: number;
+              cacheWrite1h?: number;
+              cached: number;
+              input: number;
+              output: number;
+            };
+            privacyErased?: boolean;
+            promptTokens?: number;
+            rerunOf?: string;
+            reservationDay?: string;
+            reservationExpired?: boolean;
+            reservationMonth?: string;
+            reservationReleased?: boolean;
+            reserveTtlMs?: number;
+            responseText?: string;
+            serverToolPriceSnapshot?: Record<string, number>;
+            serverToolUses?: Record<string, number>;
+            settled?: boolean;
+            status: "pending" | "success" | "error" | "blocked";
+            tags?: Array<{ dimension: string; value: string }>;
+            unpricedModel?: boolean;
+            userId: string;
+          }>;
+          truncated: boolean;
+        },
         Name
       >;
       listAdjustments: FunctionReference<
         "query",
         "internal",
         { dimension: string; limit?: number; value: string },
-        any,
+        Array<{
+          _creationTime: number;
+          _id: string;
+          deltaNanos: number;
+          dimension: string;
+          reason?: string;
+          tokens?: number;
+          value: string;
+        }>,
         Name
       >;
       listBuckets: FunctionReference<
         "query",
         "internal",
         { dimension?: string },
-        any,
+        Array<{
+          _creationTime: number;
+          _id: string;
+          blocked?: boolean;
+          bumpDayStamp?: string;
+          bumpMonthStamp?: string;
+          creditsNanos?: number;
+          creditsThisMonthNanos?: number;
+          creditsTodayNanos?: number;
+          dailyBumpNanos?: number;
+          dailySpendLimitNanos?: number;
+          dailyTokenLimit?: number;
+          dayStamp: string;
+          dimension: string;
+          enforcement?: "hard" | "soft";
+          lifetimeBumpNanos?: number;
+          lifetimeSpendLimitNanos?: number;
+          lifetimeTokenLimit?: number;
+          maxConcurrent?: number;
+          monthStamp?: string;
+          monthlyBumpNanos?: number;
+          monthlySpendLimitNanos?: number;
+          monthlyTokenLimit?: number;
+          pendingCount?: number;
+          requestsPerMinute?: number;
+          reservedMonthNanos?: number;
+          reservedMonthTokens?: number;
+          reservedTodayNanos?: number;
+          reservedTodayTokens?: number;
+          reservedTotalNanos?: number;
+          reservedTotalTokens?: number;
+          spendThisMonthNanos: number;
+          spendTodayNanos: number;
+          tokensThisMonth: number;
+          tokensToday: number;
+          totalRequests: number;
+          totalSpendNanos: number;
+          totalTokens: number;
+          value: string;
+          warnAtPct?: number;
+        }>,
         Name
       >;
-      listPrices: FunctionReference<"query", "internal", {}, any, Name>;
+      listPrices: FunctionReference<
+        "query",
+        "internal",
+        {},
+        Record<
+          string,
+          {
+            cacheWrite?: number;
+            cacheWrite1h?: number;
+            cached?: number;
+            input: number;
+            output: number;
+            overridden: boolean;
+          }
+        >,
+        Name
+      >;
       listRequests: FunctionReference<
         "query",
         "internal",
         { dimension?: string; limit?: number; userId?: string; value?: string },
-        any,
+        Array<{
+          _creationTime: number;
+          _id: string;
+          actionName?: string;
+          attributedBuckets?: Array<{
+            bucketId: string;
+            dimension: string;
+            value: string;
+          }>;
+          cachedTokens?: number;
+          cachedWrite1hTokens?: number;
+          cachedWriteTokens?: number;
+          completionTokens?: number;
+          contentPurged?: boolean;
+          costNanos?: number;
+          costSource?:
+            "authoritative" | "token_estimate" | "reservation_estimate";
+          error?: string;
+          estimatedNanos?: number;
+          estimatedTokens?: number;
+          expiredAt?: number;
+          expiresAt?: number;
+          finishedAt?: number;
+          heldBucketIds?: Array<string>;
+          latencyMs?: number;
+          messages: Array<{ content: string; role: string }>;
+          model: string;
+          overBudget?: boolean;
+          priceSnapshot?: {
+            cacheWrite: number;
+            cacheWrite1h?: number;
+            cached: number;
+            input: number;
+            output: number;
+          };
+          privacyErased?: boolean;
+          promptTokens?: number;
+          rerunOf?: string;
+          reservationDay?: string;
+          reservationExpired?: boolean;
+          reservationMonth?: string;
+          reservationReleased?: boolean;
+          reserveTtlMs?: number;
+          serverToolPriceSnapshot?: Record<string, number>;
+          serverToolUses?: Record<string, number>;
+          settled?: boolean;
+          status: "pending" | "success" | "error" | "blocked";
+          tags?: Array<{ dimension: string; value: string }>;
+          unpricedModel?: boolean;
+          userId: string;
+        }>,
         Name
       >;
       listServerToolPrices: FunctionReference<
         "query",
         "internal",
         {},
-        any,
+        Record<string, number>,
         Name
       >;
       paginateAdminEvents: FunctionReference<
@@ -411,7 +722,17 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           period: "day" | "month";
           value: string;
         },
-        any,
+        Array<{
+          _creationTime: number;
+          _id: string;
+          dimension: string;
+          period: "day" | "month";
+          requests: number;
+          spendNanos: number;
+          stamp: string;
+          tokens: number;
+          value: string;
+        }>,
         Name
       >;
     };

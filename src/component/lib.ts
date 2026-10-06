@@ -2048,6 +2048,11 @@ export const setRetention = mutation({
 
 export const lineage = query({
   args: { requestId: v.id("requests") },
+  returns: v.object({
+    ancestors: v.array(schema.doc("requests")),
+    reruns: v.array(schema.doc("requests")),
+    truncated: v.boolean(),
+  }),
   handler: async (ctx, { requestId }) => {
     // Walk up to the root of the re-run chain.
     const ancestors = [];
@@ -2072,6 +2077,7 @@ export const lineage = query({
 
 export const getRequest = query({
   args: { requestId: v.id("requests") },
+  returns: v.nullable(schema.doc("requests")),
   handler: async (ctx, args) => ctx.db.get(args.requestId),
 });
 
@@ -2084,6 +2090,7 @@ export const listRequests = query({
     value: v.optional(v.string()),
     limit: v.optional(v.number()),
   },
+  returns: v.array(schema.doc("requests").omit("responseText")),
   handler: async (ctx, args) => {
     // Clamp the page size so a caller can't force a scan past the transaction's
     // read limits, and strip prompt/response content from the LOG view — it's a
@@ -2273,10 +2280,24 @@ const ADMIN_LIST_CAP = 2000;
 // the read scan and the return-value size.
 const MAX_LIST = 200;
 
+const vNormalizedBucket = schema.doc("buckets").extend({
+  creditsTodayNanos: v.optional(v.number()),
+  reservedTodayNanos: v.optional(v.number()),
+  reservedTodayTokens: v.optional(v.number()),
+  creditsThisMonthNanos: v.optional(v.number()),
+  reservedMonthNanos: v.optional(v.number()),
+  reservedMonthTokens: v.optional(v.number()),
+  spendTodayNanos: v.number(),
+  tokensToday: v.number(),
+  spendThisMonthNanos: v.number(),
+  tokensThisMonth: v.number(),
+});
+
 // List budget buckets, optionally filtered to one dimension ("user", "action",
 // or any custom tag dimension). Today's spend is zeroed for stale day windows.
 export const listBuckets = query({
   args: { dimension: v.optional(v.string()) },
+  returns: v.array(vNormalizedBucket),
   handler: async (ctx, args) => {
     // Bounded to avoid an unbounded full-table scan on this reactive query.
     // Use paginateBuckets for larger deployments.
@@ -2300,6 +2321,7 @@ export const listBuckets = query({
 
 export const getBucket = query({
   args: { dimension: v.string(), value: v.string() },
+  returns: v.nullable(vNormalizedBucket),
   handler: async (ctx, args) => {
     const b = await getBucketDoc(ctx, args.dimension, args.value);
     if (!b) return null;
@@ -2661,6 +2683,7 @@ export const listAdjustments = query({
     value: v.string(),
     limit: v.optional(v.number()),
   },
+  returns: v.array(schema.doc("adjustments")),
   handler: async (ctx, { dimension, value, limit }) =>
     ctx.db
       .query("adjustments")
@@ -2680,6 +2703,7 @@ export const usageHistory = query({
     period: v.union(v.literal("day"), v.literal("month")),
     limit: v.optional(v.number()),
   },
+  returns: v.array(schema.doc("usage")),
   handler: async (ctx, { dimension, value, period, limit }) =>
     ctx.db
       .query("usage")
@@ -3114,6 +3138,17 @@ export const setPrice = mutation({
 
 export const listPrices = query({
   args: {},
+  returns: v.record(
+    v.string(),
+    v.object({
+      input: v.number(),
+      output: v.number(),
+      cached: v.optional(v.number()),
+      cacheWrite: v.optional(v.number()),
+      cacheWrite1h: v.optional(v.number()),
+      overridden: v.boolean(),
+    }),
+  ),
   handler: async (ctx) => {
     const overrides = await ctx.db.query("prices").take(2000);
     const merged: Record<
@@ -3148,6 +3183,7 @@ export const listPrices = query({
 // with any deployment overrides.
 export const listServerToolPrices = query({
   args: {},
+  returns: v.record(v.string(), v.number()),
   handler: async (ctx) => {
     const s = await getSettings(ctx);
     return { ...DEFAULT_SERVER_TOOL_PRICES, ...(s?.serverToolPrices ?? {}) };
