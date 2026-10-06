@@ -16,6 +16,6 @@
       "convex/*": ["./node_modules/convex/*"]
     }
   },
-  "include": ["src", "convex", "../src"],
+  "include": ["src", "convex", "../src", "vite.config.ts"],
   "exclude": ["../src/**/*.test.ts"]
 }

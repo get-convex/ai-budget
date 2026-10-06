@@ -5,7 +5,7 @@
     "src/**/*.tsx",
     "example/src/**/*.ts",
     "example/src/**/*.tsx",
-    "example/convex/**/*.ts"
+    "example/convex/**/*.ts",
   ],
-  "exclude": ["node_modules", "dist", "**/_generated"]
+  "exclude": ["node_modules", "dist", "**/_generated"],
 }

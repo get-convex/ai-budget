@@ -5,12 +5,7 @@ import convexPlugin from "@convex-dev/eslint-plugin";
 
 export default [
   {
-    ignores: [
-      "dist/**",
-      "eslint.config.js",
-      "vitest.config.ts",
-      "**/_generated/",
-    ],
+    ignores: ["dist/**", "eslint.config.js", "**/_generated/"],
   },
   {
     files: ["src/**/*.{js,mjs,cjs,ts,tsx}", "example/**/*.{js,mjs,cjs,ts,tsx}"],
@@ -41,6 +36,7 @@ export default [
     rules: {
       ...convexPlugin.configs.recommended[0].rules,
 
+      "@convex-dev/no-duplicate-indexes": "warn",
       "@typescript-eslint/no-floating-promises": "error",
       "@typescript-eslint/no-explicit-any": "off",
       "no-unused-vars": "off",

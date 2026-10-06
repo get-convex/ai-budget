@@ -66,7 +66,7 @@ export const addCase = mutation({
   },
   returns: v.id("cases"),
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
+    const run = await ctx.db.get("runs", args.runId);
     if (!run || run.status !== "running") throw new Error("Run is not active");
     return ctx.db.insert("cases", args);
   },
@@ -87,10 +87,10 @@ export const recordResult = mutation({
   },
   returns: v.id("results"),
   handler: async (ctx, args) => {
-    const run = await ctx.db.get(args.runId);
+    const run = await ctx.db.get("runs", args.runId);
     if (!run || run.status !== "running") throw new Error("Run is not active");
     if (args.caseId !== undefined) {
-      const testCase = await ctx.db.get(args.caseId);
+      const testCase = await ctx.db.get("cases", args.caseId);
       if (!testCase || testCase.runId !== args.runId)
         throw new Error("Case does not belong to run");
     }
@@ -115,10 +115,10 @@ export const completeRun = mutation({
   },
   returns: v.null(),
   handler: async (ctx, { runId, status, summaryJson, error }) => {
-    const run = await ctx.db.get(runId);
+    const run = await ctx.db.get("runs", runId);
     if (!run) throw new Error("Unknown run");
     if (run.status !== "running") return null;
-    await ctx.db.patch(runId, {
+    await ctx.db.patch("runs", runId, {
       status,
       summaryJson,
       error,
@@ -131,7 +131,7 @@ export const completeRun = mutation({
 export const getRun = query({
   args: { runId: v.id("runs") },
   returns: v.union(vRun, v.null()),
-  handler: async (ctx, { runId }) => ctx.db.get(runId),
+  handler: async (ctx, { runId }) => ctx.db.get("runs", runId),
 });
 
 export const listRuns = query({

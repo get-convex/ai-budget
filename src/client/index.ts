@@ -1098,7 +1098,7 @@ export class AIBudget {
       get: (ctx: QueryCtx | MutationCtx | ActionCtx, args: A) =>
         ctx.runQuery(c.lib.getBucket, { dimension, value: key(args) }),
       setLimits: (ctx: MutationCtx | ActionCtx, args: A & BucketLimits) => {
-        const { value, userId, name, ...limits } = args as any;
+        const { value: _, userId: __, name: ___, ...limits } = args;
         return this.adminMutation(ctx, c.lib.setBucketLimits, {
           dimension,
           value: key(args),
@@ -1521,6 +1521,7 @@ export class AIBudget {
     },
   ) {
     const path = opts.path ?? "/aibudget/webhook";
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
     http.route({
       path,

@@ -22,9 +22,12 @@ export const agentChat = action({
   handler: async (ctx, { userId, prompt, threadId }) => {
     const agent = new Agent(components.agent, {
       name: "budgeted-demo-agent",
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      languageModel: ai.languageModel(ctx, { userId, action: "agentChat" }) as any,
-      instructions: "You are a concise, friendly assistant. Keep replies short.",
+      languageModel: ai.languageModel(ctx, {
+        userId,
+        action: "agentChat",
+      }) as any,
+      instructions:
+        "You are a concise, friendly assistant. Keep replies short.",
     });
     const tId =
       threadId ?? (await agent.createThread(ctx, { userId })).threadId;

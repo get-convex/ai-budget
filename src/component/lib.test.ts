@@ -751,7 +751,8 @@ describe("accounting lifecycle regressions", () => {
       const result = await t.mutation(internal.lib.expirePhase, {});
       expect(result.expired).toBe(1);
       expect(
-        (await t.run((ctx) => ctx.db.get(short.requestId))).reservationExpired,
+        (await t.run((ctx) => ctx.db.get("requests", short.requestId)))
+          .reservationExpired,
       ).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -820,7 +821,8 @@ test("legacy pending rows acquire deadlines without starving newer expired work"
     vi.advanceTimersByTime(31 * 60_000);
     expect((await t.mutation(internal.lib.expirePhase, {})).expired).toBe(1);
     expect(
-      (await t.run((ctx) => ctx.db.get(job.requestId))).reservationExpired,
+      (await t.run((ctx) => ctx.db.get("requests", job.requestId)))
+        .reservationExpired,
     ).toBe(true);
     // The phase self-reschedules to backfill the remaining legacy rows in
     // batches; drain those scheduled continuations.
@@ -863,7 +865,9 @@ test("retention progresses past unresolved jobs", async () => {
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
     vi.advanceTimersByTime(2 * 60 * 60_000);
     expect((await t.mutation(internal.lib.retentionPhase, {})).purged).toBe(1);
-    expect(await t.run((ctx) => ctx.db.get(job.requestId))).toBeNull();
+    expect(
+      await t.run((ctx) => ctx.db.get("requests", job.requestId)),
+    ).toBeNull();
   } finally {
     vi.useRealTimers();
   }
@@ -1029,11 +1033,15 @@ describe("v1 hardening (round 3): reconcile phases", () => {
       await t.mutation(internal.lib.expirePhase, {});
       // Within the 7-day late-settle horizon: retention keeps the tombstone.
       await t.mutation(internal.lib.retentionPhase, {});
-      expect(await t.run((ctx) => ctx.db.get(job.requestId))).not.toBeNull();
+      expect(
+        await t.run((ctx) => ctx.db.get("requests", job.requestId)),
+      ).not.toBeNull();
       // Past the horizon: the tombstone is deleted so they can't accumulate.
       vi.advanceTimersByTime(8 * 24 * 60 * 60_000);
       await t.mutation(internal.lib.retentionPhase, {});
-      expect(await t.run((ctx) => ctx.db.get(job.requestId))).toBeNull();
+      expect(
+        await t.run((ctx) => ctx.db.get("requests", job.requestId)),
+      ).toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -1670,7 +1678,7 @@ test("credits do not hide one-nanodollar violations through floating-point cance
       .query("buckets")
       .withIndex("dim_value", (q) => q.eq("dimension", "user").eq("value", "u"))
       .unique())!;
-    await ctx.db.patch(b._id, {
+    await ctx.db.patch("buckets", b._id, {
       totalSpendNanos: Number.MAX_SAFE_INTEGER,
       creditsNanos: Number.MAX_SAFE_INTEGER,
       reservedTotalNanos: 1,
@@ -1775,7 +1783,7 @@ describe("security review fixes: overflow, audit retention, bounded admin inputs
           q.eq("dimension", "user").eq("value", "whale"),
         )
         .unique();
-      await ctx.db.patch(b._id, {
+      await ctx.db.patch("buckets", b._id, {
         totalSpendNanos: Number.MAX_SAFE_INTEGER - 100,
       });
     });
