@@ -1,16 +1,15 @@
 import { convexGateway } from "@convex-dev/ai-sdk-provider";
 import { generateText, type LanguageModel, wrapLanguageModel } from "ai";
 import {
-  type Expand,
   type FunctionReference,
-  GenericActionCtx,
-  GenericDataModel,
-  GenericMutationCtx,
-  GenericQueryCtx,
+  type GenericActionCtx,
+  type GenericDataModel,
+  type GenericMutationCtx,
+  type GenericQueryCtx,
   httpActionGeneric,
   type HttpRouter,
 } from "convex/server";
-import { ConvexError, type GenericId } from "convex/values";
+import { ConvexError } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
 

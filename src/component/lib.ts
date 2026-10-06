@@ -1,4 +1,4 @@
-import { MINUTE, RateLimitConfig, RateLimiter } from "@convex-dev/rate-limiter";
+import { MINUTE, RateLimiter } from "@convex-dev/rate-limiter";
 import { ShardedCounter } from "@convex-dev/sharded-counter";
 import { paginator } from "convex-helpers/server/pagination";
 import { paginationOptsValidator } from "convex/server";
