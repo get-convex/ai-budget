@@ -82,7 +82,9 @@ function globToRegExp(glob: string): RegExp {
 }
 
 /** Match an import source against the provider patterns (exact, subpath, or `/*`). */
-function makeSourceMatcher(patterns: readonly string[]): (source: string) => boolean {
+function makeSourceMatcher(
+  patterns: readonly string[],
+): (source: string) => boolean {
   const compiled = patterns.map((p) => {
     if (p.endsWith("/*")) {
       const prefix = p.slice(0, -1); // "@ai-sdk/*" -> "@ai-sdk/"
@@ -98,7 +100,9 @@ function makeSourceMatcher(patterns: readonly string[]): (source: string) => boo
 }
 
 /** Match a filename against `allow` globs; relative patterns match anywhere in the path. */
-function makeFileMatcher(patterns: readonly string[]): (file: string) => boolean {
+function makeFileMatcher(
+  patterns: readonly string[],
+): (file: string) => boolean {
   if (patterns.length === 0) return () => false;
   const res = patterns.map((p) => {
     const norm = p.replace(/\\/g, "/");

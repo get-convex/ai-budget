@@ -104,7 +104,8 @@ describe("plugin shape", () => {
     if (rec.rules?.["@convex-dev/ai-budget/no-ungoverned-ai"] !== "warn") {
       throw new Error("recommended config should warn by default");
     }
-    if (!DEFAULT_PROVIDERS.includes("ai")) throw new Error("defaults missing 'ai'");
+    if (!DEFAULT_PROVIDERS.includes("ai"))
+      throw new Error("defaults missing 'ai'");
   });
 });
 

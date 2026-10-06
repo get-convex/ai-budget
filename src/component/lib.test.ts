@@ -111,7 +111,9 @@ describe("cache-aware pricing", () => {
       completionTokens: 0,
       cachedTokens: 1_000_000,
     });
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.costNanos).toBe(15_000_000);
     expect(req.cachedTokens).toBe(1_000_000);
   });
@@ -124,7 +126,9 @@ describe("cache-aware pricing", () => {
       completionTokens: 1_000_000,
       costNanos: 12_345,
     });
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.costNanos).toBe(12_345);
   });
 });
@@ -139,7 +143,9 @@ describe("server-tool pricing", () => {
       completionTokens: 0,
       serverToolUses: { web_search: 3 },
     });
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.costNanos).toBe(30_000_000);
     expect(req.serverToolUses).toEqual({ web_search: 3 });
   });
@@ -156,7 +162,9 @@ describe("server-tool pricing", () => {
       completionTokens: 0,
       serverToolUses: { web_search: 2 },
     });
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.costNanos).toBe(24_000_000);
   });
 
@@ -169,7 +177,9 @@ describe("server-tool pricing", () => {
       serverToolUses: { web_search: 5 },
       costNanos: 999,
     });
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.costNanos).toBe(999);
   });
 });
@@ -217,7 +227,9 @@ describe("async lifecycle (video jobs): begin now, settle later", () => {
       reserveTtlMs: 30 * 60 * 1000,
     });
     expect(r.allowed).toBe(true);
-    const pending = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const pending = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(pending.status).toBe("pending");
     expect(pending.reserveTtlMs).toBe(30 * 60 * 1000);
     // held reservation
@@ -236,7 +248,10 @@ describe("durable usage history", () => {
   test("settled spend lands in a per-day usage row", async () => {
     const t = initTest();
     const r = await start(t, { userId: "u" });
-    await settleWith(t, r.requestId, { promptTokens: 1_000_000, completionTokens: 1_000_000 });
+    await settleWith(t, r.requestId, {
+      promptTokens: 1_000_000,
+      completionTokens: 1_000_000,
+    });
     const hist = await t.query(api.lib.usageHistory, {
       dimension: "user",
       value: "u",
@@ -252,7 +267,10 @@ describe("manual adjustments", () => {
   test("a credit accrues separately from gross spend and grants headroom", async () => {
     const t = initTest();
     const r = await start(t, { userId: "u" });
-    await settleWith(t, r.requestId, { promptTokens: 1_000_000, completionTokens: 1_000_000 });
+    await settleWith(t, r.requestId, {
+      promptTokens: 1_000_000,
+      completionTokens: 1_000_000,
+    });
     await t.mutation(api.lib.adjustBucket, {
       dimension: "user",
       value: "u",
@@ -264,7 +282,10 @@ describe("manual adjustments", () => {
     // separately. Net = gross - credits = 500M.
     expect(u.totalSpendNanos).toBe(750_000_000);
     expect(u.creditsNanos).toBe(250_000_000);
-    const log = await t.query(api.lib.listAdjustments, { dimension: "user", value: "u" });
+    const log = await t.query(api.lib.listAdjustments, {
+      dimension: "user",
+      value: "u",
+    });
     expect(log.length).toBe(1);
     expect(log[0].deltaNanos).toBe(-250_000_000);
   });
@@ -275,14 +296,20 @@ describe("manual adjustments", () => {
     const r = await start(t, { userId: "u" });
     await settleWith(t, r.requestId, { costNanos: 900_000_000 }); // $0.90 gross
     // Right at the edge: a $0.20 estimate would exceed the $1 cap...
-    expect((await start(t, { userId: "u", estimatedCostNanos: 200_000_000 })).allowed).toBe(false);
+    expect(
+      (await start(t, { userId: "u", estimatedCostNanos: 200_000_000 }))
+        .allowed,
+    ).toBe(false);
     // ...but a $0.30 credit (net spend $0.60) reopens headroom.
     await t.mutation(api.lib.adjustBucket, {
       dimension: "user",
       value: "u",
       deltaNanos: -300_000_000,
     });
-    expect((await start(t, { userId: "u", estimatedCostNanos: 200_000_000 })).allowed).toBe(true);
+    expect(
+      (await start(t, { userId: "u", estimatedCostNanos: 200_000_000 }))
+        .allowed,
+    ).toBe(true);
   });
 });
 
@@ -290,7 +317,10 @@ describe("threshold alerts", () => {
   test("crossing warnAtPct returns a notice but still admits", async () => {
     const t = initTest();
     // One "hi" estimate is ~480_150 nano. Cap 800_000, warn at 50% (400_000).
-    await setUserLimits(t, "u", { dailySpendLimitNanos: 800_000, warnAtPct: 0.5 });
+    await setUserLimits(t, "u", {
+      dailySpendLimitNanos: 800_000,
+      warnAtPct: 0.5,
+    });
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(true);
     expect(r.notices.length).toBeGreaterThan(0);
@@ -320,14 +350,28 @@ describe("per-bucket rate limits", () => {
         value: "busy",
         requestsPerMinute: 1,
       });
-      expect((await start(t, { userId: "other", actionName: "busy" })).allowed).toBe(true);
-      expect((await start(t, { userId: "u", actionName: "busy" })).code).toBe("action_rate_limit");
-      expect((await start(t, { userId: "u", actionName: "free" })).allowed).toBe(true);
-      expect((await start(t, { userId: "u", actionName: "free" })).allowed).toBe(true);
-      expect((await start(t, { userId: "u", actionName: "free" })).allowed).toBe(false);
+      expect(
+        (await start(t, { userId: "other", actionName: "busy" })).allowed,
+      ).toBe(true);
+      expect((await start(t, { userId: "u", actionName: "busy" })).code).toBe(
+        "action_rate_limit",
+      );
+      expect(
+        (await start(t, { userId: "u", actionName: "free" })).allowed,
+      ).toBe(true);
+      expect(
+        (await start(t, { userId: "u", actionName: "free" })).allowed,
+      ).toBe(true);
+      expect(
+        (await start(t, { userId: "u", actionName: "free" })).allowed,
+      ).toBe(false);
       vi.advanceTimersByTime(30_000);
-      expect((await start(t, { userId: "u", actionName: "free" })).allowed).toBe(true);
-      expect((await start(t, { userId: "u", actionName: "free" })).allowed).toBe(false);
+      expect(
+        (await start(t, { userId: "u", actionName: "free" })).allowed,
+      ).toBe(true);
+      expect(
+        (await start(t, { userId: "u", actionName: "free" })).allowed,
+      ).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -357,10 +401,16 @@ describe("per-bucket rate limits", () => {
     const t = initTest();
     await setUserLimits(t, "u", { requestsPerMinute: 0 });
     expect((await start(t, { userId: "u" })).code).toBe("rate_limit");
-    for (const requestsPerMinute of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity]) {
-      await expect(setUserLimits(t, "u", { requestsPerMinute })).rejects.toThrow(
-        /requestsPerMinute/,
-      );
+    for (const requestsPerMinute of [
+      -1,
+      0.5,
+      Number.MAX_SAFE_INTEGER + 1,
+      NaN,
+      Infinity,
+    ]) {
+      await expect(
+        setUserLimits(t, "u", { requestsPerMinute }),
+      ).rejects.toThrow(/requestsPerMinute/);
     }
   });
 
@@ -416,8 +466,14 @@ describe("per-bucket rate limits", () => {
 describe("tag-filtered request log", () => {
   test("listRequests filters by a custom tag dimension", async () => {
     const t = initTest();
-    await start(t, { userId: "u", tags: [{ dimension: "customer", value: "acme" }] });
-    await start(t, { userId: "u", tags: [{ dimension: "customer", value: "globex" }] });
+    await start(t, {
+      userId: "u",
+      tags: [{ dimension: "customer", value: "acme" }],
+    });
+    await start(t, {
+      userId: "u",
+      tags: [{ dimension: "customer", value: "globex" }],
+    });
     const acme = await t.query(api.lib.listRequests, {
       dimension: "customer",
       value: "acme",
@@ -539,7 +595,9 @@ describe("soft enforcement", () => {
     const r = await start(t, { userId: "u" });
     expect(r.allowed).toBe(true);
     expect(r.warnings.length).toBeGreaterThan(0);
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.overBudget).toBe(true);
   });
 });
@@ -586,7 +644,9 @@ describe("F-04 fail-closed pricing", () => {
     // still the safe direction, without the old arbitrary $20/$100 that blocked
     // concurrency under small caps.
     expect(u.totalSpendNanos).toBe(90_000_000_000);
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.unpricedModel).toBe(true);
   });
 });
@@ -597,11 +657,17 @@ describe("accounting lifecycle regressions", () => {
     try {
       vi.setSystemTime(new Date("2026-09-30T23:59:00Z"));
       const t = initTest();
-      await setUserLimits(t, "u", { dailySpendLimitNanos: 1000, monthlySpendLimitNanos: 1000 });
+      await setUserLimits(t, "u", {
+        dailySpendLimitNanos: 1000,
+        monthlySpendLimitNanos: 1000,
+      });
       const old = await start(t, { userId: "u", estimatedCostNanos: 100 });
       vi.setSystemTime(new Date("2026-10-01T00:01:00Z"));
       await start(t, { userId: "u", estimatedCostNanos: 100 });
-      await t.mutation(api.lib.finishRequest, { requestId: old.requestId, costNanos: 0 });
+      await t.mutation(api.lib.finishRequest, {
+        requestId: old.requestId,
+        costNanos: 0,
+      });
       await t.mutation(internal.lib.foldTotals, { requestId: old.requestId });
       const b = await userOf(t, "u");
       expect(b.reservedTodayNanos).toBe(100);
@@ -617,14 +683,17 @@ describe("accounting lifecycle regressions", () => {
     const t = initTest();
     const old = await start(t, { userId: "u", estimatedCostNanos: 100 });
     await setUserLimits(t, "u", { dailySpendLimitNanos: 1000 });
-    expect((await start(t, { userId: "u", estimatedCostNanos: 100 })).code).toBe(
-      "bucket_reconciling",
-    );
+    expect(
+      (await start(t, { userId: "u", estimatedCostNanos: 100 })).code,
+    ).toBe("bucket_reconciling");
     vi.useFakeTimers();
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     vi.useRealTimers();
     await start(t, { userId: "u", estimatedCostNanos: 100 });
-    await t.mutation(api.lib.finishRequest, { requestId: old.requestId, costNanos: 0 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: old.requestId,
+      costNanos: 0,
+    });
     await t.mutation(internal.lib.foldTotals, { requestId: old.requestId });
     expect((await userOf(t, "u")).reservedTotalNanos).toBe(100);
   });
@@ -639,15 +708,23 @@ describe("accounting lifecycle regressions", () => {
       await t.mutation(internal.lib.expirePhase, {});
       expect((await userOf(t, "u")).reservedTotalNanos).toBe(0);
       await start(t, { userId: "u", estimatedCostNanos: 100 });
-      await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 75 });
+      await t.mutation(api.lib.finishRequest, {
+        requestId: job.requestId,
+        costNanos: 75,
+      });
       await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
-      await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 999 });
+      await t.mutation(api.lib.finishRequest, {
+        requestId: job.requestId,
+        costNanos: 999,
+      });
       await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
       const b = await userOf(t, "u");
       expect(b.totalSpendNanos).toBe(75);
       expect(b.totalRequests).toBe(1);
       expect(b.reservedTotalNanos).toBe(100);
-      expect((await t.query(api.lib.getGlobalStatus, {})).spentTotalNanos).toBe(75);
+      expect((await t.query(api.lib.getGlobalStatus, {})).spentTotalNanos).toBe(
+        75,
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -657,7 +734,7 @@ describe("accounting lifecycle regressions", () => {
     vi.useFakeTimers();
     try {
       const t = initTest();
-      await t.run(async ctx => {
+      await t.run(async (ctx) => {
         for (let i = 0; i < 201; i++) {
           await ctx.db.insert("requests", {
             userId: "long",
@@ -673,7 +750,9 @@ describe("accounting lifecycle regressions", () => {
       vi.advanceTimersByTime(31 * 60_000);
       const result = await t.mutation(internal.lib.expirePhase, {});
       expect(result.expired).toBe(1);
-      expect((await t.run(ctx => ctx.db.get(short.requestId))).reservationExpired).toBe(true);
+      expect(
+        (await t.run((ctx) => ctx.db.get(short.requestId))).reservationExpired,
+      ).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -682,25 +761,41 @@ describe("accounting lifecycle regressions", () => {
   test("global accounting includes usage before limits are enabled", async () => {
     const t = initTest();
     const job = await start(t, { userId: "u" });
-    await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 100 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: job.requestId,
+      costNanos: 100,
+    });
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
-    expect((await t.query(api.lib.getGlobalStatus, {})).spentTotalNanos).toBe(100);
+    expect((await t.query(api.lib.getGlobalStatus, {})).spentTotalNanos).toBe(
+      100,
+    );
     await t.mutation(api.lib.setGlobalLimits, { lifetimeSpendLimitNanos: 100 });
     // The killswitch trips out-of-band (H4): the reconciler's globalPhase
     // compares the sharded total to the cap and flags settings; admission reads
     // the flag. So a request admits until the flag is set, then blocks.
-    expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed).toBe(true);
+    expect(
+      (await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed,
+    ).toBe(true);
     await t.mutation(internal.lib.globalPhase, {});
-    expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed).toBe(false);
+    expect(
+      (await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed,
+    ).toBe(false);
   });
 
   test("settlement does not write admission policy, but changing limits does", async () => {
     const t = initTest();
     const job = await start(t, { userId: "u" });
-    const before = await t.run(ctx => ctx.db.query("bucketPolicies").collect());
-    await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 100 });
+    const before = await t.run((ctx) =>
+      ctx.db.query("bucketPolicies").collect(),
+    );
+    await t.mutation(api.lib.finishRequest, {
+      requestId: job.requestId,
+      costNanos: 100,
+    });
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
-    expect(await t.run(ctx => ctx.db.query("bucketPolicies").collect())).toEqual(before);
+    expect(
+      await t.run((ctx) => ctx.db.query("bucketPolicies").collect()),
+    ).toEqual(before);
     await setUserLimits(t, "u", { blocked: true });
     expect((await start(t, { userId: "u" })).allowed).toBe(false);
   });
@@ -710,7 +805,7 @@ test("legacy pending rows acquire deadlines without starving newer expired work"
   vi.useFakeTimers();
   try {
     const t = initTest();
-    await t.run(async ctx => {
+    await t.run(async (ctx) => {
       for (let i = 0; i < 201; i++) {
         await ctx.db.insert("requests", {
           userId: "legacy",
@@ -724,16 +819,20 @@ test("legacy pending rows acquire deadlines without starving newer expired work"
     const job = await start(t, { userId: "new" });
     vi.advanceTimersByTime(31 * 60_000);
     expect((await t.mutation(internal.lib.expirePhase, {})).expired).toBe(1);
-    expect((await t.run(ctx => ctx.db.get(job.requestId))).reservationExpired).toBe(true);
+    expect(
+      (await t.run((ctx) => ctx.db.get(job.requestId))).reservationExpired,
+    ).toBe(true);
     // The phase self-reschedules to backfill the remaining legacy rows in
     // batches; drain those scheduled continuations.
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     expect(
-      await t.run(ctx =>
-        ctx.db.query("requests").withIndex(
-          "status_expires",
-          q => q.eq("status", "pending").eq("expiresAt", undefined),
-        ).take(1)
+      await t.run((ctx) =>
+        ctx.db
+          .query("requests")
+          .withIndex("status_expires", (q) =>
+            q.eq("status", "pending").eq("expiresAt", undefined),
+          )
+          .take(1),
       ),
     ).toHaveLength(0);
   } finally {
@@ -745,7 +844,7 @@ test("retention progresses past unresolved jobs", async () => {
   vi.useFakeTimers();
   try {
     const t = initTest();
-    await t.run(async ctx => {
+    await t.run(async (ctx) => {
       for (let i = 0; i < 501; i++) {
         await ctx.db.insert("requests", {
           userId: "long",
@@ -757,11 +856,14 @@ test("retention progresses past unresolved jobs", async () => {
       }
     });
     const job = await start(t, { userId: "short" });
-    await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 0 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: job.requestId,
+      costNanos: 0,
+    });
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
     vi.advanceTimersByTime(2 * 60 * 60_000);
     expect((await t.mutation(internal.lib.retentionPhase, {})).purged).toBe(1);
-    expect(await t.run(ctx => ctx.db.get(job.requestId))).toBeNull();
+    expect(await t.run((ctx) => ctx.db.get(job.requestId))).toBeNull();
   } finally {
     vi.useRealTimers();
   }
@@ -774,7 +876,10 @@ test("delayed folding attributes spend to completion day and leaves newer holds 
     const t = initTest();
     await setUserLimits(t, "u", { dailySpendLimitNanos: 1000 });
     const job = await start(t, { userId: "u", estimatedCostNanos: 100 });
-    await t.mutation(api.lib.finishRequest, { requestId: job.requestId, costNanos: 50 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: job.requestId,
+      costNanos: 50,
+    });
     vi.setSystemTime(new Date("2026-10-01T00:01:00Z"));
     await start(t, { userId: "u", estimatedCostNanos: 100 });
     await t.mutation(internal.lib.foldTotals, { requestId: job.requestId });
@@ -809,7 +914,9 @@ describe("v1 hardening", () => {
     expect(g.lifetimeSpendLimitNanos).toBe(500);
     expect(g.enforcement).toBe("soft");
     // Explicit null clears just that field.
-    await t.mutation(api.lib.setGlobalLimits, { lifetimeSpendLimitNanos: null });
+    await t.mutation(api.lib.setGlobalLimits, {
+      lifetimeSpendLimitNanos: null,
+    });
     const after = await t.query(api.lib.getGlobalStatus, {});
     expect(after.lifetimeSpendLimitNanos).toBe(null);
     expect(after.dailySpendLimitNanos).toBe(200);
@@ -825,9 +932,9 @@ describe("v1 hardening", () => {
       costNanos: 1_000_000,
     });
     expect(out.costNanos).toBe(1_000_000);
-    expect((await t.query(api.lib.getRequest, { requestId: r.requestId })).userId).toBe(
-      `erased:${r.requestId}`,
-    );
+    expect(
+      (await t.query(api.lib.getRequest, { requestId: r.requestId })).userId,
+    ).toBe(`erased:${r.requestId}`);
   });
 
   test("deleting a user releases holds it placed on a shared bucket", async () => {
@@ -892,7 +999,10 @@ describe("v1 hardening (round 2)", () => {
   test("a settle with no cost signal falls back to the reserved estimate, not $0", async () => {
     const t = initTest();
     // $2 reserved up front (e.g. a video job).
-    const r = await start(t, { userId: "u", estimatedCostNanos: 2_000_000_000 });
+    const r = await start(t, {
+      userId: "u",
+      estimatedCostNanos: 2_000_000_000,
+    });
     // Settle with an unpriced server tool and no tokens/authoritative cost.
     const out = await t.mutation(api.lib.finishRequest, {
       requestId: r.requestId,
@@ -933,7 +1043,9 @@ describe("v1 hardening (round 3): reconcile phases", () => {
 describe("v1: deployment policy (unpriced models, content storage)", () => {
   test("blocking unpriced models rejects a model with no configured price", async () => {
     const t = initTest();
-    await t.mutation(api.lib.setDeploymentPolicy, { allowUnpricedModels: false });
+    await t.mutation(api.lib.setDeploymentPolicy, {
+      allowUnpricedModels: false,
+    });
     const r = await start(t, { userId: "u", model: "made/up-model" });
     expect(r.allowed).toBe(false);
     expect(r.code).toBe("model_unpriced");
@@ -950,7 +1062,9 @@ describe("v1: deployment policy (unpriced models, content storage)", () => {
       completionTokens: 5,
       responseText: "secret answer",
     });
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.messages).toEqual([]); // prompt not stored
     expect(req.responseText ?? undefined).toBe(undefined); // response not stored
     expect(req.promptTokens).toBe(10); // metadata/cost still recorded
@@ -961,14 +1075,25 @@ describe("v1: Convex byte-limit hardening", () => {
   test("a huge prompt is truncated for storage but estimated at full size", async () => {
     const t = initTest();
     const huge = "x".repeat(500_000);
-    const r = await start(t, { userId: "u", messages: [{ role: "user", content: huge }] });
+    const r = await start(t, {
+      userId: "u",
+      messages: [{ role: "user", content: huge }],
+    });
     expect(r.allowed).toBe(true);
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
-    const stored = req.messages.reduce((n: number, m: any) => n + m.content.length, 0);
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
+    const stored = req.messages.reduce(
+      (n: number, m: any) => n + m.content.length,
+      0,
+    );
     expect(stored).toBeLessThanOrEqual(20_000); // row stays far under 1 MiB
     // The token estimate still reflects the full prompt, so a tiny cap blocks it.
     await setUserLimits(t, "u2", { dailyTokenLimit: 1000 });
-    const blocked = await start(t, { userId: "u2", messages: [{ role: "user", content: huge }] });
+    const blocked = await start(t, {
+      userId: "u2",
+      messages: [{ role: "user", content: huge }],
+    });
     expect(blocked.allowed).toBe(false);
   });
 
@@ -980,26 +1105,37 @@ describe("v1: Convex byte-limit hardening", () => {
       completionTokens: 1,
       responseText: "y".repeat(200_000),
     });
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect((req.responseText ?? "").length).toBeLessThanOrEqual(20_000);
   });
 
   test("excess attribution tags are rejected rather than silently dropping budget dimensions", async () => {
     const t = initTest();
-    const tags = Array.from({ length: 17 }, (_, i) => ({ dimension: `tag${i}`, value: "v" }));
+    const tags = Array.from({ length: 17 }, (_, i) => ({
+      dimension: `tag${i}`,
+      value: "v",
+    }));
     await expect(start(t, { userId: "u", tags })).rejects.toThrow(/At most 16/);
     expect(await t.query(api.lib.listRequests, {})).toHaveLength(0);
   });
 
   test("listRequests clamps the page size and strips content", async () => {
     const t = initTest();
-    const r = await start(t, { userId: "u", messages: [{ role: "user", content: "hello" }] });
+    const r = await start(t, {
+      userId: "u",
+      messages: [{ role: "user", content: "hello" }],
+    });
     await settleWith(t, r.requestId, {
       promptTokens: 10,
       completionTokens: 5,
       responseText: "a response",
     });
-    const rows = await t.query(api.lib.listRequests, { userId: "u", limit: 10_000_000 });
+    const rows = await t.query(api.lib.listRequests, {
+      userId: "u",
+      limit: 10_000_000,
+    });
     expect(rows.length).toBeLessThanOrEqual(200);
     expect(rows[0].messages).toEqual([]);
     expect(rows[0].responseText ?? undefined).toBe(undefined);
@@ -1024,7 +1160,9 @@ describe("v1: H6 fold de-contention", () => {
     // contention): its total is still 0, the spend sits in queued deltas.
     const before = await bucketOf(t, "action", "shared");
     expect(before?.totalSpendNanos ?? 0).toBe(0);
-    const deltas = await t.run((ctx: any) => ctx.db.query("usageDeltas").collect());
+    const deltas = await t.run((ctx: any) =>
+      ctx.db.query("usageDeltas").collect(),
+    );
     expect(deltas.length).toBeGreaterThan(0);
     // The reconciler's rollup drains them into the row + usage history.
     await t.mutation(internal.lib.rollupPhase, {});
@@ -1037,7 +1175,9 @@ describe("v1: H6 fold de-contention", () => {
       period: "day",
     });
     expect(hist[0].spendNanos).toBe(200_000_000);
-    expect(await t.run((ctx: any) => ctx.db.query("usageDeltas").collect())).toHaveLength(0);
+    expect(
+      await t.run((ctx: any) => ctx.db.query("usageDeltas").collect()),
+    ).toHaveLength(0);
   });
 
   test("a capped bucket is updated live and NOT double-counted by the rollup", async () => {
@@ -1045,7 +1185,10 @@ describe("v1: H6 fold de-contention", () => {
     await setUserLimits(t, "u", { lifetimeSpendLimitNanos: 1_000_000_000 });
     const r = await start(t, { userId: "u" });
     // finish + fold (capped row updated live)...
-    await t.mutation(api.lib.finishRequest, { requestId: r.requestId, costNanos: 300_000_000 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: r.requestId,
+      costNanos: 300_000_000,
+    });
     vi.useFakeTimers();
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     vi.useRealTimers();
@@ -1071,11 +1214,22 @@ describe("security review regressions", () => {
     try {
       vi.setSystemTime(new Date("2026-09-30T23:59:00Z"));
       const t = initTest();
-      await setUserLimits(t, "u", { dailySpendLimitNanos: 100, monthlySpendLimitNanos: 100 });
-      await t.mutation(api.lib.adjustBucket, { dimension: "user", value: "u", deltaNanos: -100 });
+      await setUserLimits(t, "u", {
+        dailySpendLimitNanos: 100,
+        monthlySpendLimitNanos: 100,
+      });
+      await t.mutation(api.lib.adjustBucket, {
+        dimension: "user",
+        value: "u",
+        deltaNanos: -100,
+      });
       vi.setSystemTime(new Date("2026-10-01T00:01:00Z"));
-      expect((await start(t, { userId: "u", estimatedCostNanos: 60 })).allowed).toBe(true);
-      expect((await start(t, { userId: "u", estimatedCostNanos: 60 })).allowed).toBe(false);
+      expect(
+        (await start(t, { userId: "u", estimatedCostNanos: 60 })).allowed,
+      ).toBe(true);
+      expect(
+        (await start(t, { userId: "u", estimatedCostNanos: 60 })).allowed,
+      ).toBe(false);
       const b = await userOf(t, "u");
       expect(b.creditsTodayNanos).toBe(0);
       expect(b.creditsThisMonthNanos).toBe(0);
@@ -1085,36 +1239,55 @@ describe("security review regressions", () => {
     }
   });
 
-  test.each([true, false])("settlement and rollup expire old credits (capped=%s)", async capped => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(new Date("2026-09-30T23:59:00Z"));
-      const t = initTest();
-      if (capped) {
-        await setUserLimits(t, "u", { dailySpendLimitNanos: 1000, monthlySpendLimitNanos: 1000 });
+  test.each([true, false])(
+    "settlement and rollup expire old credits (capped=%s)",
+    async (capped) => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-30T23:59:00Z"));
+        const t = initTest();
+        if (capped) {
+          await setUserLimits(t, "u", {
+            dailySpendLimitNanos: 1000,
+            monthlySpendLimitNanos: 1000,
+          });
+        }
+        await t.mutation(api.lib.adjustBucket, {
+          dimension: "user",
+          value: "u",
+          deltaNanos: -100,
+        });
+        const r = await start(t, { userId: "u", estimatedCostNanos: 10 });
+        vi.setSystemTime(new Date("2026-10-01T00:01:00Z"));
+        await t.mutation(api.lib.finishRequest, {
+          requestId: r.requestId,
+          costNanos: 10,
+        });
+        await t.mutation(internal.lib.foldTotals, { requestId: r.requestId });
+        await t.mutation(internal.lib.rollupPhase, {});
+        const b = await userOf(t, "u");
+        expect(b.creditsTodayNanos).toBe(0);
+        expect(b.creditsThisMonthNanos).toBe(0);
+        expect(b.spendTodayNanos).toBe(10);
+      } finally {
+        vi.useRealTimers();
       }
-      await t.mutation(api.lib.adjustBucket, { dimension: "user", value: "u", deltaNanos: -100 });
-      const r = await start(t, { userId: "u", estimatedCostNanos: 10 });
-      vi.setSystemTime(new Date("2026-10-01T00:01:00Z"));
-      await t.mutation(api.lib.finishRequest, { requestId: r.requestId, costNanos: 10 });
-      await t.mutation(internal.lib.foldTotals, { requestId: r.requestId });
-      await t.mutation(internal.lib.rollupPhase, {});
-      const b = await userOf(t, "u");
-      expect(b.creditsTodayNanos).toBe(0);
-      expect(b.creditsThisMonthNanos).toBe(0);
-      expect(b.spendTodayNanos).toBe(10);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+    },
+  );
 
   test("cap activation drains prior spend and adopts existing holds before admitting", async () => {
     const t = initTest();
     const done = await start(t, { userId: "u", estimatedCostNanos: 100 });
-    await t.mutation(api.lib.finishRequest, { requestId: done.requestId, costNanos: 600 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: done.requestId,
+      costNanos: 600,
+    });
     await t.mutation(internal.lib.foldTotals, { requestId: done.requestId });
     const pending = await start(t, { userId: "u", estimatedCostNanos: 300 });
-    await setUserLimits(t, "u", { lifetimeSpendLimitNanos: 1000, maxConcurrent: 1 });
+    await setUserLimits(t, "u", {
+      lifetimeSpendLimitNanos: 1000,
+      maxConcurrent: 1,
+    });
     expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).code).toBe(
       "bucket_reconciling",
     );
@@ -1126,9 +1299,14 @@ describe("security review regressions", () => {
     expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).code).toBe(
       "user_max_concurrent",
     );
-    await t.mutation(api.lib.finishRequest, { requestId: pending.requestId, costNanos: 300 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: pending.requestId,
+      costNanos: 300,
+    });
     await drain(t);
-    expect((await start(t, { userId: "u", estimatedCostNanos: 101 })).allowed).toBe(false);
+    expect(
+      (await start(t, { userId: "u", estimatedCostNanos: 101 })).allowed,
+    ).toBe(false);
   });
 
   test("tag cap activation scans multiple pages without double counting", async () => {
@@ -1140,33 +1318,57 @@ describe("security review regressions", () => {
         estimatedCostNanos: 10,
       });
     }
-    await t.mutation(api.lib.setBucketLimits, { dimension: "team", value: "a", maxConcurrent: 30 });
+    await t.mutation(api.lib.setBucketLimits, {
+      dimension: "team",
+      value: "a",
+      maxConcurrent: 30,
+    });
     await drain(t);
     const b = await bucketOf(t, "team", "a");
     expect(b.pendingCount).toBe(30);
     expect(b.reservedTotalNanos).toBe(300);
     expect(
-      (await start(t, {
-        userId: "new",
-        tags: [{ dimension: "team", value: "a" }],
-        estimatedCostNanos: 10,
-      })).allowed,
+      (
+        await start(t, {
+          userId: "new",
+          tags: [{ dimension: "team", value: "a" }],
+          estimatedCostNanos: 10,
+        })
+      ).allowed,
     ).toBe(false);
   });
 
   test("global bumps and server tool prices reject poison and overflow", async () => {
     const t = initTest();
-    for (const amount of [-1, NaN, Infinity, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
-      await expect(t.mutation(api.lib.bumpGlobal, { dailyNanos: amount })).rejects.toThrow();
-      await expect(t.mutation(api.lib.setServerToolPrice, { tool: "x", nanosPerCall: amount }))
-        .rejects.toThrow();
+    for (const amount of [
+      -1,
+      NaN,
+      Infinity,
+      0.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      await expect(
+        t.mutation(api.lib.bumpGlobal, { dailyNanos: amount }),
+      ).rejects.toThrow();
+      await expect(
+        t.mutation(api.lib.setServerToolPrice, {
+          tool: "x",
+          nanosPerCall: amount,
+        }),
+      ).rejects.toThrow();
     }
-    await t.mutation(api.lib.bumpGlobal, { lifetimeNanos: Number.MAX_SAFE_INTEGER });
-    await expect(t.mutation(api.lib.bumpGlobal, { lifetimeNanos: 1 })).rejects.toThrow(
-      /safe integer/,
-    );
-    await expect(t.mutation(api.lib.setRetention, { retentionMs: NaN })).rejects.toThrow();
-    await expect(t.mutation(api.lib.setAlertDefaults, { warnAtPct: 1.1 })).rejects.toThrow();
+    await t.mutation(api.lib.bumpGlobal, {
+      lifetimeNanos: Number.MAX_SAFE_INTEGER,
+    });
+    await expect(
+      t.mutation(api.lib.bumpGlobal, { lifetimeNanos: 1 }),
+    ).rejects.toThrow(/safe integer/);
+    await expect(
+      t.mutation(api.lib.setRetention, { retentionMs: NaN }),
+    ).rejects.toThrow();
+    await expect(
+      t.mutation(api.lib.setAlertDefaults, { warnAtPct: 1.1 }),
+    ).rejects.toThrow();
   });
 
   test("unsafe settlement and tool counts cannot reach the ledger", async () => {
@@ -1184,7 +1386,9 @@ describe("security review regressions", () => {
         serverToolUses: { web_search: Infinity },
       }),
     ).rejects.toThrow();
-    expect((await t.query(api.lib.getRequest, { requestId: r.requestId })).status).toBe("pending");
+    expect(
+      (await t.query(api.lib.getRequest, { requestId: r.requestId })).status,
+    ).toBe("pending");
   });
 
   test("prices are frozen at admission including cache reads, writes and tools", async () => {
@@ -1202,7 +1406,10 @@ describe("security review regressions", () => {
       inputNanosPerMTok: 0,
       outputNanosPerMTok: 0,
     });
-    await t.mutation(api.lib.setServerToolPrice, { tool: "web_search", nanosPerCall: 0 });
+    await t.mutation(api.lib.setServerToolPrice, {
+      tool: "web_search",
+      nanosPerCall: 0,
+    });
     const out = await t.mutation(api.lib.finishRequest, {
       requestId: r.requestId,
       promptTokens: 300,
@@ -1226,7 +1433,10 @@ describe("security review regressions", () => {
       error: "private",
       costNanos: 123,
     });
-    await t.mutation(api.lib.finishRequest, { requestId: r.requestId, costNanos: 999 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: r.requestId,
+      costNanos: 999,
+    });
     await drain(t);
     await t.mutation(internal.lib.rollupPhase, {});
     const req = await t.query(api.lib.getRequest, { requestId: r.requestId });
@@ -1236,8 +1446,12 @@ describe("security review regressions", () => {
     expect(await userOf(t, "u")).toBeUndefined();
     expect(await userOf(t, "erased")).toBeUndefined();
     expect((await bucketOf(t, "action", "shared")).totalSpendNanos).toBe(123);
-    expect((await t.query(api.lib.getGlobalStatus, {})).spentTotalNanos).toBe(123);
-    const events = await t.run(ctx => ctx.db.query("billingEvents").collect());
+    expect((await t.query(api.lib.getGlobalStatus, {})).spentTotalNanos).toBe(
+      123,
+    );
+    const events = await t.run((ctx) =>
+      ctx.db.query("billingEvents").collect(),
+    );
     expect(events).toHaveLength(1);
     expect(events[0].costNanos).toBe(123);
   });
@@ -1251,15 +1465,25 @@ describe("security review regressions", () => {
       reason: "private",
     });
     const r = await start(t, { userId: "u" });
-    await t.mutation(api.lib.finishRequest, { requestId: r.requestId, costNanos: 50 });
+    await t.mutation(api.lib.finishRequest, {
+      requestId: r.requestId,
+      costNanos: 50,
+    });
     await t.mutation(internal.lib.foldTotals, { requestId: r.requestId });
     await t.mutation(api.lib.deleteBucket, { dimension: "user", value: "u" });
     await setUserLimits(t, "u", { dailySpendLimitNanos: 100 });
     await t.mutation(internal.lib.rollupPhase, {});
     expect((await userOf(t, "u")).totalSpendNanos).toBe(0);
-    expect(await t.query(api.lib.usageHistory, { dimension: "user", value: "u", period: "day" }))
-      .toEqual([]);
-    expect(await t.query(api.lib.listAdjustments, { dimension: "user", value: "u" })).toEqual([]);
+    expect(
+      await t.query(api.lib.usageHistory, {
+        dimension: "user",
+        value: "u",
+        period: "day",
+      }),
+    ).toEqual([]);
+    expect(
+      await t.query(api.lib.listAdjustments, { dimension: "user", value: "u" }),
+    ).toEqual([]);
     await t.mutation(api.lib.deleteBucket, { dimension: "user", value: "u" });
     expect(await userOf(t, "u")).toBeUndefined();
   });
@@ -1297,13 +1521,23 @@ describe("security review regressions", () => {
     try {
       vi.setSystemTime(new Date("2026-09-30T23:59:00Z"));
       const t = initTest();
-      await setUserLimits(t, "u", { dailySpendLimitNanos: 1000, monthlySpendLimitNanos: 1000 });
-      await t.mutation(api.lib.adjustBucket, { dimension: "user", value: "u", deltaNanos: -100 });
+      await setUserLimits(t, "u", {
+        dailySpendLimitNanos: 1000,
+        monthlySpendLimitNanos: 1000,
+      });
+      await t.mutation(api.lib.adjustBucket, {
+        dimension: "user",
+        value: "u",
+        deltaNanos: -100,
+      });
       await start(t, { userId: "u", estimatedCostNanos: 100 });
       await t.mutation(internal.lib.globalPhase, {});
       vi.setSystemTime(new Date("2026-10-01T00:01:00Z"));
       await t.mutation(internal.lib.globalPhase, {});
-      const b = await t.query(api.lib.getBucket, { dimension: "user", value: "u" });
+      const b = await t.query(api.lib.getBucket, {
+        dimension: "user",
+        value: "u",
+      });
       expect(b.creditsTodayNanos).toBe(0);
       expect(b.creditsThisMonthNanos).toBe(0);
       expect(b.reservedTodayTokens).toBe(0);
@@ -1323,8 +1557,13 @@ describe("security review regressions", () => {
     expect(again.requestId).toBe(first.requestId);
     expect(again.reused).toBe(true);
     expect((await userOf(t, "u")).pendingCount).toBe(1);
-    await expect(start(t, { userId: "u", idempotencyKey: "job", messages: msg("changed") })).rejects
-      .toThrow(/different arguments/);
+    await expect(
+      start(t, {
+        userId: "u",
+        idempotencyKey: "job",
+        messages: msg("changed"),
+      }),
+    ).rejects.toThrow(/different arguments/);
   });
 
   test("bucket pagination returns all buckets across pages", async () => {
@@ -1338,7 +1577,9 @@ describe("security review regressions", () => {
       dimension: "user",
       paginationOpts: { cursor: first.continueCursor, numItems: 3 },
     });
-    expect(new Set([...first.page, ...second.page].map(b => b.value)).size).toBe(6);
+    expect(
+      new Set([...first.page, ...second.page].map((b) => b.value)).size,
+    ).toBe(6);
     await expect(
       t.query(api.lib.usageHistory, {
         dimension: "user",
@@ -1352,13 +1593,21 @@ describe("security review regressions", () => {
 
 test("explicit reservation policy refuses heuristic spend and token holds", async () => {
   const t = initTest();
-  await t.mutation(api.lib.setDeploymentPolicy, { requireExplicitReservations: true });
-  expect((await start(t, { userId: "u" })).code).toBe("explicit_reservation_required");
+  await t.mutation(api.lib.setDeploymentPolicy, {
+    requireExplicitReservations: true,
+  });
+  expect((await start(t, { userId: "u" })).code).toBe(
+    "explicit_reservation_required",
+  );
   expect((await start(t, { userId: "u", estimatedCostNanos: 100 })).code).toBe(
     "explicit_reservation_required",
   );
   await setUserLimits(t, "u", { dailyTokenLimit: 10 });
-  const r = await start(t, { userId: "u", estimatedCostNanos: 100, estimatedTokens: 10 });
+  const r = await start(t, {
+    userId: "u",
+    estimatedCostNanos: 100,
+    estimatedTokens: 10,
+  });
   expect(r.allowed).toBe(true);
   expect((await userOf(t, "u")).reservedTotalTokens).toBe(10);
 });
@@ -1373,7 +1622,9 @@ test("Unicode prompt and response retention obeys byte limits", async () => {
   });
   const req = await t.query(api.lib.getRequest, { requestId: r.requestId });
   const encode = (text: string) => new TextEncoder().encode(text).length;
-  expect(req.messages.reduce((n, m) => n + encode(m.content), 0)).toBeLessThanOrEqual(16 * 1024);
+  expect(
+    req.messages.reduce((n, m) => n + encode(m.content), 0),
+  ).toBeLessThanOrEqual(16 * 1024);
   expect(encode(req.responseText!)).toBeLessThanOrEqual(16 * 1024);
 });
 
@@ -1386,10 +1637,13 @@ test("the durable billing ledger survives request retention", async () => {
   try {
     vi.advanceTimersByTime(100);
     await t.mutation(internal.lib.retentionPhase, {});
-    expect(await t.query(api.lib.getRequest, { requestId: r.requestId })).toBeNull();
-    expect((await t.query(api.lib.getBillingEvent, { requestId: r.requestId }))?.costNanos).toBe(
-      321,
-    );
+    expect(
+      await t.query(api.lib.getRequest, { requestId: r.requestId }),
+    ).toBeNull();
+    expect(
+      (await t.query(api.lib.getBillingEvent, { requestId: r.requestId }))
+        ?.costNanos,
+    ).toBe(321);
   } finally {
     vi.useRealTimers();
   }
@@ -1397,7 +1651,10 @@ test("the durable billing ledger survives request retention", async () => {
 
 test("admin changes produce actor-attributed audit events", async () => {
   const t = initTest();
-  await t.mutation(api.lib.setGlobalLimits, { dailySpendLimitNanos: 100, actorId: "admin-a" });
+  await t.mutation(api.lib.setGlobalLimits, {
+    dailySpendLimitNanos: 100,
+    actorId: "admin-a",
+  });
   const events = await t.query(api.lib.paginateAdminEvents, {
     paginationOpts: { cursor: null, numItems: 10 },
   });
@@ -1408,16 +1665,20 @@ test("admin changes produce actor-attributed audit events", async () => {
 test("credits do not hide one-nanodollar violations through floating-point cancellation", async () => {
   const t = initTest();
   await setUserLimits(t, "u", { lifetimeSpendLimitNanos: 1 });
-  await t.run(async ctx => {
-    const b = (await ctx.db.query("buckets").withIndex("dim_value", q =>
-      q.eq("dimension", "user").eq("value", "u")).unique())!;
+  await t.run(async (ctx) => {
+    const b = (await ctx.db
+      .query("buckets")
+      .withIndex("dim_value", (q) => q.eq("dimension", "user").eq("value", "u"))
+      .unique())!;
     await ctx.db.patch(b._id, {
       totalSpendNanos: Number.MAX_SAFE_INTEGER,
       creditsNanos: Number.MAX_SAFE_INTEGER,
       reservedTotalNanos: 1,
     });
   });
-  expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed).toBe(false);
+  expect((await start(t, { userId: "u", estimatedCostNanos: 1 })).allowed).toBe(
+    false,
+  );
 });
 
 test("token pricing rounds exact integer intermediates", async () => {
@@ -1433,7 +1694,9 @@ test("token pricing rounds exact integer intermediates", async () => {
     requestId: r.requestId,
     completionTokens: 100_001,
   });
-  expect(out.costNanos).toBe(Number((100_001n * BigInt(rate) + 500_000n) / 1_000_000n));
+  expect(out.costNanos).toBe(
+    Number((100_001n * BigInt(rate) + 500_000n) / 1_000_000n),
+  );
 });
 
 test("raw provider errors require explicit diagnostic retention", async () => {
@@ -1444,9 +1707,9 @@ test("raw provider errors require explicit diagnostic retention", async () => {
     error: "private diagnostic",
     costNanos: 0,
   });
-  expect((await t.query(api.lib.getRequest, { requestId: first.requestId })).error).toBe(
-    "provider_error",
-  );
+  expect(
+    (await t.query(api.lib.getRequest, { requestId: first.requestId })).error,
+  ).toBe("provider_error");
   await t.mutation(api.lib.setDeploymentPolicy, { storeRawErrors: true });
   const second = await start(t, { userId: "u" });
   await t.mutation(api.lib.finishRequest, {
@@ -1454,29 +1717,43 @@ test("raw provider errors require explicit diagnostic retention", async () => {
     error: "retained diagnostic",
     costNanos: 0,
   });
-  expect((await t.query(api.lib.getRequest, { requestId: second.requestId })).error).toBe(
-    "retained diagnostic",
-  );
+  expect(
+    (await t.query(api.lib.getRequest, { requestId: second.requestId })).error,
+  ).toBe("retained diagnostic");
 });
 
 test("long-running jobs retain a full late-settlement horizon after expiry", async () => {
   vi.useFakeTimers();
   try {
     const t = initTest();
-    const r = await start(t, { userId: "u", reserveTtlMs: 10 * 24 * 60 * 60 * 1000 });
+    const r = await start(t, {
+      userId: "u",
+      reserveTtlMs: 10 * 24 * 60 * 60 * 1000,
+    });
     vi.advanceTimersByTime(11 * 24 * 60 * 60 * 1000);
     await t.mutation(internal.lib.expirePhase, {});
     await t.mutation(internal.lib.retentionPhase, {});
-    expect(await t.query(api.lib.getRequest, { requestId: r.requestId })).not.toBeNull();
+    expect(
+      await t.query(api.lib.getRequest, { requestId: r.requestId }),
+    ).not.toBeNull();
     vi.advanceTimersByTime(6 * 24 * 60 * 60 * 1000);
-    const out = await t.mutation(api.lib.finishRequest, { requestId: r.requestId, costNanos: 50 });
+    const out = await t.mutation(api.lib.finishRequest, {
+      requestId: r.requestId,
+      costNanos: 50,
+    });
     expect(out.costNanos).toBe(50);
     await t.mutation(internal.lib.foldTotals, { requestId: r.requestId });
     await t.mutation(internal.lib.retentionPhase, {});
-    expect(await t.query(api.lib.getRequest, { requestId: r.requestId })).toBeNull();
     expect(
-      (await t.mutation(api.lib.finishRequest, { requestId: r.requestId, costNanos: 999 }))
-        .costNanos,
+      await t.query(api.lib.getRequest, { requestId: r.requestId }),
+    ).toBeNull();
+    expect(
+      (
+        await t.mutation(api.lib.finishRequest, {
+          requestId: r.requestId,
+          costNanos: 999,
+        })
+      ).costNanos,
     ).toBe(50);
   } finally {
     vi.useRealTimers();
@@ -1494,9 +1771,13 @@ describe("security review fixes: overflow, audit retention, bounded admin inputs
     await t.run(async (ctx: any) => {
       const b = await ctx.db
         .query("buckets")
-        .withIndex("dim_value", (q: any) => q.eq("dimension", "user").eq("value", "whale"))
+        .withIndex("dim_value", (q: any) =>
+          q.eq("dimension", "user").eq("value", "whale"),
+        )
         .unique();
-      await ctx.db.patch(b._id, { totalSpendNanos: Number.MAX_SAFE_INTEGER - 100 });
+      await ctx.db.patch(b._id, {
+        totalSpendNanos: Number.MAX_SAFE_INTEGER - 100,
+      });
     });
     // Settling a real $0.75 charge would overflow the lifetime total. It must NOT
     // throw (a throw rolls back the fold and makes foldPhase retry forever); it
@@ -1560,15 +1841,21 @@ describe("security review fixes: overflow, audit retention, bounded admin inputs
     const pol = await t.query(api.lib.getModelPolicy, {});
     expect(pol.models.length).toBeLessThanOrEqual(1000);
     expect(pol.models.every((m: string) => m.length <= 256)).toBe(true);
-    const reason: string = await t.run(async (ctx: any) =>
-      (await ctx.db.query("adjustments").collect())[0].reason
+    const reason: string = await t.run(
+      async (ctx: any) =>
+        (await ctx.db.query("adjustments").collect())[0].reason,
     );
-    expect(new TextEncoder().encode(reason).length).toBeLessThanOrEqual(2 * 1024 + 4);
+    expect(new TextEncoder().encode(reason).length).toBeLessThanOrEqual(
+      2 * 1024 + 4,
+    );
     const events = await t.query(api.lib.paginateAdminEvents, {
       paginationOpts: { numItems: 50, cursor: null },
     });
     expect(
-      events.page.every((e: any) => new TextEncoder().encode(e.detailsJson).length <= 8 * 1024 + 4),
+      events.page.every(
+        (e: any) =>
+          new TextEncoder().encode(e.detailsJson).length <= 8 * 1024 + 4,
+      ),
     ).toBe(true);
   });
 });
@@ -1576,9 +1863,15 @@ describe("security review fixes: overflow, audit retention, bounded admin inputs
 describe("security review fixes (round 2): explicit reservations, index, pricing", () => {
   test("M4: requireExplicitReservations rejects a 0/0 (or omitted) reservation", async () => {
     const t = initTest();
-    await t.mutation(api.lib.setDeploymentPolicy, { requireExplicitReservations: true });
+    await t.mutation(api.lib.setDeploymentPolicy, {
+      requireExplicitReservations: true,
+    });
     // A 0/0 reservation reserves nothing — it must be rejected, not admitted.
-    const zero = await start(t, { userId: "u", estimatedCostNanos: 0, estimatedTokens: 0 });
+    const zero = await start(t, {
+      userId: "u",
+      estimatedCostNanos: 0,
+      estimatedTokens: 0,
+    });
     expect(zero.allowed).toBe(false);
     expect(zero.code).toBe("explicit_reservation_required");
     // Omitted bounds: still rejected.
@@ -1586,7 +1879,11 @@ describe("security review fixes (round 2): explicit reservations, index, pricing
     expect(missing.allowed).toBe(false);
     expect(missing.code).toBe("explicit_reservation_required");
     // Positive explicit bounds: admitted.
-    const ok = await start(t, { userId: "u", estimatedCostNanos: 1_000_000, estimatedTokens: 100 });
+    const ok = await start(t, {
+      userId: "u",
+      estimatedCostNanos: 1_000_000,
+      estimatedTokens: 100,
+    });
     expect(ok.allowed).toBe(true);
   });
 
@@ -1594,15 +1891,18 @@ describe("security review fixes (round 2): explicit reservations, index, pricing
     const t = initTest();
     await setUserLimits(t, "a", { dailySpendLimitNanos: 1_000_000_000 });
     await setUserLimits(t, "b", { dailySpendLimitNanos: 1_000_000_000 });
-    const users = (await t.query(api.lib.listBuckets, { dimension: "user" })).map((x: any) =>
-      x.value
-    );
+    const users = (
+      await t.query(api.lib.listBuckets, { dimension: "user" })
+    ).map((x: any) => x.value);
     expect(users.sort()).toEqual(["a", "b"]);
   });
 
   test("server-tool pricing is integer-exact and bounded", async () => {
     const t = initTest();
-    await t.mutation(api.lib.setServerToolPrice, { tool: "image", nanosPerCall: 50_000_000 });
+    await t.mutation(api.lib.setServerToolPrice, {
+      tool: "image",
+      nanosPerCall: 50_000_000,
+    });
     const r = await start(t, { userId: "u" });
     await settleWith(t, r.requestId, {
       promptTokens: 0,
@@ -1620,11 +1920,17 @@ describe("identity upgrades preserve budget enforcement", () => {
     await setUserLimits(t, "same", { dailySpendLimitNanos: 1 });
     for (const userId of ["issuer-a|same", "issuer-b|same"]) {
       const r = await start(t, { userId, legacyUserId: "same" });
-      expect(r).toMatchObject({ allowed: false, code: "identity_migration_required" });
+      expect(r).toMatchObject({
+        allowed: false,
+        code: "identity_migration_required",
+      });
       expect(await userOf(t, userId)).toBeUndefined();
     }
     const legacy = await start(t, { userId: "same" });
-    expect(legacy).toMatchObject({ allowed: false, code: "user_daily_spend_limit" });
+    expect(legacy).toMatchObject({
+      allowed: false,
+      code: "user_daily_spend_limit",
+    });
   });
   test("fresh identities admit normally without an old subject bucket", async () => {
     const t = initTest();
@@ -1636,9 +1942,18 @@ describe("identity upgrades preserve budget enforcement", () => {
 test("issuer migration cannot bypass a legacy deletion marker", async () => {
   const t = initTest();
   await setUserLimits(t, "deleted-subject", {});
-  await t.mutation(api.lib.deleteBucket, { dimension: "user", value: "deleted-subject" });
-  const r = await start(t, { userId: "issuer|deleted-subject", legacyUserId: "deleted-subject" });
-  expect(r).toMatchObject({ allowed: false, code: "identity_migration_required" });
+  await t.mutation(api.lib.deleteBucket, {
+    dimension: "user",
+    value: "deleted-subject",
+  });
+  const r = await start(t, {
+    userId: "issuer|deleted-subject",
+    legacyUserId: "deleted-subject",
+  });
+  expect(r).toMatchObject({
+    allowed: false,
+    code: "identity_migration_required",
+  });
   expect(await userOf(t, "issuer|deleted-subject")).toBeUndefined();
 });
 
@@ -1646,20 +1961,28 @@ describe("1.1.1 fixes: failure billing, default prices, global enforcement", () 
   test("B4: a failed call is NOT charged its reserved estimate", async () => {
     const t = initTest();
     await setUserLimits(t, "fail-u", { dailySpendLimitNanos: 1_000_000_000 });
-    const r = await start(t, { userId: "fail-u", estimatedCostNanos: 500_000_000 }); // reserve $0.50
+    const r = await start(t, {
+      userId: "fail-u",
+      estimatedCostNanos: 500_000_000,
+    }); // reserve $0.50
     expect(r.allowed).toBe(true);
     await settleWith(t, r.requestId, { error: "provider boom" }); // failed, no usage signal
     const u = await userOf(t, "fail-u");
     expect(u.totalSpendNanos).toBe(0); // no charge on failure
     expect(u.reservedTotalNanos ?? 0).toBe(0); // reservation released
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.status).toBe("error");
     expect(req.costNanos).toBe(0);
   });
 
   test("B4: a SUCCESSFUL no-usage call still falls back to the reserved estimate", async () => {
     const t = initTest();
-    const r = await start(t, { userId: "succ-u", estimatedCostNanos: 500_000_000 });
+    const r = await start(t, {
+      userId: "succ-u",
+      estimatedCostNanos: 500_000_000,
+    });
     expect(r.allowed).toBe(true);
     await settleWith(t, r.requestId, {}); // success, no tokens/cost signal
     const u = await userOf(t, "succ-u");
@@ -1668,11 +1991,16 @@ describe("1.1.1 fixes: failure billing, default prices, global enforcement", () 
 
   test("B6: current models carry real default prices (not the fallback)", async () => {
     const t = initTest();
-    const r = await start(t, { userId: "s5", model: "anthropic/claude-sonnet-5" });
+    const r = await start(t, {
+      userId: "s5",
+      model: "anthropic/claude-sonnet-5",
+    });
     await settle(t, r.requestId, 1_000_000, 1_000_000); // 1M in + 1M out
     const u = await userOf(t, "s5");
     expect(u.totalSpendNanos).toBe(18_000_000_000); // $3 in + $15 out, NOT the $90 fallback
-    const req = (await t.query(api.lib.getRequest, { requestId: r.requestId }))!;
+    const req = (await t.query(api.lib.getRequest, {
+      requestId: r.requestId,
+    }))!;
     expect(req.unpricedModel).not.toBe(true);
   });
 

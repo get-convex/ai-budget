@@ -2,7 +2,10 @@ import { httpRouter } from "convex/server";
 import { expect, test, vi } from "vitest";
 
 vi.mock("ai", () => ({
-  generateText: vi.fn(async () => ({ text: "ok", usage: { inputTokens: 1, outputTokens: 1 } })),
+  generateText: vi.fn(async () => ({
+    text: "ok",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  })),
   wrapLanguageModel: (options: unknown) => options,
 }));
 vi.mock("@convex-dev/ai-sdk-provider", () => ({ convexGateway: () => ({}) }));
@@ -16,13 +19,15 @@ const component = {
     setBucketLimits: "limits",
   },
 } as any;
-const makeCtx = (identity: any = { tokenIdentifier: "issuer|u", subject: "u" }) => ({
+const makeCtx = (
+  identity: any = { tokenIdentifier: "issuer|u", subject: "u" },
+) => ({
   auth: { getUserIdentity: async () => identity },
   runQuery: vi.fn(),
   runMutation: vi.fn(async (fn: string, _args: any) =>
     fn === "start"
       ? { allowed: true, requestId: "r", warnings: [], notices: [] }
-      : { costNanos: 42 }
+      : { costNanos: 42 },
   ),
 });
 
@@ -45,8 +50,12 @@ test("default identity includes the issuer and explicit IDs remain host-owned", 
 
 test("legacy subject keys require an explicit migration option", async () => {
   const ctx = makeCtx({ subject: "u" });
-  await expect(new AIBudget(component).begin(ctx as any, { model: "m" })).rejects.toThrow();
-  await new AIBudget(component, { identityKey: "subject" }).begin(ctx as any, { model: "m" });
+  await expect(
+    new AIBudget(component).begin(ctx as any, { model: "m" }),
+  ).rejects.toThrow();
+  await new AIBudget(component, { identityKey: "subject" }).begin(ctx as any, {
+    model: "m",
+  });
   expect(ctx.runMutation.mock.calls[0][1].userId).toBe("u");
   expect(ctx.runMutation.mock.calls[0][1].legacyUserId).toBeUndefined();
 });
@@ -59,7 +68,10 @@ test("raw Anthropic usage includes fresh, cache-read and cache-write tokens", as
       input_tokens: 10,
       cache_read_input_tokens: 100,
       cache_creation_input_tokens: 20,
-      cache_creation: { ephemeral_1h_input_tokens: 5, ephemeral_5m_input_tokens: 15 },
+      cache_creation: {
+        ephemeral_1h_input_tokens: 5,
+        ephemeral_5m_input_tokens: 15,
+      },
       output_tokens: 3,
     },
   });
@@ -74,24 +86,36 @@ test("raw Anthropic usage includes fresh, cache-read and cache-write tokens", as
 
 test("meter refuses to repeat a provider side effect on reused admission", async () => {
   const ctx = makeCtx();
-  ctx.runMutation.mockResolvedValueOnce(
-    { allowed: true, requestId: "r", reused: true, warnings: [], notices: [] } as any,
-  );
+  ctx.runMutation.mockResolvedValueOnce({
+    allowed: true,
+    requestId: "r",
+    reused: true,
+    warnings: [],
+    notices: [],
+  } as any);
   const run = vi.fn();
   await expect(
-    new AIBudget(component).meter(ctx as any, {
-      userId: "u",
-      model: "m",
-      messages: [],
-      idempotencyKey: "job",
-    }, run),
-  ).rejects.toMatchObject({ data: { kind: "AIBudgetDuplicate", requestId: "r" } });
+    new AIBudget(component).meter(
+      ctx as any,
+      {
+        userId: "u",
+        model: "m",
+        messages: [],
+        idempotencyKey: "job",
+      },
+      run,
+    ),
+  ).rejects.toMatchObject({
+    data: { kind: "AIBudgetDuplicate", requestId: "r" },
+  });
   expect(run).not.toHaveBeenCalled();
 });
 
 async function streamHarness(source: ReadableStream) {
   const ctx = makeCtx();
-  const model = new AIBudget(component).languageModel(ctx as any, { userId: "u" }) as any;
+  const model = new AIBudget(component).languageModel(ctx as any, {
+    userId: "u",
+  }) as any;
   const result = await model.middleware.wrapStream({
     params: { prompt: [{ role: "user", content: "prompt" }] },
     doStream: async () => ({ stream: source }),
@@ -116,7 +140,9 @@ test("a normal stream records final authoritative usage once", async () => {
     }),
   );
   const reader = stream.getReader();
-  while (!(await reader.read()).done) { /* consume */ }
+  while (!(await reader.read()).done) {
+    /* consume */
+  }
   expect(finishes(ctx)).toHaveLength(1);
   expect(finishes(ctx)[0][1]).toMatchObject({
     promptTokens: 10,
@@ -162,13 +188,18 @@ test("an error chunk followed by final usage retains authoritative billing", asy
     new ReadableStream({
       start(controller) {
         controller.enqueue({ type: "error", error: "provider error" });
-        controller.enqueue({ type: "finish", usage: { inputTokens: 123, outputTokens: 456 } });
+        controller.enqueue({
+          type: "finish",
+          usage: { inputTokens: 123, outputTokens: 456 },
+        });
         controller.close();
       },
     }),
   );
   const reader = stream.getReader();
-  while (!(await reader.read()).done) { /* consume */ }
+  while (!(await reader.read()).done) {
+    /* consume */
+  }
   expect(finishes(ctx)).toHaveLength(1);
   expect(finishes(ctx)[0][1]).toMatchObject({
     error: "provider error",
@@ -199,18 +230,30 @@ test("cookie-authorized dashboard mutations require same-origin JSON", async () 
       new Request("https://app.test/aibudget/api/global/setLimits", {
         method: "POST",
         headers,
-        body: "{\"dailySpendLimitNanos\":null}",
+        body: '{"dailySpendLimitNanos":null}',
       }),
     );
-  expect((await invoke({ origin: "https://evil.test", "content-type": "text/plain" })).status).toBe(
-    403,
-  );
-  expect((await invoke({ origin: "https://app.test", "content-type": "text/plain" })).status).toBe(
-    415,
-  );
+  expect(
+    (
+      await invoke({
+        origin: "https://evil.test",
+        "content-type": "text/plain",
+      })
+    ).status,
+  ).toBe(403);
+  expect(
+    (await invoke({ origin: "https://app.test", "content-type": "text/plain" }))
+      .status,
+  ).toBe(415);
   expect(ctx.runMutation).not.toHaveBeenCalled();
-  expect((await invoke({ origin: "https://app.test", "content-type": "application/json" })).status)
-    .toBe(200);
+  expect(
+    (
+      await invoke({
+        origin: "https://app.test",
+        "content-type": "application/json",
+      })
+    ).status,
+  ).toBe(200);
   expect(ctx.runMutation.mock.calls[0][1]).toEqual({
     dailySpendLimitNanos: null,
     actorId: "issuer|u",
@@ -226,7 +269,10 @@ test("SDK middleware reserves explicit bounds and limits provider output", async
     params: { maxOutputTokens: 500, prompt: [] },
   });
   expect(params.maxOutputTokens).toBe(100);
-  await model.middleware.wrapGenerate({ params, doGenerate: async () => ({ usage: {} }) });
+  await model.middleware.wrapGenerate({
+    params,
+    doGenerate: async () => ({ usage: {} }),
+  });
   expect(ctx.runMutation.mock.calls[0][1]).toMatchObject({
     estimatedCostNanos: 1000,
     estimatedTokens: 300,
@@ -253,6 +299,10 @@ test("provider-level structured cache usage is normalized", async () => {
 
 test("admin wrappers derive the audit actor from the authenticated identity", async () => {
   const ctx = makeCtx();
-  await new AIBudget(component).global.setLimits(ctx as any, { dailySpendLimitNanos: 1 });
-  expect(ctx.runMutation.mock.calls[0][1]).toMatchObject({ actorId: "issuer|u" });
+  await new AIBudget(component).global.setLimits(ctx as any, {
+    dailySpendLimitNanos: 1,
+  });
+  expect(ctx.runMutation.mock.calls[0][1]).toMatchObject({
+    actorId: "issuer|u",
+  });
 });

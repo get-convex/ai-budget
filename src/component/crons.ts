@@ -9,7 +9,7 @@ crons.interval(
   "reconcile ai gateway spend",
   { minutes: 1 },
   internal.lib.reconcile,
-  {}
+  {},
 );
 
 export default crons;

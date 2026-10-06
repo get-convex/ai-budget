@@ -50,7 +50,9 @@ export default defineSchema({
     dimension: v.string(),
     value: v.string(),
     deleting: v.boolean(),
-  }).index("dim_value", ["dimension", "value"]).index("deleting", ["deleting"]),
+  })
+    .index("dim_value", ["dimension", "value"])
+    .index("deleting", ["deleting"]),
   bucketPolicies: defineTable({
     bucketId: v.id("buckets"),
     reconciling: v.optional(v.boolean()),
@@ -70,7 +72,9 @@ export default defineSchema({
     warnAtPct: v.optional(v.number()),
     // "hard" (default): exceeding a budget blocks. "soft": warn but allow.
     enforcement: v.optional(v.union(v.literal("hard"), v.literal("soft"))),
-  }).index("dim_value", ["dimension", "value"]).index("reconciling", ["reconciling"]),
+  })
+    .index("dim_value", ["dimension", "value"])
+    .index("reconciling", ["reconciling"]),
   // A budget holder, keyed by (dimension, value). Unifies what used to be the
   // `users` and `actions` tables — those are just the "user" and "action"
   // dimensions now. Any tag a request carries can have its own budget here.
@@ -196,7 +200,13 @@ export default defineSchema({
     model: v.string(),
     privacyErased: v.optional(v.boolean()),
     attributedBuckets: v.optional(
-      v.array(v.object({ dimension: v.string(), value: v.string(), bucketId: v.id("buckets") })),
+      v.array(
+        v.object({
+          dimension: v.string(),
+          value: v.string(),
+          bucketId: v.id("buckets"),
+        }),
+      ),
     ),
     priceSnapshot: v.optional(
       v.object({
@@ -266,7 +276,11 @@ export default defineSchema({
     .index("status", ["status"])
     .index("status_expires", ["status", "expiresAt"])
     .index("retention", ["reservationExpired", "settled"])
-    .index("retention_expiredAt", ["reservationExpired", "settled", "expiredAt"])
+    .index("retention_expiredAt", [
+      "reservationExpired",
+      "settled",
+      "expiredAt",
+    ])
     .index("expired_content", ["reservationExpired", "contentPurged"])
     .index("rerunOf", ["rerunOf"])
     .index("actionName", ["actionName"])
@@ -290,11 +304,7 @@ export default defineSchema({
     // "open": any model allowed. "allowlist": only listed models.
     // "denylist": any model except the listed ones.
     modelMode: v.optional(
-      v.union(
-        v.literal("open"),
-        v.literal("allowlist"),
-        v.literal("denylist"),
-      ),
+      v.union(v.literal("open"), v.literal("allowlist"), v.literal("denylist")),
     ),
     models: v.optional(v.array(v.string())),
     // Deployment-wide ("global") spend cap across ALL requests. Running totals
