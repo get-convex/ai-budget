@@ -160,7 +160,8 @@ const noUngovernedAi: Rule.RuleModule = {
     const isAllowedFile = makeFileMatcher(opts.allow ?? []);
 
     const filename =
-      (context as { filename?: string }).filename ?? context.getFilename();
+      context.filename ??
+      (context as unknown as { getFilename(): string }).getFilename();
     if (isAllowedFile(filename)) return {};
 
     function check(sourceNode: Node | null | undefined, reportNode: Node) {
