@@ -17,7 +17,8 @@ const evalTags = (runId: string) => [
   { dimension: "workload", value: "evaluation" },
 ];
 
-const SYSTEM_PROMPT = "You are a concise, friendly assistant. Keep replies short.";
+const SYSTEM_PROMPT =
+  "You are a concise, friendly assistant. Keep replies short.";
 
 export const sendMessage = action({
   args: {
@@ -104,17 +105,26 @@ export const burst = action({
             tags: [{ dimension: "burst", value: runId }],
             messages: [
               { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: BURST_PROMPTS[i % BURST_PROMPTS.length] },
+              {
+                role: "user",
+                content: BURST_PROMPTS[i % BURST_PROMPTS.length],
+              },
             ],
           })
           .then(
-            (r) => ({ index: i, ok: true as const, costNanos: r.costNanos, text: r.text }),
+            (r) => ({
+              index: i,
+              ok: true as const,
+              costNanos: r.costNanos,
+              text: r.text,
+            }),
             (e: any) => ({
               index: i,
               ok: false as const,
               reason: String(e?.data?.reason ?? e?.message ?? e),
             }),
-          )),
+          ),
+      ),
     );
     const admitted = results.filter((r) => r.ok);
     return {
@@ -122,7 +132,10 @@ export const burst = action({
       requested: n,
       admitted: admitted.length,
       rejected: n - admitted.length,
-      totalCostNanos: admitted.reduce((s, r) => s + (r.ok ? r.costNanos ?? 0 : 0), 0),
+      totalCostNanos: admitted.reduce(
+        (s, r) => s + (r.ok ? (r.costNanos ?? 0) : 0),
+        0,
+      ),
       results,
     };
   },
@@ -141,7 +154,9 @@ export const experiment = action({
   handler: async (ctx, { userId, prompt, systems, models }) => {
     const sys = systems?.length ? systems : [SYSTEM_PROMPT];
     const mods = models?.length ? models : ["openai/gpt-4o-mini"];
-    const combos = sys.flatMap((system) => mods.map((model) => ({ system, model })));
+    const combos = sys.flatMap((system) =>
+      mods.map((model) => ({ system, model })),
+    );
     const runId = await ctx.runMutation(evalStore.createRun, {
       kind: "matrix",
       configJson: JSON.stringify({ prompt, systems: sys, models: mods }),
@@ -181,7 +196,10 @@ export const experiment = action({
             caseId,
             candidate: system,
             model,
-            outputJson: JSON.stringify({ text: r.text, requestId: r.requestId }),
+            outputJson: JSON.stringify({
+              text: r.text,
+              requestId: r.requestId,
+            }),
             costNanos: r.costNanos,
           });
           return result;
@@ -225,7 +243,12 @@ export const judge = action({
     const judgeModel = model ?? "openai/gpt-4o";
     const runId = await ctx.runMutation(evalStore.createRun, {
       kind: "judge",
-      configJson: JSON.stringify({ prompt, candidates, criteria: rubric, model: judgeModel }),
+      configJson: JSON.stringify({
+        prompt,
+        candidates,
+        criteria: rubric,
+        model: judgeModel,
+      }),
       budgetTagDimension: "evalRun",
     });
     const caseId = await ctx.runMutation(evalStore.addCase, {
@@ -245,8 +268,7 @@ export const judge = action({
         messages: [
           {
             role: "system",
-            content:
-              `You are an impartial evaluator. Rank the candidate responses by how well they meet these criteria: "${rubric}". Respond ONLY as JSON: {"winner":"<label>","rationale":"<one sentence>","ranking":["<label>", ...]}.`,
+            content: `You are an impartial evaluator. Rank the candidate responses by how well they meet these criteria: "${rubric}". Respond ONLY as JSON: {"winner":"<label>","rationale":"<one sentence>","ranking":["<label>", ...]}.`,
           },
           {
             role: "user",
@@ -279,7 +301,10 @@ export const judge = action({
     } catch (error) {
       await ctx.runMutation(evalStore.completeRun, {
         runId,
-        status: (error as any)?.data?.kind === "AIBudgetLimit" ? "budget_exhausted" : "failed",
+        status:
+          (error as any)?.data?.kind === "AIBudgetLimit"
+            ? "budget_exhausted"
+            : "failed",
         error: String(error),
       });
       throw error;
@@ -299,7 +324,10 @@ export const backtest = action({
     model: v.optional(v.string()),
     limit: v.optional(v.number()),
   },
-  handler: async (ctx, { action: targetAction, newSystem, criteria, model, limit }) => {
+  handler: async (
+    ctx,
+    { action: targetAction, newSystem, criteria, model, limit },
+  ) => {
     const rubric = criteria?.trim() || "overall quality and helpfulness";
     const N = Math.min(Math.max(1, Math.floor(limit ?? 5)), 10);
     const recent = await ai.requests.list(ctx, {
@@ -309,18 +337,19 @@ export const backtest = action({
     });
     // Fetch only a bounded corpus; production adapters must authorize each detail read.
     const details = await Promise.all(
-      recent.filter(r => r.status === "success").slice(0, N).map(r =>
-        ai.requests.get(ctx, { requestId: r._id })
-      ),
+      recent
+        .filter((r) => r.status === "success")
+        .slice(0, N)
+        .map((r) => ai.requests.get(ctx, { requestId: r._id })),
     );
     const all = details.filter((r): r is NonNullable<typeof r> => r !== null);
     const sample = all
       .filter(
         (r: any) =>
-          r.status === "success"
-          && r.actionName === targetAction
-          && r.responseText
-          && r.messages?.some((m: any) => m.role === "user"),
+          r.status === "success" &&
+          r.actionName === targetAction &&
+          r.responseText &&
+          r.messages?.some((m: any) => m.role === "user"),
       )
       .slice(0, N);
 
@@ -371,14 +400,15 @@ export const backtest = action({
             messages: [
               {
                 role: "system",
-                content:
-                  `Two assistant responses answer the same user request. Which better meets these criteria: "${rubric}"? Respond ONLY JSON: {"better":"original"|"new"|"tie","why":"<short>"}.`,
+                content: `Two assistant responses answer the same user request. Which better meets these criteria: "${rubric}"? Respond ONLY JSON: {"better":"original"|"new"|"tie","why":"<short>"}.`,
               },
               {
                 role: "user",
-                content: `Request:\n${
-                  convo.map((m: any) => `${m.role}: ${m.content}`).join("\n")
-                }\n\nORIGINAL:\n${r.responseText}\n\nNEW:\n${rr.text}`,
+                content: `Request:\n${convo
+                  .map((m: any) => `${m.role}: ${m.content}`)
+                  .join(
+                    "\n",
+                  )}\n\nORIGINAL:\n${r.responseText}\n\nNEW:\n${rr.text}`,
               },
             ],
           });
@@ -401,7 +431,10 @@ export const backtest = action({
             caseId: caseIds[index],
             candidate: newSystem,
             model: model ?? r.model,
-            outputJson: JSON.stringify({ original: r.responseText, updated: rr.text }),
+            outputJson: JSON.stringify({
+              original: r.responseText,
+              updated: rr.text,
+            }),
             verdict: v2.better,
             rationale: v2.why,
             costNanos: result.costNanos,
@@ -427,8 +460,10 @@ export const backtest = action({
     const summary = {
       results,
       total: results.length,
-      improved: results.filter((r) => "better" in r && r.better === "new").length,
-      regressed: results.filter((r) => "better" in r && r.better === "original").length,
+      improved: results.filter((r) => "better" in r && r.better === "new")
+        .length,
+      regressed: results.filter((r) => "better" in r && r.better === "original")
+        .length,
     };
     await ctx.runMutation(evalStore.completeRun, {
       runId,
@@ -460,7 +495,15 @@ export const evolve = action({
   },
   handler: async (
     ctx,
-    { action: targetAction, goal, criteria, seedSystem, rounds, sampleSize, budgetNanos },
+    {
+      action: targetAction,
+      goal,
+      criteria,
+      seedSystem,
+      rounds,
+      sampleSize,
+      budgetNanos,
+    },
   ) => {
     const rubric = criteria?.trim() || goal;
     const maxRounds = Math.min(rounds ?? 4, 8);
@@ -474,17 +517,18 @@ export const evolve = action({
     });
     // Fetch only a bounded corpus; production adapters must authorize each detail read.
     const details = await Promise.all(
-      recent.filter(r => r.status === "success").slice(0, N).map(r =>
-        ai.requests.get(ctx, { requestId: r._id })
-      ),
+      recent
+        .filter((r) => r.status === "success")
+        .slice(0, N)
+        .map((r) => ai.requests.get(ctx, { requestId: r._id })),
     );
     const all = details.filter((r): r is NonNullable<typeof r> => r !== null);
     const sample = all
       .filter(
         (r: any) =>
-          r.status === "success"
-          && r.actionName === targetAction
-          && r.messages?.some((m: any) => m.role === "user"),
+          r.status === "success" &&
+          r.actionName === targetAction &&
+          r.messages?.some((m: any) => m.role === "user"),
       )
       .slice(0, N)
       .map((r: any) => ({
@@ -556,21 +600,25 @@ export const evolve = action({
           messages: [
             {
               role: "system",
-              content:
-                `Rate 0-10 how well the response meets these criteria: "${rubric}". Respond ONLY JSON {"score":<number>}.`,
+              content: `Rate 0-10 how well the response meets these criteria: "${rubric}". Respond ONLY JSON {"score":<number>}.`,
             },
             {
               role: "user",
-              content: `User: ${
-                s.convo.map((m: any) => m.content).join(" ")
-              }\n\nResponse: ${gen.text}`,
+              content: `User: ${s.convo
+                .map((m: any) => m.content)
+                .join(" ")}\n\nResponse: ${gen.text}`,
             },
           ],
         });
         let sc = 0;
         try {
-          sc = Number(JSON.parse(jr.text.match(/\{[\s\S]*\}/)?.[0] ?? "{}").score) || 0;
-        } catch {}
+          sc =
+            Number(
+              JSON.parse(jr.text.match(/\{[\s\S]*\}/)?.[0] ?? "{}").score,
+            ) || 0;
+        } catch {
+          // ignore
+        }
         total += sc;
       }
       return { avg: total / sample.length, outs };
@@ -589,7 +637,12 @@ export const evolve = action({
         }
         const spentBeforeRound = spent;
         const { avg, outs } = await scoreSystem(current);
-        history.push({ round: round + 1, system: current, score: avg, spentNanos: spent });
+        history.push({
+          round: round + 1,
+          system: current,
+          score: avg,
+          spentNanos: spent,
+        });
         await ctx.runMutation(evalStore.recordResult, {
           runId,
           candidate: current,
@@ -608,23 +661,26 @@ export const evolve = action({
           messages: [
             {
               role: "system",
-              content:
-                `You refine system prompts toward a goal: "${goal}". Given the current prompt (scored ${
-                  avg.toFixed(1)
-                }/10) and sample outputs, propose a better system prompt. Respond ONLY JSON {"system":"<new prompt>"}.`,
+              content: `You refine system prompts toward a goal: "${goal}". Given the current prompt (scored ${avg.toFixed(
+                1,
+              )}/10) and sample outputs, propose a better system prompt. Respond ONLY JSON {"system":"<new prompt>"}.`,
             },
             {
               role: "user",
-              content: `Current system prompt:\n${current}\n\nSample outputs:\n${
-                outs.map((o) => `- ${o.slice(0, 140)}`).join("\n")
-              }`,
+              content: `Current system prompt:\n${current}\n\nSample outputs:\n${outs
+                .map((o) => `- ${o.slice(0, 140)}`)
+                .join("\n")}`,
             },
           ],
         });
         let next: string | undefined;
         try {
-          next = JSON.parse(prop.text.match(/\{[\s\S]*\}/s)?.[0] ?? "{}").system;
-        } catch {}
+          next = JSON.parse(
+            prop.text.match(/\{[\s\S]*\}/s)?.[0] ?? "{}",
+          ).system;
+        } catch {
+          // ignore
+        }
         if (!next) break;
         current = next;
       }
@@ -639,7 +695,13 @@ export const evolve = action({
         throw e;
       }
     }
-    const summary = { history, best, spentNanos: spent, stopped, corpusSize: sample.length };
+    const summary = {
+      history,
+      best,
+      spentNanos: spent,
+      stopped,
+      corpusSize: sample.length,
+    };
     await ctx.runMutation(evalStore.completeRun, {
       runId,
       status: stopped === "budget" ? "budget_exhausted" : "completed",
@@ -728,7 +790,7 @@ export const syncPrices = action({
   args: {},
   handler: async (ctx) => {
     const res = await fetch("https://openrouter.ai/api/v1/models");
-    const { data } = (await res.json()) as { data: any[]; };
+    const { data } = (await res.json()) as { data: any[] };
     const byId = new Map(data.map((m) => [m.id, m]));
     const models = [
       "openai/gpt-4o-mini",
@@ -744,7 +806,11 @@ export const syncPrices = action({
       if (!p) continue;
       const inputNanosPerMTok = Math.round(Number(p.prompt) * 1e15);
       const outputNanosPerMTok = Math.round(Number(p.completion) * 1e15);
-      await ai.prices.set(ctx, { model, inputNanosPerMTok, outputNanosPerMTok });
+      await ai.prices.set(ctx, {
+        model,
+        inputNanosPerMTok,
+        outputNanosPerMTok,
+      });
       updated.push({ model, inputNanosPerMTok, outputNanosPerMTok });
     }
     return { updated };
@@ -780,7 +846,9 @@ export const setGlobalLimits = mutation({
   args: {
     dailySpendLimitNanos: v.optional(v.number()),
     lifetimeSpendLimitNanos: v.optional(v.number()),
-    enforcement: v.optional(v.union(v.literal("approximate"), v.literal("soft"))),
+    enforcement: v.optional(
+      v.union(v.literal("approximate"), v.literal("soft")),
+    ),
   },
   handler: async (ctx, args) => {
     await ai.global.setLimits(ctx, args);
@@ -844,7 +912,8 @@ export const adjust = mutation({
 
 export const listAdjustments = query({
   args: { dimension: v.string(), value: v.string() },
-  handler: async (ctx, { dimension, value }) => ai.tag(dimension).adjustments(ctx, { value }),
+  handler: async (ctx, { dimension, value }) =>
+    ai.tag(dimension).adjustments(ctx, { value }),
 });
 
 export const setAlertDefaults = mutation({

@@ -14,7 +14,9 @@ const MODELS = [
 // All money is integer nanodollars (1 USD = 1e9).
 const NANOS = 1e9;
 const usd = (nanos: number | undefined) =>
-  nanos === undefined ? "—" : `$${(nanos / NANOS).toFixed(nanos < NANOS / 100 ? 6 : 2)}`;
+  nanos === undefined
+    ? "—"
+    : `$${(nanos / NANOS).toFixed(nanos < NANOS / 100 ? 6 : 2)}`;
 // aliases kept so existing call sites render nanodollars as USD
 const cents = usd;
 const dollars = usd;
@@ -44,10 +46,14 @@ export default function App() {
           background: "var(--panel)",
         }}
       >
-        <header style={{ padding: 16, borderBottom: "1px solid var(--border)" }}>
+        <header
+          style={{ padding: 16, borderBottom: "1px solid var(--border)" }}
+        >
           <h1 style={{ fontSize: 18 }}>
             ☂️ Worry-Free AI{" "}
-            <span style={{ color: "var(--muted)", fontWeight: 400, fontSize: 13 }}>
+            <span
+              style={{ color: "var(--muted)", fontWeight: 400, fontSize: 13 }}
+            >
               convex component demo
             </span>
           </h1>
@@ -71,7 +77,14 @@ export default function App() {
         <Chat userId={userId} model={model} />
       </div>
 
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+        }}
+      >
         <div
           style={{
             display: "flex",
@@ -112,7 +125,12 @@ export default function App() {
           >
             ⚡ Burst
           </button>
-          <button className={tab === "jev" ? "" : "ghost"} onClick={() => setTab("jev")}>Jev</button>
+          <button
+            className={tab === "jev" ? "" : "ghost"}
+            onClick={() => setTab("jev")}
+          >
+            Jev
+          </button>
           <Totals />
         </div>
         <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
@@ -153,17 +171,28 @@ function Chat({ userId, model }: { userId: string; model: string }) {
     // prior turns become history so the stored request holds the full chain
     const history = entries
       .filter((e) => e.who !== "error")
-      .map((e) => ({ role: e.who === "user" ? "user" : "assistant", content: e.text }));
+      .map((e) => ({
+        role: e.who === "user" ? "user" : "assistant",
+        content: e.text,
+      }));
     push({ who: "user", text: prompt });
     setBusy(true);
     try {
       const res = await send({ userId, prompt, history, model });
-      push({ who: "ai", text: res.text, costNanos: res.costNanos, warnings: res.warnings });
+      push({
+        who: "ai",
+        text: res.text,
+        costNanos: res.costNanos,
+        warnings: res.warnings,
+      });
     } catch (e: any) {
       const data = e?.data;
       push({
         who: "error",
-        text: data?.kind === "AIBudgetLimit" ? `🚫 ${data.reason}` : String(e?.message ?? e),
+        text:
+          data?.kind === "AIBudgetLimit"
+            ? `🚫 ${data.reason}`
+            : String(e?.message ?? e),
       });
     } finally {
       setBusy(false);
@@ -172,10 +201,26 @@ function Chat({ userId, model }: { userId: string; model: string }) {
 
   return (
     <>
-      <div style={{ flex: 1, overflow: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div
+        style={{
+          flex: 1,
+          overflow: "auto",
+          padding: 16,
+          display: "flex",
+          flexDirection: "column",
+          gap: 10,
+        }}
+      >
         {entries.length === 0 && (
-          <div style={{ color: "var(--muted)", textAlign: "center", marginTop: 40 }}>
-            Chat as <b>{userId}</b> — every call is tracked, priced, and limit-checked.
+          <div
+            style={{
+              color: "var(--muted)",
+              textAlign: "center",
+              marginTop: 40,
+            }}
+          >
+            Chat as <b>{userId}</b> — every call is tracked, priced, and
+            limit-checked.
           </div>
         )}
         {entries.map((m, i) => (
@@ -198,14 +243,18 @@ function Chat({ userId, model }: { userId: string; model: string }) {
           >
             {m.text}
             {m.warnings && m.warnings.length > 0 && (
-              <div style={{ fontSize: 11, color: "var(--accent2)", marginTop: 4 }}>
+              <div
+                style={{ fontSize: 11, color: "var(--accent2)", marginTop: 4 }}
+              >
                 {m.warnings.map((w, j) => (
                   <div key={j}>⚠ {w}</div>
                 ))}
               </div>
             )}
             {m.costNanos !== undefined && (
-              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+              <div
+                style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}
+              >
                 cost: {cents(m.costNanos)}
               </div>
             )}
@@ -213,7 +262,14 @@ function Chat({ userId, model }: { userId: string; model: string }) {
         ))}
         {busy && <div style={{ color: "var(--muted)" }}>thinking…</div>}
       </div>
-      <div style={{ display: "flex", gap: 8, padding: 16, borderTop: "1px solid var(--border)" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          padding: 16,
+          borderTop: "1px solid var(--border)",
+        }}
+      >
         <input
           style={{ flex: 1 }}
           value={input}
@@ -233,12 +289,19 @@ function Chat({ userId, model }: { userId: string; model: string }) {
             try {
               const text = entries.map((e) => `${e.who}: ${e.text}`).join("\n");
               const res = await summarize({ userId, text });
-              push({ who: "ai", text: `📝 ${res.text}`, costNanos: res.costNanos });
+              push({
+                who: "ai",
+                text: `📝 ${res.text}`,
+                costNanos: res.costNanos,
+              });
             } catch (e: any) {
               const data = e?.data;
               push({
                 who: "error",
-                text: data?.kind === "AIBudgetLimit" ? `🚫 ${data.reason}` : String(e?.message ?? e),
+                text:
+                  data?.kind === "AIBudgetLimit"
+                    ? `🚫 ${data.reason}`
+                    : String(e?.message ?? e),
               });
             } finally {
               setBusy(false);
@@ -258,7 +321,8 @@ function Totals() {
   const requests = users.reduce((s: number, u: any) => s + u.totalRequests, 0);
   return (
     <div style={{ marginLeft: "auto", color: "var(--muted)", fontSize: 13 }}>
-      {requests} requests · total spend <b style={{ color: "var(--accent2)" }}>{dollars(total)}</b>
+      {requests} requests · total spend{" "}
+      <b style={{ color: "var(--accent2)" }}>{dollars(total)}</b>
     </div>
   );
 }
@@ -285,7 +349,9 @@ function Requests() {
         <tbody>
           {requests.map((r: any) => (
             <tr key={r._id}>
-              <td className="mono">{new Date(r._creationTime).toLocaleTimeString()}</td>
+              <td className="mono">
+                {new Date(r._creationTime).toLocaleTimeString()}
+              </td>
               <td>{r.userId}</td>
               <td className="mono">{r.actionName ?? "—"}</td>
               <td className="mono">
@@ -301,12 +367,27 @@ function Requests() {
               </td>
               <td>
                 <span className={`pill ${r.status}`}>{r.status}</span>
-                {r.rerunOf && <span style={{ marginLeft: 6, fontSize: 11, color: "var(--muted)" }}>rerun</span>}
+                {r.rerunOf && (
+                  <span
+                    style={{
+                      marginLeft: 6,
+                      fontSize: 11,
+                      color: "var(--muted)",
+                    }}
+                  >
+                    rerun
+                  </span>
+                )}
               </td>
               <td className="mono">
-                {r.promptTokens !== undefined ? `${r.promptTokens}→${r.completionTokens}` : "—"}
+                {r.promptTokens !== undefined
+                  ? `${r.promptTokens}→${r.completionTokens}`
+                  : "—"}
                 {r.cachedTokens ? (
-                  <span title="prompt tokens served from cache" style={{ color: "var(--green)", marginLeft: 6 }}>
+                  <span
+                    title="prompt tokens served from cache"
+                    style={{ color: "var(--green)", marginLeft: 6 }}
+                  >
                     ⚡{r.cachedTokens}
                   </span>
                 ) : null}
@@ -346,7 +427,7 @@ function Inspector({
   const rerun = useAction(api.ai.rerun);
   const lineage = useQuery(api.ai.lineage, { requestId: request._id });
   const [messages, setMessages] = useState<{ role: string; content: string }[]>(
-    request.messages
+    request.messages,
   );
   const [model, setModel] = useState(request.model);
   const [result, setResult] = useState<any>(null);
@@ -371,68 +452,89 @@ function Inspector({
   return (
     <div
       style={{
-        position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
-        display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10,
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 10,
       }}
       onClick={onClose}
     >
       <div
         style={{
-          background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 12,
-          width: 640, maxHeight: "85vh", overflow: "auto", padding: 20,
+          background: "var(--panel)",
+          border: "1px solid var(--border)",
+          borderRadius: 12,
+          width: 640,
+          maxHeight: "85vh",
+          overflow: "auto",
+          padding: 20,
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            marginBottom: 12,
+          }}
+        >
           <h2 style={{ fontSize: 16 }}>
             Request by <b>{request.userId}</b>{" "}
             <span className={`pill ${request.status}`}>{request.status}</span>
           </h2>
-          <button className="ghost" onClick={onClose}>✕</button>
+          <button className="ghost" onClick={onClose}>
+            ✕
+          </button>
         </div>
-        {lineage && (lineage.ancestors.length > 0 || lineage.reruns.length > 0) && (
-          <div
-            style={{
-              background: "var(--panel2)",
-              borderRadius: 8,
-              padding: 10,
-              marginBottom: 12,
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 6,
-              alignItems: "center",
-              fontSize: 12,
-            }}
-          >
-            <span style={{ color: "var(--muted)" }}>lineage:</span>
-            {lineage.ancestors.map((a: any) => (
-              <span key={a._id}>
-                <button className="ghost" onClick={() => onOpen(a)}>
-                  {new Date(a._creationTime).toLocaleTimeString()} · {a.model.split("/")[1]} · {cents(a.costNanos)}
-                </button>{" "}
-                →
-              </span>
-            ))}
-            <span
+        {lineage &&
+          (lineage.ancestors.length > 0 || lineage.reruns.length > 0) && (
+            <div
               style={{
-                border: "1px solid var(--accent)",
+                background: "var(--panel2)",
                 borderRadius: 8,
-                padding: "4px 8px",
-                color: "var(--accent2)",
+                padding: 10,
+                marginBottom: 12,
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 6,
+                alignItems: "center",
+                fontSize: 12,
               }}
             >
-              this one
-            </span>
-            {lineage.reruns.map((r: any) => (
-              <span key={r._id}>
-                →{" "}
-                <button className="ghost" onClick={() => onOpen(r)}>
-                  {new Date(r._creationTime).toLocaleTimeString()} · {r.model.split("/")[1]} · {cents(r.costNanos)}
-                </button>
+              <span style={{ color: "var(--muted)" }}>lineage:</span>
+              {lineage.ancestors.map((a: any) => (
+                <span key={a._id}>
+                  <button className="ghost" onClick={() => onOpen(a)}>
+                    {new Date(a._creationTime).toLocaleTimeString()} ·{" "}
+                    {a.model.split("/")[1]} · {cents(a.costNanos)}
+                  </button>{" "}
+                  →
+                </span>
+              ))}
+              <span
+                style={{
+                  border: "1px solid var(--accent)",
+                  borderRadius: 8,
+                  padding: "4px 8px",
+                  color: "var(--accent2)",
+                }}
+              >
+                this one
               </span>
-            ))}
-          </div>
-        )}
+              {lineage.reruns.map((r: any) => (
+                <span key={r._id}>
+                  →{" "}
+                  <button className="ghost" onClick={() => onOpen(r)}>
+                    {new Date(r._creationTime).toLocaleTimeString()} ·{" "}
+                    {r.model.split("/")[1]} · {cents(r.costNanos)}
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
         {original && (
           <button
             className={diff ? "" : "ghost"}
@@ -446,68 +548,147 @@ function Inspector({
           <div style={{ marginBottom: 10 }}>
             <div style={{ fontSize: 12, marginBottom: 8 }}>
               <span style={{ color: "var(--muted)" }}>model: </span>
-              <span className="mono" style={{ color: original.model === request.model ? "var(--muted)" : "var(--red)" }}>
+              <span
+                className="mono"
+                style={{
+                  color:
+                    original.model === request.model
+                      ? "var(--muted)"
+                      : "var(--red)",
+                }}
+              >
                 {original.model}
               </span>
               {" → "}
-              <span className="mono" style={{ color: original.model === request.model ? "var(--muted)" : "var(--green)" }}>
+              <span
+                className="mono"
+                style={{
+                  color:
+                    original.model === request.model
+                      ? "var(--muted)"
+                      : "var(--green)",
+                }}
+              >
                 {request.model}
               </span>
-              {original.model === request.model && <span style={{ color: "var(--muted)" }}> (unchanged)</span>}
+              {original.model === request.model && (
+                <span style={{ color: "var(--muted)" }}> (unchanged)</span>
+              )}
             </div>
-            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
-              prompt diff <span style={{ color: "var(--red)" }}>original</span> →{" "}
-              <span style={{ color: "var(--green)" }}>this</span>
+            <div
+              style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}
+            >
+              prompt diff <span style={{ color: "var(--red)" }}>original</span>{" "}
+              → <span style={{ color: "var(--green)" }}>this</span>
             </div>
             {mergeRoles(original.messages, messages).map((pair, i) => (
               <div key={i} style={{ marginBottom: 8 }}>
-                <label style={{ fontSize: 11, color: "var(--muted)" }}>{pair.role}</label>
-                <div style={{ background: "var(--panel2)", borderRadius: 6, padding: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
+                <label style={{ fontSize: 11, color: "var(--muted)" }}>
+                  {pair.role}
+                </label>
+                <div
+                  style={{
+                    background: "var(--panel2)",
+                    borderRadius: 6,
+                    padding: 8,
+                    whiteSpace: "pre-wrap",
+                    fontSize: 13,
+                  }}
+                >
                   <DiffText a={pair.a} b={pair.b} />
                 </div>
               </div>
             ))}
-            <div style={{ fontSize: 12, color: "var(--muted)", margin: "10px 0 6px" }}>output diff</div>
-            <div style={{ background: "var(--panel2)", borderRadius: 6, padding: 8, whiteSpace: "pre-wrap", fontSize: 13 }}>
-              <DiffText a={original.responseText ?? ""} b={request.responseText ?? ""} />
+            <div
+              style={{
+                fontSize: 12,
+                color: "var(--muted)",
+                margin: "10px 0 6px",
+              }}
+            >
+              output diff
+            </div>
+            <div
+              style={{
+                background: "var(--panel2)",
+                borderRadius: 6,
+                padding: 8,
+                whiteSpace: "pre-wrap",
+                fontSize: 13,
+              }}
+            >
+              <DiffText
+                a={original.responseText ?? ""}
+                b={request.responseText ?? ""}
+              />
             </div>
           </div>
         ) : (
           <>
             <label style={{ fontSize: 12, color: "var(--muted)" }}>model</label>
-            <select value={model} onChange={(e) => setModel(e.target.value)} style={{ width: "100%", marginBottom: 10 }}>
-              {MODELS.map((m) => <option key={m}>{m}</option>)}
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              style={{ width: "100%", marginBottom: 10 }}
+            >
+              {MODELS.map((m) => (
+                <option key={m}>{m}</option>
+              ))}
             </select>
             {messages.map((m, i) => (
               <div key={i} style={{ marginBottom: 8 }}>
-                <label style={{ fontSize: 12, color: "var(--muted)" }}>{m.role}</label>
+                <label style={{ fontSize: 12, color: "var(--muted)" }}>
+                  {m.role}
+                </label>
                 <textarea
                   style={{ width: "100%", minHeight: 60 }}
                   value={m.content}
                   onChange={(e) =>
-                    setMessages(messages.map((mm, j) => (j === i ? { ...mm, content: e.target.value } : mm)))
+                    setMessages(
+                      messages.map((mm, j) =>
+                        j === i ? { ...mm, content: e.target.value } : mm,
+                      ),
+                    )
                   }
                 />
               </div>
             ))}
             {request.responseText && (
-              <div style={{ background: "var(--panel2)", borderRadius: 8, padding: 10, marginBottom: 10 }}>
+              <div
+                style={{
+                  background: "var(--panel2)",
+                  borderRadius: 8,
+                  padding: 10,
+                  marginBottom: 10,
+                }}
+              >
                 <div style={{ fontSize: 12, color: "var(--muted)" }}>
                   response · {cents(request.costNanos)}
                 </div>
-                <div style={{ whiteSpace: "pre-wrap" }}>{request.responseText}</div>
+                <div style={{ whiteSpace: "pre-wrap" }}>
+                  {request.responseText}
+                </div>
               </div>
             )}
           </>
         )}
         {request.error && (
-          <div style={{ color: "var(--red)", marginBottom: 10 }}>{request.error}</div>
+          <div style={{ color: "var(--red)", marginBottom: 10 }}>
+            {request.error}
+          </div>
         )}
         <button onClick={run} disabled={busy}>
           {busy ? "Re-running…" : "▶ Re-run with edits"}
         </button>
         {result && (
-          <div style={{ background: "var(--panel2)", borderRadius: 8, padding: 10, marginTop: 10 }}>
+          <div
+            style={{
+              background: "var(--panel2)",
+              borderRadius: 8,
+              padding: 10,
+              marginTop: 10,
+            }}
+          >
             {result.error ? (
               <div style={{ color: "var(--red)" }}>{result.error}</div>
             ) : (
@@ -549,7 +730,9 @@ function Users() {
       <tbody>
         {users.map((u: any) => (
           <tr key={u._id}>
-            <td><b>{u.value}</b></td>
+            <td>
+              <b>{u.value}</b>
+            </td>
             <td className="mono">{u.totalRequests}</td>
             <td className="mono">{u.totalTokens.toLocaleString()}</td>
             <td className="mono">{dollars(u.spendTodayNanos)}</td>
@@ -557,19 +740,25 @@ function Users() {
             <td>
               <LimitInput
                 value={u.requestsPerMinute}
-                onSave={(n) => setLimits({ userId: u.value, requestsPerMinute: n })}
+                onSave={(n) =>
+                  setLimits({ userId: u.value, requestsPerMinute: n })
+                }
               />
             </td>
             <td>
               <MoneyInput
                 value={u.dailySpendLimitNanos}
-                onSave={(n) => setLimits({ userId: u.value, dailySpendLimitNanos: n })}
+                onSave={(n) =>
+                  setLimits({ userId: u.value, dailySpendLimitNanos: n })
+                }
               />
             </td>
             <td>
               <LimitInput
                 value={u.dailyTokenLimit}
-                onSave={(n) => setLimits({ userId: u.value, dailyTokenLimit: n })}
+                onSave={(n) =>
+                  setLimits({ userId: u.value, dailyTokenLimit: n })
+                }
               />
             </td>
             <td title="Soft = warn but allow; unchecked = hard block">
@@ -577,7 +766,10 @@ function Users() {
                 type="checkbox"
                 checked={u.enforcement === "soft"}
                 onChange={(e) =>
-                  setLimits({ userId: u.value, enforcement: e.target.checked ? "soft" : "hard" })
+                  setLimits({
+                    userId: u.value,
+                    enforcement: e.target.checked ? "soft" : "hard",
+                  })
                 }
               />
             </td>
@@ -585,7 +777,9 @@ function Users() {
               <input
                 type="checkbox"
                 checked={!!u.blocked}
-                onChange={(e) => setLimits({ userId: u.value, blocked: e.target.checked })}
+                onChange={(e) =>
+                  setLimits({ userId: u.value, blocked: e.target.checked })
+                }
               />
             </td>
             <td title="One-time bump: approve another $1 of daily budget">
@@ -627,7 +821,9 @@ function Actions() {
         <tbody>
           {actions.map((a: any) => (
             <tr key={a._id}>
-              <td className="mono"><b>{a.value}</b></td>
+              <td className="mono">
+                <b>{a.value}</b>
+              </td>
               <td className="mono">{a.totalRequests}</td>
               <td className="mono">{a.totalTokens.toLocaleString()}</td>
               <td className="mono">{dollars(a.spendTodayNanos)}</td>
@@ -635,14 +831,18 @@ function Actions() {
               <td>
                 <MoneyInput
                   value={a.dailySpendLimitNanos}
-                  onSave={(n) => setLimits({ name: a.value, dailySpendLimitNanos: n })}
+                  onSave={(n) =>
+                    setLimits({ name: a.value, dailySpendLimitNanos: n })
+                  }
                 />
               </td>
               <td>
                 <input
                   type="checkbox"
                   checked={!!a.blocked}
-                  onChange={(e) => setLimits({ name: a.value, blocked: e.target.checked })}
+                  onChange={(e) =>
+                    setLimits({ name: a.value, blocked: e.target.checked })
+                  }
                 />
               </td>
             </tr>
@@ -683,7 +883,9 @@ function MoneyInput({
   value: number | undefined;
   onSave: (nanos: number | undefined) => void;
 }) {
-  const [text, setText] = useState(value === undefined ? "" : (value / NANOS).toString());
+  const [text, setText] = useState(
+    value === undefined ? "" : (value / NANOS).toString(),
+  );
   const save = () =>
     onSave(text === "" ? undefined : Math.round(Number(text) * NANOS));
   return (
@@ -703,7 +905,7 @@ function MoneyInput({
 // Pair up messages by position for a side-by-side prompt diff.
 function mergeRoles(
   a: { role: string; content: string }[] = [],
-  b: { role: string; content: string }[] = []
+  b: { role: string; content: string }[] = [],
 ) {
   const n = Math.max(a.length, b.length);
   const out: { role: string; a: string; b: string }[] = [];
@@ -723,31 +925,52 @@ function DiffText({ a, b }: { a: string; b: string }) {
   const B = b.split(/(\s+)/);
   const m = A.length,
     n = B.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  const dp: number[][] = Array.from({ length: m + 1 }, () =>
+    new Array(n + 1).fill(0),
+  );
   for (let i = m - 1; i >= 0; i--)
     for (let j = n - 1; j >= 0; j--)
-      dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      dp[i][j] =
+        A[i] === B[j]
+          ? dp[i + 1][j + 1] + 1
+          : Math.max(dp[i + 1][j], dp[i][j + 1]);
   const parts: { t: string; k: "same" | "del" | "add" }[] = [];
   let i = 0,
     j = 0;
   while (i < m && j < n) {
-    if (A[i] === B[j]) { parts.push({ t: A[i], k: "same" }); i++; j++; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) { parts.push({ t: A[i], k: "del" }); i++; }
-    else { parts.push({ t: B[j], k: "add" }); j++; }
+    if (A[i] === B[j]) {
+      parts.push({ t: A[i], k: "same" });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      parts.push({ t: A[i], k: "del" });
+      i++;
+    } else {
+      parts.push({ t: B[j], k: "add" });
+      j++;
+    }
   }
   while (i < m) parts.push({ t: A[i++], k: "del" });
   while (j < n) parts.push({ t: B[j++], k: "add" });
-  if (a === b) return <span style={{ color: "var(--muted)" }}>{a || "(empty)"}</span>;
+  if (a === b)
+    return <span style={{ color: "var(--muted)" }}>{a || "(empty)"}</span>;
   return (
     <>
       {parts.map((p, idx) =>
         p.k === "same" ? (
           <span key={idx}>{p.t}</span>
         ) : p.k === "del" ? (
-          <span key={idx} style={{ color: "var(--red)", textDecoration: "line-through" }}>{p.t}</span>
+          <span
+            key={idx}
+            style={{ color: "var(--red)", textDecoration: "line-through" }}
+          >
+            {p.t}
+          </span>
         ) : (
-          <span key={idx} style={{ color: "var(--green)" }}>{p.t}</span>
-        )
+          <span key={idx} style={{ color: "var(--green)" }}>
+            {p.t}
+          </span>
+        ),
       )}
     </>
   );
@@ -769,18 +992,20 @@ function Burst({ userId, model }: { userId: string; model: string }) {
   const requests =
     useQuery(
       api.ai.listRequests,
-      runId ? { dimension: "burst", value: runId } : "skip"
+      runId ? { dimension: "burst", value: runId } : "skip",
     ) ?? [];
   const byIndex = [...requests].sort(
-    (a: any, b: any) => a._creationTime - b._creationTime
+    (a: any, b: any) => a._creationTime - b._creationTime,
   );
   const spentNanos = byIndex.reduce(
-    (s: number, r: any) => s + (r.status === "success" ? r.costNanos ?? 0 : 0),
-    0
+    (s: number, r: any) =>
+      s + (r.status === "success" ? (r.costNanos ?? 0) : 0),
+    0,
   );
   const reservedNanos = byIndex.reduce(
-    (s: number, r: any) => s + (r.status === "pending" ? r.estimatedNanos ?? 0 : 0),
-    0
+    (s: number, r: any) =>
+      s + (r.status === "pending" ? (r.estimatedNanos ?? 0) : 0),
+    0,
   );
   const admitted = byIndex.filter((r: any) => r.status !== "blocked").length;
   const blocked = byIndex.filter((r: any) => r.status === "blocked").length;
@@ -791,9 +1016,7 @@ function Burst({ userId, model }: { userId: string; model: string }) {
     setSummary(null);
     setBusy(true);
     try {
-      setSummary(
-        await fire({ userId, runId: id, count, budgetNanos, model })
-      );
+      setSummary(await fire({ userId, runId: id, count, budgetNanos, model }));
     } catch (e: any) {
       setSummary({ error: String(e?.data?.reason ?? e?.message ?? e) });
     } finally {
@@ -804,15 +1027,25 @@ function Burst({ userId, model }: { userId: string; model: string }) {
   return (
     <div style={{ maxWidth: 1000 }}>
       <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
-        Fire <b>real concurrent AI requests</b> against one tightly-capped budget.
-        Admission is <b>reserve-then-settle</b> and atomic: each request reserves a
-        pessimistic estimate against the cap in one transaction, so concurrent
-        requests can't all spend the same remaining budget — the ones that fit are
-        admitted, the rest are <b style={{ color: "var(--red)" }}>rejected up front</b>.
-        (A short gpt-4o-mini request reserves ≈$0.0005.)
+        Fire <b>real concurrent AI requests</b> against one tightly-capped
+        budget. Admission is <b>reserve-then-settle</b> and atomic: each request
+        reserves a pessimistic estimate against the cap in one transaction, so
+        concurrent requests can't all spend the same remaining budget — the ones
+        that fit are admitted, the rest are{" "}
+        <b style={{ color: "var(--red)" }}>rejected up front</b>. (A short
+        gpt-4o-mini request reserves ≈$0.0005.)
       </p>
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 14 }}>
-        <label style={{ fontSize: 12, color: "var(--muted)" }}>concurrent requests</label>
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          marginBottom: 14,
+        }}
+      >
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>
+          concurrent requests
+        </label>
         <input
           type="number"
           style={{ width: 56 }}
@@ -831,7 +1064,10 @@ function Burst({ userId, model }: { userId: string; model: string }) {
           {busy ? "⚡ Bursting…" : `⚡ Fire ${count} as ${userId}`}
         </button>
         {runId && (
-          <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>
+          <span
+            className="mono"
+            style={{ fontSize: 11, color: "var(--muted)" }}
+          >
             run {runId}
           </span>
         )}
@@ -852,24 +1088,34 @@ function Burst({ userId, model }: { userId: string; model: string }) {
           <div
             title="reserved (holds placed at admission) + settled, vs the cap"
             style={{
-              background: "var(--panel2)", borderRadius: 6, height: 12,
-              overflow: "hidden", marginBottom: 14, display: "flex",
+              background: "var(--panel2)",
+              borderRadius: 6,
+              height: 12,
+              overflow: "hidden",
+              marginBottom: 14,
+              display: "flex",
             }}
           >
-            <div style={{
-              width: `${Math.min(100, (spentNanos / budgetNanos) * 100)}%`,
-              background: "var(--green)",
-            }} />
-            <div style={{
-              width: `${Math.min(100, (reservedNanos / budgetNanos) * 100)}%`,
-              background: "var(--accent)",
-            }} />
+            <div
+              style={{
+                width: `${Math.min(100, (spentNanos / budgetNanos) * 100)}%`,
+                background: "var(--green)",
+              }}
+            />
+            <div
+              style={{
+                width: `${Math.min(100, (reservedNanos / budgetNanos) * 100)}%`,
+                background: "var(--accent)",
+              }}
+            />
           </div>
-          <div style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
-            gap: 10,
-          }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+              gap: 10,
+            }}
+          >
             {byIndex.map((r: any) => (
               <div
                 key={r._id}
@@ -881,10 +1127,18 @@ function Burst({ userId, model }: { userId: string; model: string }) {
                         ? "var(--green)"
                         : "var(--border)"
                   }`,
-                  borderRadius: 8, padding: 10, fontSize: 12,
+                  borderRadius: 8,
+                  padding: 10,
+                  fontSize: 12,
                 }}
               >
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    marginBottom: 4,
+                  }}
+                >
                   <span className={`pill ${r.status}`}>{r.status}</span>
                   <span className="mono" style={{ color: "var(--muted)" }}>
                     {r.status === "pending"
@@ -908,19 +1162,28 @@ function Burst({ userId, model }: { userId: string; model: string }) {
             ))}
           </div>
           {summary?.error && (
-            <div style={{ color: "var(--red)", marginTop: 10 }}>{summary.error}</div>
+            <div style={{ color: "var(--red)", marginTop: 10 }}>
+              {summary.error}
+            </div>
           )}
           {summary && !summary.error && (
-            <div style={{
-              background: "var(--panel2)", borderRadius: 8, padding: 12,
-              marginTop: 12, fontSize: 13,
-            }}>
-              Done: <b style={{ color: "var(--green)" }}>{summary.admitted}</b> of{" "}
-              {summary.requested} admitted,{" "}
-              <b style={{ color: "var(--red)" }}>{summary.rejected} rejected by the budget</b>
+            <div
+              style={{
+                background: "var(--panel2)",
+                borderRadius: 8,
+                padding: 12,
+                marginTop: 12,
+                fontSize: 13,
+              }}
+            >
+              Done: <b style={{ color: "var(--green)" }}>{summary.admitted}</b>{" "}
+              of {summary.requested} admitted,{" "}
+              <b style={{ color: "var(--red)" }}>
+                {summary.rejected} rejected by the budget
+              </b>
               {" — total real cost "}
-              <b>{usd(summary.totalCostNanos)}</b> (cap {usd(budgetNanos)} held as
-              reservations; actual spend settles lower).
+              <b>{usd(summary.totalCostNanos)}</b> (cap {usd(budgetNanos)} held
+              as reservations; actual spend settles lower).
             </div>
           )}
         </>
@@ -941,17 +1204,32 @@ function Experiment({ userId }: { userId: string }) {
   return (
     <div>
       <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-        <button className={mode === "matrix" ? "" : "ghost"} onClick={() => setMode("matrix")}>
+        <button
+          className={mode === "matrix" ? "" : "ghost"}
+          onClick={() => setMode("matrix")}
+        >
           Prompt × model matrix
         </button>
-        <button className={mode === "backtest" ? "" : "ghost"} onClick={() => setMode("backtest")}>
+        <button
+          className={mode === "backtest" ? "" : "ghost"}
+          onClick={() => setMode("backtest")}
+        >
           Backtest on real traffic
         </button>
-        <button className={mode === "evolve" ? "" : "ghost"} onClick={() => setMode("evolve")}>
+        <button
+          className={mode === "evolve" ? "" : "ghost"}
+          onClick={() => setMode("evolve")}
+        >
           🧬 Evolve (budget-bounded)
         </button>
       </div>
-      {mode === "matrix" ? <Matrix userId={userId} /> : mode === "backtest" ? <Backtest /> : <Evolve />}
+      {mode === "matrix" ? (
+        <Matrix userId={userId} />
+      ) : mode === "backtest" ? (
+        <Backtest />
+      ) : (
+        <Evolve />
+      )}
     </div>
   );
 }
@@ -960,71 +1238,154 @@ function Evolve() {
   const evolve = useAction(api.ai.evolve);
   const tunable = useTunableActions();
   const [action, setAction] = useState("ai:sendMessage");
-  const [goal, setGoal] = useState("Explain like I'm five, warmly, with a concrete analogy.");
+  const [goal, setGoal] = useState(
+    "Explain like I'm five, warmly, with a concrete analogy.",
+  );
   const [seedSystem, setSeedSystem] = useState("You are a helpful assistant.");
   const [rounds, setRounds] = useState(5);
   const [budget, setBudget] = useState(0.02); // dollars
   const [out, setOut] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const run = async () => {
-    setBusy(true); setOut(null);
+    setBusy(true);
+    setOut(null);
     try {
-      setOut(await evolve({ action, goal, seedSystem, rounds, sampleSize: 2, budgetNanos: Math.round(budget * NANOS) }));
+      setOut(
+        await evolve({
+          action,
+          goal,
+          seedSystem,
+          rounds,
+          sampleSize: 2,
+          budgetNanos: Math.round(budget * NANOS),
+        }),
+      );
     } catch (e: any) {
       setOut({ error: String(e?.data?.reason ?? e?.message ?? e) });
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+    }
   };
   const maxScore = 10;
   return (
     <div style={{ maxWidth: 900 }}>
       <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
-        An LLM evolves the system prompt for a chosen feature (action) toward your goal,
-        scoring each candidate on <b>that feature's</b> real requests. It runs until the
-        round limit <b>or the budget</b> — the spend cap is what makes an autonomous
-        optimization loop safe to walk away from.
+        An LLM evolves the system prompt for a chosen feature (action) toward
+        your goal, scoring each candidate on <b>that feature's</b> real
+        requests. It runs until the round limit <b>or the budget</b> — the spend
+        cap is what makes an autonomous optimization loop safe to walk away
+        from.
       </p>
       <div style={{ marginBottom: 8 }}>
-        <label style={{ fontSize: 12, color: "var(--muted)" }}>action (feature to tune) </label>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>
+          action (feature to tune){" "}
+        </label>
         <select value={action} onChange={(e) => setAction(e.target.value)}>
-          {[action, ...tunable.filter((a: string) => a !== action)].map((a: string) => (
-            <option key={a}>{a}</option>
-          ))}
+          {[action, ...tunable.filter((a: string) => a !== action)].map(
+            (a: string) => (
+              <option key={a}>{a}</option>
+            ),
+          )}
         </select>
       </div>
       <label style={{ fontSize: 12, color: "var(--muted)" }}>goal</label>
-      <textarea style={{ width: "100%", minHeight: 40, marginBottom: 8 }} value={goal} onChange={(e) => setGoal(e.target.value)} />
-      <label style={{ fontSize: 12, color: "var(--muted)" }}>seed system prompt</label>
-      <textarea style={{ width: "100%", minHeight: 40, marginBottom: 8 }} value={seedSystem} onChange={(e) => setSeedSystem(e.target.value)} />
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 14 }}>
-        <label style={{ fontSize: 12, color: "var(--muted)" }}>max rounds</label>
-        <input type="number" style={{ width: 56 }} value={rounds} onChange={(e) => setRounds(Number(e.target.value))} />
+      <textarea
+        style={{ width: "100%", minHeight: 40, marginBottom: 8 }}
+        value={goal}
+        onChange={(e) => setGoal(e.target.value)}
+      />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>
+        seed system prompt
+      </label>
+      <textarea
+        style={{ width: "100%", minHeight: 40, marginBottom: 8 }}
+        value={seedSystem}
+        onChange={(e) => setSeedSystem(e.target.value)}
+      />
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          marginBottom: 14,
+        }}
+      >
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>
+          max rounds
+        </label>
+        <input
+          type="number"
+          style={{ width: 56 }}
+          value={rounds}
+          onChange={(e) => setRounds(Number(e.target.value))}
+        />
         <label style={{ fontSize: 12, color: "var(--muted)" }}>budget $</label>
-        <input type="number" step="0.01" style={{ width: 70 }} value={budget} onChange={(e) => setBudget(Number(e.target.value))} />
-        <button onClick={run} disabled={busy}>{busy ? "Evolving…" : "🧬 Evolve"}</button>
+        <input
+          type="number"
+          step="0.01"
+          style={{ width: 70 }}
+          value={budget}
+          onChange={(e) => setBudget(Number(e.target.value))}
+        />
+        <button onClick={run} disabled={busy}>
+          {busy ? "Evolving…" : "🧬 Evolve"}
+        </button>
       </div>
       {out?.error && <div style={{ color: "var(--red)" }}>{out.error}</div>}
       {out?.history && (
         <>
           <div style={{ marginBottom: 12, fontSize: 13 }}>
             stopped by{" "}
-            <b style={{ color: out.stopped === "budget" ? "var(--accent2)" : "var(--muted)" }}>
+            <b
+              style={{
+                color:
+                  out.stopped === "budget" ? "var(--accent2)" : "var(--muted)",
+              }}
+            >
               {out.stopped === "budget" ? "🛑 budget reached" : "round limit"}
             </b>{" "}
-            · spent <b>{cents(out.spentNanos)}</b> · corpus {out.corpusSize} real requests
+            · spent <b>{cents(out.spentNanos)}</b> · corpus {out.corpusSize}{" "}
+            real requests
           </div>
           {out.history.map((h: any) => {
             const isBest = h.system === out.best.system;
             return (
-              <div key={h.round} style={{
-                display: "flex", gap: 10, alignItems: "flex-start", padding: "8px 0",
-                borderBottom: "1px solid var(--border)",
-              }}>
-                <div className="mono" style={{ width: 60, color: "var(--muted)", fontSize: 12 }}>#{h.round}</div>
+              <div
+                key={h.round}
+                style={{
+                  display: "flex",
+                  gap: 10,
+                  alignItems: "flex-start",
+                  padding: "8px 0",
+                  borderBottom: "1px solid var(--border)",
+                }}
+              >
+                <div
+                  className="mono"
+                  style={{ width: 60, color: "var(--muted)", fontSize: 12 }}
+                >
+                  #{h.round}
+                </div>
                 <div style={{ width: 120 }}>
-                  <div style={{ background: "var(--panel2)", borderRadius: 4, height: 8, overflow: "hidden" }}>
-                    <div style={{ width: `${(h.score / maxScore) * 100}%`, height: "100%", background: isBest ? "var(--green)" : "var(--accent)" }} />
+                  <div
+                    style={{
+                      background: "var(--panel2)",
+                      borderRadius: 4,
+                      height: 8,
+                      overflow: "hidden",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${(h.score / maxScore) * 100}%`,
+                        height: "100%",
+                        background: isBest ? "var(--green)" : "var(--accent)",
+                      }}
+                    />
                   </div>
-                  <div style={{ fontSize: 11, color: "var(--muted)" }}>{h.score.toFixed(1)}/10 · {cents(h.spentNanos)}</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                    {h.score.toFixed(1)}/10 · {cents(h.spentNanos)}
+                  </div>
                 </div>
                 <div style={{ flex: 1, fontSize: 13 }}>
                   {isBest && <span style={{ color: "var(--green)" }}>★ </span>}
@@ -1033,8 +1394,20 @@ function Evolve() {
               </div>
             );
           })}
-          <div style={{ marginTop: 14, background: "var(--panel2)", border: "1px solid var(--green)", borderRadius: 8, padding: 12 }}>
-            <div style={{ fontSize: 12, color: "var(--green)", marginBottom: 4 }}>best prompt · {out.best.score.toFixed(1)}/10</div>
+          <div
+            style={{
+              marginTop: 14,
+              background: "var(--panel2)",
+              border: "1px solid var(--green)",
+              borderRadius: 8,
+              padding: 12,
+            }}
+          >
+            <div
+              style={{ fontSize: 12, color: "var(--green)", marginBottom: 4 }}
+            >
+              best prompt · {out.best.score.toFixed(1)}/10
+            </div>
             <div style={{ whiteSpace: "pre-wrap" }}>{out.best.system}</div>
           </div>
         </>
@@ -1056,7 +1429,7 @@ function Backtest() {
   const tunable = useTunableActions();
   const [action, setAction] = useState("ai:sendMessage");
   const [newSystem, setNewSystem] = useState(
-    "You are a warm, encouraging assistant. Answer with a concrete example."
+    "You are a warm, encouraging assistant. Answer with a concrete example.",
   );
   const [criteria, setCriteria] = useState("Accurate, concise, and friendly.");
   const [model, setModel] = useState("");
@@ -1064,68 +1437,176 @@ function Backtest() {
   const [out, setOut] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const run = async () => {
-    setBusy(true); setOut(null);
+    setBusy(true);
+    setOut(null);
     try {
-      setOut(await backtest({ action, newSystem, criteria: criteria || undefined, model: model || undefined, limit }));
+      setOut(
+        await backtest({
+          action,
+          newSystem,
+          criteria: criteria || undefined,
+          model: model || undefined,
+          limit,
+        }),
+      );
     } catch (e: any) {
       setOut({ error: String(e?.data?.reason ?? e?.message ?? e) });
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+    }
   };
   return (
     <div style={{ maxWidth: 1000 }}>
       <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
-        Pick a feature (action), then replay a new system prompt against <b>its</b> last N
-        real requests and let a judge decide whether it improved each one. Each feature
-        has its own prompt, so each is backtested separately. Budget-capped.
+        Pick a feature (action), then replay a new system prompt against{" "}
+        <b>its</b> last N real requests and let a judge decide whether it
+        improved each one. Each feature has its own prompt, so each is
+        backtested separately. Budget-capped.
       </p>
       <div style={{ marginBottom: 10 }}>
-        <label style={{ fontSize: 12, color: "var(--muted)" }}>action (feature to tune) </label>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>
+          action (feature to tune){" "}
+        </label>
         <select value={action} onChange={(e) => setAction(e.target.value)}>
-          {[action, ...tunable.filter((a: string) => a !== action)].map((a: string) => (
-            <option key={a}>{a}</option>
-          ))}
+          {[action, ...tunable.filter((a: string) => a !== action)].map(
+            (a: string) => (
+              <option key={a}>{a}</option>
+            ),
+          )}
         </select>
       </div>
-      <label style={{ fontSize: 12, color: "var(--muted)" }}>candidate system prompt</label>
-      <textarea style={{ width: "100%", minHeight: 54, marginBottom: 10 }} value={newSystem} onChange={(e) => setNewSystem(e.target.value)} />
-      <label style={{ fontSize: 12, color: "var(--muted)" }}>evaluation criteria (how the judge decides)</label>
-      <textarea style={{ width: "100%", minHeight: 34, marginBottom: 10 }} value={criteria} onChange={(e) => setCriteria(e.target.value)} />
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
-        <label style={{ fontSize: 12, color: "var(--muted)" }}>model override</label>
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>
+        candidate system prompt
+      </label>
+      <textarea
+        style={{ width: "100%", minHeight: 54, marginBottom: 10 }}
+        value={newSystem}
+        onChange={(e) => setNewSystem(e.target.value)}
+      />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>
+        evaluation criteria (how the judge decides)
+      </label>
+      <textarea
+        style={{ width: "100%", minHeight: 34, marginBottom: 10 }}
+        value={criteria}
+        onChange={(e) => setCriteria(e.target.value)}
+      />
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          marginBottom: 14,
+        }}
+      >
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>
+          model override
+        </label>
         <select value={model} onChange={(e) => setModel(e.target.value)}>
           <option value="">(keep original)</option>
-          {MODELS.map((m) => <option key={m}>{m}</option>)}
+          {MODELS.map((m) => (
+            <option key={m}>{m}</option>
+          ))}
         </select>
         <label style={{ fontSize: 12, color: "var(--muted)" }}>last</label>
-        <input type="number" style={{ width: 56 }} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
-        <button onClick={run} disabled={busy}>{busy ? "Backtesting…" : "▶ Backtest"}</button>
+        <input
+          type="number"
+          style={{ width: 56 }}
+          value={limit}
+          onChange={(e) => setLimit(Number(e.target.value))}
+        />
+        <button onClick={run} disabled={busy}>
+          {busy ? "Backtesting…" : "▶ Backtest"}
+        </button>
       </div>
       {out?.error && <div style={{ color: "var(--red)" }}>{out.error}</div>}
       {out?.results && (
         <>
-          <div style={{ background: "var(--panel2)", borderRadius: 8, padding: 12, marginBottom: 12 }}>
+          <div
+            style={{
+              background: "var(--panel2)",
+              borderRadius: 8,
+              padding: 12,
+              marginBottom: 12,
+            }}
+          >
             <b style={{ color: "var(--green)" }}>{out.improved} improved</b>
-            {" · "}<b style={{ color: "var(--red)" }}>{out.regressed} regressed</b>
-            {" · "}{out.total - out.improved - out.regressed} tie · over {out.total} real requests
+            {" · "}
+            <b style={{ color: "var(--red)" }}>{out.regressed} regressed</b>
+            {" · "}
+            {out.total - out.improved - out.regressed} tie · over {out.total}{" "}
+            real requests
           </div>
           {out.results.map((r: any, i: number) => (
-            <div key={i} style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 12, marginBottom: 10 }}>
-              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
-                {r.error ? "🚫 " + r.error : <><b>prompt:</b> {r.prompt.slice(0, 120)}</>}
+            <div
+              key={i}
+              style={{
+                border: "1px solid var(--border)",
+                borderRadius: 8,
+                padding: 12,
+                marginBottom: 10,
+              }}
+            >
+              <div
+                style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}
+              >
+                {r.error ? (
+                  "🚫 " + r.error
+                ) : (
+                  <>
+                    <b>prompt:</b> {r.prompt.slice(0, 120)}
+                  </>
+                )}
               </div>
               {!r.error && (
                 <>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "1fr 1fr",
+                      gap: 10,
+                    }}
+                  >
                     <div>
-                      <div style={{ fontSize: 11, color: r.better === "original" ? "var(--green)" : "var(--muted)" }}>original {r.better === "original" && "✓"}</div>
-                      <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>{r.original}</div>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color:
+                            r.better === "original"
+                              ? "var(--green)"
+                              : "var(--muted)",
+                        }}
+                      >
+                        original {r.better === "original" && "✓"}
+                      </div>
+                      <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>
+                        {r.original}
+                      </div>
                     </div>
                     <div>
-                      <div style={{ fontSize: 11, color: r.better === "new" ? "var(--green)" : "var(--muted)" }}>new {r.better === "new" && "✓"}</div>
-                      <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}><DiffText a={r.original} b={r.updated} /></div>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color:
+                            r.better === "new"
+                              ? "var(--green)"
+                              : "var(--muted)",
+                        }}
+                      >
+                        new {r.better === "new" && "✓"}
+                      </div>
+                      <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>
+                        <DiffText a={r.original} b={r.updated} />
+                      </div>
                     </div>
                   </div>
-                  <div style={{ fontSize: 11, color: "var(--accent2)", marginTop: 6 }}>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "var(--accent2)",
+                      marginTop: 6,
+                    }}
+                  >
                     judge: <b>{r.better}</b> — {r.why} · {cents(r.costNanos)}
                   </div>
                 </>
@@ -1142,21 +1623,39 @@ function Matrix({ userId }: { userId: string }) {
   const experiment = useAction(api.ai.experiment);
   const judge = useAction(api.ai.judge);
   const [prompt, setPrompt] = useState("Explain recursion to a five-year-old.");
-  const [criteria, setCriteria] = useState("Clear for a five-year-old, warm, uses an analogy.");
+  const [criteria, setCriteria] = useState(
+    "Clear for a five-year-old, warm, uses an analogy.",
+  );
   const [systems, setSystems] = useState<string[]>(DEFAULT_SYSTEMS);
-  const [models, setModels] = useState<string[]>(["openai/gpt-4o-mini", "openai/gpt-4o"]);
+  const [models, setModels] = useState<string[]>([
+    "openai/gpt-4o-mini",
+    "openai/gpt-4o",
+  ]);
   const [results, setResults] = useState<any[] | null>(null);
   const [verdict, setVerdict] = useState<any>(null);
   const [busy, setBusy] = useState<"" | "run" | "judge">("");
 
   const toggleModel = (m: string) =>
-    setModels((ms) => (ms.includes(m) ? ms.filter((x) => x !== m) : [...ms, m]));
+    setModels((ms) =>
+      ms.includes(m) ? ms.filter((x) => x !== m) : [...ms, m],
+    );
 
   const run = async () => {
-    setBusy("run"); setResults(null); setVerdict(null);
+    setBusy("run");
+    setResults(null);
+    setVerdict(null);
     try {
-      setResults(await experiment({ userId, prompt, systems: systems.filter((s) => s.trim()), models }));
-    } finally { setBusy(""); }
+      setResults(
+        await experiment({
+          userId,
+          prompt,
+          systems: systems.filter((s) => s.trim()),
+          models,
+        }),
+      );
+    } finally {
+      setBusy("");
+    }
   };
   const doJudge = async () => {
     if (!results) return;
@@ -1165,45 +1664,98 @@ function Matrix({ userId }: { userId: string }) {
       const candidates = results
         .filter((r) => r.text)
         .map((r, i) => ({ label: String.fromCharCode(65 + i), text: r.text }));
-      setVerdict(await judge({ prompt, candidates, criteria: criteria || undefined }));
-    } finally { setBusy(""); }
+      setVerdict(
+        await judge({ prompt, candidates, criteria: criteria || undefined }),
+      );
+    } finally {
+      setBusy("");
+    }
   };
   // winner may come back as "B" or "Candidate B" — match the trailing token.
   const wins = (label: string) =>
-    !!verdict?.winner && String(verdict.winner).trim().split(/\s+/).pop() === label;
+    !!verdict?.winner &&
+    String(verdict.winner).trim().split(/\s+/).pop() === label;
 
   return (
     <div style={{ maxWidth: 1100 }}>
       <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 10 }}>
-        Run one prompt across every <b>system prompt × model</b> combination — every
-        cell is a tracked, budgeted request — then let a judge model pick the best.
+        Run one prompt across every <b>system prompt × model</b> combination —
+        every cell is a tracked, budgeted request — then let a judge model pick
+        the best.
       </p>
       <label style={{ fontSize: 12, color: "var(--muted)" }}>prompt</label>
-      <textarea style={{ width: "100%", minHeight: 54, marginBottom: 10 }} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
-      <label style={{ fontSize: 12, color: "var(--muted)" }}>judge criteria (how the winner is chosen)</label>
-      <textarea style={{ width: "100%", minHeight: 34, marginBottom: 10 }} value={criteria} onChange={(e) => setCriteria(e.target.value)} />
-      <label style={{ fontSize: 12, color: "var(--muted)" }}>system prompt variants</label>
+      <textarea
+        style={{ width: "100%", minHeight: 54, marginBottom: 10 }}
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+      />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>
+        judge criteria (how the winner is chosen)
+      </label>
+      <textarea
+        style={{ width: "100%", minHeight: 34, marginBottom: 10 }}
+        value={criteria}
+        onChange={(e) => setCriteria(e.target.value)}
+      />
+      <label style={{ fontSize: 12, color: "var(--muted)" }}>
+        system prompt variants
+      </label>
       {systems.map((s, i) => (
         <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-          <textarea style={{ flex: 1, minHeight: 34 }} value={s}
-            onChange={(e) => setSystems(systems.map((x, j) => (j === i ? e.target.value : x)))} />
-          <button className="ghost" onClick={() => setSystems(systems.filter((_, j) => j !== i))}>✕</button>
+          <textarea
+            style={{ flex: 1, minHeight: 34 }}
+            value={s}
+            onChange={(e) =>
+              setSystems(systems.map((x, j) => (j === i ? e.target.value : x)))
+            }
+          />
+          <button
+            className="ghost"
+            onClick={() => setSystems(systems.filter((_, j) => j !== i))}
+          >
+            ✕
+          </button>
         </div>
       ))}
-      <button className="ghost" style={{ marginBottom: 10 }} onClick={() => setSystems([...systems, ""])}>+ variant</button>
+      <button
+        className="ghost"
+        style={{ marginBottom: 10 }}
+        onClick={() => setSystems([...systems, ""])}
+      >
+        + variant
+      </button>
       <div style={{ marginBottom: 12 }}>
-        <label style={{ fontSize: 12, color: "var(--muted)" }}>models (A/B)</label>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+        <label style={{ fontSize: 12, color: "var(--muted)" }}>
+          models (A/B)
+        </label>
+        <div
+          style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}
+        >
           {MODELS.map((m) => (
-            <label key={m} style={{ fontSize: 12, display: "flex", gap: 4, alignItems: "center" }}>
-              <input type="checkbox" checked={models.includes(m)} onChange={() => toggleModel(m)} /> {m}
+            <label
+              key={m}
+              style={{
+                fontSize: 12,
+                display: "flex",
+                gap: 4,
+                alignItems: "center",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={models.includes(m)}
+                onChange={() => toggleModel(m)}
+              />{" "}
+              {m}
             </label>
           ))}
         </div>
       </div>
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <button onClick={run} disabled={busy !== "" || !models.length}>
-          {busy === "run" ? "Running…" : `▶ Run ${systems.filter((s) => s.trim()).length * models.length} variants`}
+          {busy === "run"
+            ? "Running…"
+            : `▶ Run ${systems.filter((s) => s.trim()).length * models.length} variants`}
         </button>
         {results && (
           <button className="ghost" onClick={doJudge} disabled={busy !== ""}>
@@ -1213,37 +1765,94 @@ function Matrix({ userId }: { userId: string }) {
       </div>
 
       {verdict && (
-        <div style={{ background: "var(--panel2)", border: "1px solid var(--accent)", borderRadius: 8, padding: 12, marginBottom: 14 }}>
-          <b style={{ color: "var(--accent2)" }}>Winner: {verdict.winner ?? "—"}</b> · {verdict.rationale}
+        <div
+          style={{
+            background: "var(--panel2)",
+            border: "1px solid var(--accent)",
+            borderRadius: 8,
+            padding: 12,
+            marginBottom: 14,
+          }}
+        >
+          <b style={{ color: "var(--accent2)" }}>
+            Winner: {verdict.winner ?? "—"}
+          </b>{" "}
+          · {verdict.rationale}
           {verdict.ranking?.length ? (
-            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>ranking: {verdict.ranking.join(" > ")}</div>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
+              ranking: {verdict.ranking.join(" > ")}
+            </div>
           ) : null}
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 12 }}>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
+          gap: 12,
+        }}
+      >
         {results?.map((r, i) => {
           const label = String.fromCharCode(65 + i);
           return (
-            <div key={i} style={{
-              background: "var(--panel)", border: `1px solid ${wins(label) ? "var(--green)" : "var(--border)"}`,
-              borderRadius: 10, padding: 12,
-            }}>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-                <span className="mono"><b>{label}</b> · {r.model.split("/")[1]}</span>
-                {wins(label) && <span style={{ color: "var(--green)" }}>★ best</span>}
+            <div
+              key={i}
+              style={{
+                background: "var(--panel)",
+                border: `1px solid ${wins(label) ? "var(--green)" : "var(--border)"}`,
+                borderRadius: 10,
+                padding: 12,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  fontSize: 12,
+                }}
+              >
+                <span className="mono">
+                  <b>{label}</b> · {r.model.split("/")[1]}
+                </span>
+                {wins(label) && (
+                  <span style={{ color: "var(--green)" }}>★ best</span>
+                )}
               </div>
-              <div style={{ fontSize: 11, color: "var(--muted)", margin: "4px 0", fontStyle: "italic" }}>
+              <div
+                style={{
+                  fontSize: 11,
+                  color: "var(--muted)",
+                  margin: "4px 0",
+                  fontStyle: "italic",
+                }}
+              >
                 {r.system}
               </div>
               {r.error ? (
-                <div style={{ color: "var(--red)", fontSize: 13 }}>🚫 {r.error}</div>
+                <div style={{ color: "var(--red)", fontSize: 13 }}>
+                  🚫 {r.error}
+                </div>
               ) : (
                 <>
-                  <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{r.text}</div>
-                  <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
-                    {cents(r.costNanos)} · {r.promptTokens}→{r.completionTokens} tok
-                    {r.cachedTokens ? <span style={{ color: "var(--green)" }}> ⚡{r.cachedTokens}</span> : null}
+                  <div style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
+                    {r.text}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "var(--muted)",
+                      marginTop: 6,
+                    }}
+                  >
+                    {cents(r.costNanos)} · {r.promptTokens}→{r.completionTokens}{" "}
+                    tok
+                    {r.cachedTokens ? (
+                      <span style={{ color: "var(--green)" }}>
+                        {" "}
+                        ⚡{r.cachedTokens}
+                      </span>
+                    ) : null}
                   </div>
                 </>
               )}
@@ -1257,20 +1866,46 @@ function Matrix({ userId }: { userId: string }) {
 
 function Jev({ userId }: { userId: string }) {
   const classify = useAction(api.jev.classify);
-  const [text, setText] = useState("I was charged twice for my subscription. Please refund the duplicate payment.");
+  const [text, setText] = useState(
+    "I was charged twice for my subscription. Please refund the duplicate payment.",
+  );
   const [result, setResult] = useState("");
   const [busy, setBusy] = useState(false);
-  return <section>
-    <h2>Jev · structured decisions</h2>
-    <p>Classify a support request as billing, technical, or other. Usage is recorded against {userId}'s budget and appears in Requests.</p>
-    <textarea aria-label="Support request" value={text} maxLength={4000} onChange={e => setText(e.target.value)} style={{ width: "100%", minHeight: 100 }} />
-    <button disabled={busy || !text.trim()} onClick={async () => {
-      setBusy(true);
-      setResult("");
-      try { setResult(JSON.stringify(await classify({ userId, text }), null, 2)); }
-      catch (e) { setResult(String(e)); }
-      finally { setBusy(false); }
-    }}>{busy ? "Classifying…" : "Test Jev"}</button>
-    <pre style={{ whiteSpace: "pre-wrap" }} aria-live="polite">{result}</pre>
-  </section>;
+  return (
+    <section>
+      <h2>Jev · structured decisions</h2>
+      <p>
+        Classify a support request as billing, technical, or other. Usage is
+        recorded against {userId}'s budget and appears in Requests.
+      </p>
+      <textarea
+        aria-label="Support request"
+        value={text}
+        maxLength={4000}
+        onChange={(e) => setText(e.target.value)}
+        style={{ width: "100%", minHeight: 100 }}
+      />
+      <button
+        disabled={busy || !text.trim()}
+        onClick={async () => {
+          setBusy(true);
+          setResult("");
+          try {
+            setResult(
+              JSON.stringify(await classify({ userId, text }), null, 2),
+            );
+          } catch (e) {
+            setResult(String(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? "Classifying…" : "Test Jev"}
+      </button>
+      <pre style={{ whiteSpace: "pre-wrap" }} aria-live="polite">
+        {result}
+      </pre>
+    </section>
+  );
 }
