@@ -1,6 +1,8 @@
 /// <reference types="vite/client" />
 import type { TestConvex } from "convex-test";
 import type { GenericSchema, SchemaDefinition } from "convex/server";
+import { componentsGeneric } from "convex/server";
+import type { ComponentApi } from "./component/_generated/component.js";
 import schema from "./component/schema.js";
 import shardedCounter from "@convex-dev/sharded-counter/test";
 import rateLimiter from "@convex-dev/rate-limiter/test";
@@ -10,6 +12,8 @@ const modules = import.meta.glob("./component/**/*.ts");
  * Register the component with the test convex instance.
  * @param t - The test convex instance, e.g. from calling `convexTest`.
  * @param name - The name of the component, as registered in convex.config.ts.
+ * @returns a component api to test via ctx.runMutation or for thick client
+ *   usage. Also provides types for convex-test's defineTestApp.
  */
 export function register<
   Schema extends SchemaDefinition<GenericSchema, boolean>,
@@ -17,5 +21,6 @@ export function register<
   t.registerComponent(name, schema, modules);
   shardedCounter.register(t, `${name}/shardedCounter`);
   rateLimiter.register(t, `${name}/rateLimiter`);
+  return componentsGeneric()[name] as unknown as ComponentApi;
 }
 export default { register, schema, modules };
